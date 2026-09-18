@@ -668,7 +668,7 @@ def generate_statistics_and_plots(scored_csv_path: str, model_name: str, output_
                         pass
 
         # Always include key run params — show None explicitly so it's clear what was/wasn't set
-        CONFIG_KEYS = ('strategy', 'max_turns', 'max_tool_calls', 'tool_output_cap', 'context_window_management', 'reasoning_effort', 'extra_llm_params')
+        CONFIG_KEYS = ('strategy', 'max_turns', 'max_tool_calls', 'tool_output_cap', 'context_window_management', 'context_window_tokens', 'condenser_token_fraction', 'condenser_keep_first', 'condenser_summarize', 'condenser_model', 'reasoning_effort', 'extra_llm_params')
         config_summary = {k: run_config.get(k) for k in CONFIG_KEYS} if run_config else {k: None for k in CONFIG_KEYS}
 
         for split_name, split_df in splits.items():
