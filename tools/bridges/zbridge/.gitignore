@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.bridge_secret
+bridge.log
+stream_tee.jsonl
+.pytest_cache/
+dist/
+build/
+tests/fixtures/real/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/

@@ -1,0 +1,10 @@
+# GLM runs (CC_MODE=zbridge) only. Opus runs never load it.
+#
+# scripts/run_task.sh adds this after overlay.yaml and sets EGRESS_SQUID_CONF.
+# It swaps in the squid-zbridge.conf copy, so main can reach zbridge on the host
+# through squid. The internal network and everything else in overlay.yaml stay.
+
+services:
+  egress-proxy:
+    volumes:
+      - "${EGRESS_SQUID_CONF:?set by scripts/run_task.sh for GLM runs}:/etc/squid/squid.conf:ro"

@@ -1,0 +1,48 @@
+# The headroom container's own way out, on the judge's pattern.
+#
+# WHY NOT THE AGENT'S SQUID
+#
+# It would work: the allowlist already carries api.anthropic.com. But the agent
+# proxy's access.log IS the egress audit's evidence
+# (tools/network/detect_internet_use.py reads it out of harbor's per-trial agent
+# log dir), and headroom generates denied attempts of its own on every start --
+# huggingface.co, raw.githubusercontent.com, an onnxruntime telemetry host.
+# Those lines are indistinguishable from the agent trying to reach the web, and
+# scan_access_log turns each one into a proxy-denied finding, which moves the
+# run's verdict to "tried and blocked". A second proxy keeps the agent's log
+# about the agent.
+networks:
+  headroom-net:
+    internal: true
+
+services:
+  headroom:
+    networks:
+      - default
+      - headroom-net
+    environment:
+      HTTP_PROXY: "http://headroom-proxy:3128"
+      HTTPS_PROXY: "http://headroom-proxy:3128"
+      http_proxy: "http://headroom-proxy:3128"
+      https_proxy: "http://headroom-proxy:3128"
+      NO_PROXY: "localhost,127.0.0.1,0.0.0.0,::1"
+      no_proxy: "localhost,127.0.0.1,0.0.0.0,::1"
+    depends_on:
+      headroom-proxy:
+        condition: service_healthy
+
+  headroom-proxy:
+    image: egress-proxy:latest
+    # squid.conf for a Claude run (api.anthropic.com), or the generated
+    # zbridge conf for a GLM run. scripts/run_task.sh picks it.
+    volumes:
+      - "${HEADROOM_SQUID_CONF:?set per run by scripts/run_task.sh}:/etc/squid/squid.conf:ro"
+    networks:
+      - headroom-net
+      - egress
+    healthcheck:
+      test: ["CMD", "squid", "-k", "check", "-f", "/etc/squid/squid.conf"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s

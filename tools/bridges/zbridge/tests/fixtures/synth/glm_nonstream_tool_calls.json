@@ -1,0 +1,26 @@
+{
+  "id": "202601020304050ghi789",
+  "created": 1782000002,
+  "model": "glm-5.3",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_8208132785081240070",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\": \"Beijing\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }],
+  "usage": {
+    "prompt_tokens": 40,
+    "completion_tokens": 15,
+    "total_tokens": 55
+  }
+}

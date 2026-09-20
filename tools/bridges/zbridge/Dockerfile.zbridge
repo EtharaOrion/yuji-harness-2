@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir --disable-pip-version-check \
+    "fastapi==0.115.5" \
+    "uvicorn==0.32.1" \
+    "httpx==0.27.2" \
+    "pydantic==2.10.3"
+
+WORKDIR /app
+COPY zbridge /app/zbridge
+
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1 \
+    ZB_HOST=0.0.0.0 \
+    ZB_PORT=8766
+
+EXPOSE 8766
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8766/healthz', timeout=2).getcode()==200 else 1)"
+
+ENTRYPOINT ["python", "-m", "zbridge"]
+CMD ["--host", "0.0.0.0", "--port", "8766"]

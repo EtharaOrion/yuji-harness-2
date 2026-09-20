@@ -1,0 +1,49 @@
+# Agent-path Headroom: the proxy the agent's model calls go through.
+#
+# Added by scripts/run_task.sh only when AGENT_HEADROOM_ENABLED=true, and after
+# overlay.yaml so the NO_PROXY below replaces the isolated one rather than the
+# other way round.
+#
+# run_task exports ANTHROPIC_BASE_URL=http://headroom:8787 and harbor forwards
+# it into main. Under isolation main's HTTP_PROXY points at squid, so `headroom`
+# has to be in NO_PROXY: without it main sends the call to squid, squid denies
+# a host that is not on the allowlist, and every turn fails. That is the trap
+# the judge hit with light-servers.
+services:
+  main:
+    environment:
+      NO_PROXY: "light-servers,main,judge,egress-proxy,headroom,localhost,127.0.0.1,0.0.0.0,::1"
+      no_proxy: "light-servers,main,judge,egress-proxy,headroom,localhost,127.0.0.1,0.0.0.0,::1"
+      # Claude Code's tool search is left alone on purpose. It was turned off
+      # here for two runs, which did not help: the flag is a mode selector, not
+      # a switch, and the damage was on the proxy's side. compress_proxy.py
+      # relays `tools` untouched, so the feature works as it does without it.
+    depends_on:
+      headroom:
+        condition: service_healthy
+
+  headroom:
+    image: headroom-compress:latest
+    # Bounded and restarted, because this container is the agent's ONLY route to
+    # the model. A run died exactly here: the docker VM hit a global OOM, the
+    # kernel picked this process, and Claude Code ended the session with "API
+    # Error: Can't reach the API server (EAI_AGAIN)" -- docker stops resolving
+    # the name of a container that is gone. The limit keeps it from being the
+    # cause; the restart gives a retry something to reach. 1 GB is ample: the
+    # library build measures ~250 MB resident, against ~400 MB for the
+    # `headroom proxy` image this replaces.
+    mem_limit: 1g
+    restart: unless-stopped
+    environment:
+      # api.anthropic.com, or zbridge on the host for a GLM run. Set per run by
+      # scripts/run_task.sh, which is also what tells squid to allow it.
+      ANTHROPIC_TARGET_API_URL: "${HEADROOM_UPSTREAM:?set per run by scripts/run_task.sh}"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      # Measured 17s to healthy: the proxy retries its own blocked startup
+      # fetches before serving. A shorter period marks main's dependency failed.
+      start_period: 30s

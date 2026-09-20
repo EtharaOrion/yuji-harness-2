@@ -1,0 +1,15 @@
+{
+  "model": "claude-3-5-sonnet-latest",
+  "max_tokens": 128,
+  "messages": [
+    {"role": "user", "content": "Look up q=x."},
+    {"role": "assistant", "content": [
+      {"type": "text", "text": "Let me check."},
+      {"type": "tool_use", "id": "toolu_call_a", "name": "lookup", "input": {"q": "x"}}
+    ]},
+    {"role": "user", "content": [
+      {"type": "text", "text": "Additional context after the result."},
+      {"type": "tool_result", "tool_use_id": "toolu_call_a", "content": "{\"ok\":true}"}
+    ]}
+  ]
+}

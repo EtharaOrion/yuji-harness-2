@@ -1,0 +1,57 @@
+# The judge's own way out, under network isolation. Bundles with a `judge`
+# service only: scripts/run_task.sh adds this after overlay.yaml (and after
+# overlay-zbridge.yaml on GLM runs) when the bundle's compose declares one.
+#
+# overlay.yaml makes `default` internal, which is right for the agent and wrong
+# for the judge: codex has to reach OpenAI to grade. Putting the judge on
+# `egress` would hand it the open internet while it reads text the agent wrote.
+# So the judge gets the agent's shape with its own allowlist:
+#
+#   default    main <-> judge, the grade request. Internal, unchanged.
+#   judge-net  judge <-> judge-proxy. Internal: no gateway.
+#   egress     judge-proxy -> chatgpt.com, auth.openai.com (squid-judge.conf).
+#
+# main never joins judge-net, so the agent cannot use the judge's proxy; the
+# judge never joins egress, so its only route out is that proxy. Same image as
+# egress-proxy, different config -- both configs are baked in and parsed at build.
+
+networks:
+  judge-net:
+    internal: true
+
+services:
+  judge:
+    networks:
+      - default
+      - judge-net
+    environment:
+      HTTP_PROXY: "http://judge-proxy:3128"
+      HTTPS_PROXY: "http://judge-proxy:3128"
+      http_proxy: "http://judge-proxy:3128"
+      https_proxy: "http://judge-proxy:3128"
+      # Everything on the compose bridge stays off the proxy. light-servers is
+      # the one that bites: tests/state_dump.py reads the world back out of it by
+      # hostname, and with only loopback exempt those calls went to judge-proxy,
+      # which allows OpenAI and nothing else. Measured as
+      # `TCP_DENIED/403 POST http://light-servers:9142/mcp` at the proxy and, in
+      # the trial, every app's dump failing while the state channel reported
+      # unavailable. Same set as main's NO_PROXY in overlay.yaml, with the
+      # judge's own proxy in place of the agent's.
+      NO_PROXY: "light-servers,main,judge,judge-proxy,localhost,127.0.0.1,0.0.0.0,::1"
+      no_proxy: "light-servers,main,judge,judge-proxy,localhost,127.0.0.1,0.0.0.0,::1"
+    depends_on:
+      judge-proxy:
+        condition: service_healthy
+
+  judge-proxy:
+    image: egress-proxy:latest
+    command: ["-f", "/etc/squid/squid-judge.conf", "-NYC"]
+    networks:
+      - judge-net
+      - egress
+    healthcheck:
+      test: ["CMD", "squid", "-k", "check", "-f", "/etc/squid/squid-judge.conf"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s

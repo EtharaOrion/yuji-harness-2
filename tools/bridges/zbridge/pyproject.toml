@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zbridge"
+version = "0.1.0"
+description = "Anthropic-shaped local proxy that translates to z.ai's GLM Coding Plan"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi==0.115.5",
+    "uvicorn==0.32.1",
+    "httpx==0.27.2",
+    "pydantic==2.10.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "respx>=0.21.1",
+    "ruff>=0.7.0",
+]
+
+[project.scripts]
+zbridge = "zbridge.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["zbridge*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "integration: integration tests using respx-mocked upstream",
+    "smoke: real-endpoint smoke tests requiring ZB_ZAI_API_KEY",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py", "smoke_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

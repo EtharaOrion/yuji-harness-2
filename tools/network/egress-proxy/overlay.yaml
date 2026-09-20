@@ -1,0 +1,136 @@
+# Network isolation for the agent phase.
+#
+# Passed to harbor as --extra-docker-compose by scripts/run_task.sh, which lands
+# it at harbor/environments/docker/docker.py:277 -- AFTER the task's own
+# environment/docker-compose.yaml and before the mounts overlay. That ordering is
+# what lets one file cover every bundle without editing any of them.
+#
+# Harbor authors no `networks:` key anywhere and never runs `docker network`; it
+# only hands an ordered list of -f files to `docker compose`. So the project's
+# network topology is ours to state here, and nothing upstream contests it.
+#
+# WHAT THIS DOES
+#
+#   default   the network every service already sits on implicitly, redeclared
+#             `internal: true`. Docker then attaches no gateway to it, so main
+#             and light-servers keep talking to each other and lose every route
+#             off the bridge. Neither service needs a `networks:` key for this;
+#             overriding the implicit default reaches them both.
+#
+#   egress    a second, ordinary bridge. Only egress-proxy joins it, so it is
+#             the single path out of the project.
+#
+# The agent runs as root and can edit its own environment, but it cannot attach
+# itself to a network it was not placed on. Unsetting HTTPS_PROXY therefore
+# gains it nothing -- there is no route to unset it toward. That is the whole
+# reason the block lives in the routing table rather than in env vars.
+#
+# network_mode in task.toml stays "public" and MUST stay "public": it is the
+# only value that appends no Harbor overlay. Setting "no-network" here would add
+# services.main.network_mode: none, which detaches main from the bridge
+# entirely, takes light-servers with it, and grades the run 0 with no MCP tools.
+# See tools/network/egress-proxy/squid.conf for the full argument.
+#
+# Disable with NETWORK_ISOLATION_OFF=1 (scripts/run_task.sh).
+
+networks:
+  default:
+    internal: true
+  egress:
+    driver: bridge
+
+services:
+  main:
+    environment:
+      # Belt to the routing table's braces. The route is what enforces the
+      # policy; these just tell well-behaved clients where the door is, so a
+      # denied host reports a proxy 403 instead of a DNS timeout.
+      HTTP_PROXY: "http://egress-proxy:3128"
+      HTTPS_PROXY: "http://egress-proxy:3128"
+      http_proxy: "http://egress-proxy:3128"
+      https_proxy: "http://egress-proxy:3128"
+      # Sidecar traffic must not be proxied -- it never leaves the bridge, and
+      # routing it through squid would fail the allowlist. Mirrors the
+      # INTERNAL_HOSTS set in tools/network/detect_internet_use.py.
+      # judge is the bundle's rubric judge; test.sh step 3 calls it directly.
+      NO_PROXY: "light-servers,main,judge,egress-proxy,localhost,127.0.0.1,0.0.0.0,::1"
+      no_proxy: "light-servers,main,judge,egress-proxy,localhost,127.0.0.1,0.0.0.0,::1"
+      # Claude Code reaches more than api.anthropic.com: update checks, feature
+      # flags, and two Datadog intakes for telemetry and error reports. squid
+      # denies all of them, which is correct but wasteful -- each one is a
+      # connection attempt, a 403, and a retry, and every denial lands in
+      # access.log next to the ones an operator is actually looking for.
+      #
+      # This turns the optional traffic off at the source instead. It does not
+      # relax the allowlist: anything still attempted is still denied.
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      # Package managers, told to stop before they start.
+      #
+      # These change NOTHING about what can leave -- the routing table already
+      # settled that. What they change is how long it takes to find out: an
+      # unconfigured `pip install pandas` opens a socket toward a gateway that
+      # does not exist and waits out a connect timeout, then a retry, then
+      # another, and the agent spends the whole time watching. With these set it
+      # refuses in milliseconds and the turn is cheap.
+      #
+      # PIP_NO_INDEX lived in .env for a while doing exactly nothing: it is a
+      # variable on the HOST shell, no code in the repo read it, and harbor
+      # forwards no such thing into the container. THIS is where it had to be.
+      PIP_NO_INDEX: "1"
+      PIP_RETRIES: "0"
+      PIP_TIMEOUT: "5"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      npm_config_offline: "true"
+      npm_config_fetch_retries: "0"
+      npm_config_audit: "false"
+      npm_config_fund: "false"
+      # apt has no offline switch and needs none: it honours http_proxy, which
+      # the block above points at squid, so `apt-get install` gets a 403 with a
+      # hostname in it rather than a hang. Nothing to add here -- and adding a
+      # variable that does not actually do anything is the mistake this comment
+      # is here to avoid repeating.
+    depends_on:
+      # Compose merges this into the task file's own depends_on mapping. Without
+      # it the agent can start before squid is listening, and the first model
+      # call fails as a connection refused that reads like an outage.
+      egress-proxy:
+        condition: service_healthy
+
+  egress-proxy:
+    image: egress-proxy:latest
+    # Built by `make build-egress-proxy`. Never `build:` here -- a task project
+    # would rebuild it per run, and run_task.sh checks the tag exists up front.
+    networks:
+      - default
+      - egress
+    volumes:
+      # PER-RUN PROOF OF DENIAL.
+      #
+      # access.log is the only ground truth about what the agent actually tried
+      # and what squid actually refused. Without this mount it is unreachable
+      # from the audit: entrypoint.sh tails it into `docker logs`, but harbor
+      # tears the project down before scripts/run_task.sh reaches stage_netaudit
+      # (docker.py:600, `down --rmi local --volumes --remove-orphans`), and
+      # STAGE=reshape can be run days later against an output tree whose
+      # containers are long gone. So it has to be persisted DURING the run.
+      #
+      # HOST_AGENT_LOGS_PATH is harbor's own per-trial host path for the dir it
+      # mounts at /logs/agent -- exported into the compose environment by
+      # harbor/environments/docker/compose_env.py::legacy_log_mount_env_vars.
+      # Using it rather than a path of our own buys two things: it is distinct
+      # per attempt, so `--n-attempts 3` yields three separate logs with no
+      # positional guessing about which belongs to which run; and it is a bind
+      # mount, so it survives the `--volumes` teardown that would destroy a
+      # named volume.
+      #
+      # `:?` and not a default. A silently-unmounted log reads as "no denials
+      # recorded", which is indistinguishable from "clean run" -- the precise
+      # confusion between configured and verified that this mount exists to
+      # remove. Fail loudly at `compose up` instead.
+      - "${HOST_AGENT_LOGS_PATH:?network isolation needs harbor's per-trial agent log mount (set by harbor; export it by hand if driving compose directly)}:/egress-out"
+    healthcheck:
+      test: ["CMD", "squid", "-k", "check", "-f", "/etc/squid/squid.conf"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s

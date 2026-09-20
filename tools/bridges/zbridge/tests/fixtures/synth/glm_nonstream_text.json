@@ -1,0 +1,18 @@
+{
+  "id": "202601020304050abc123",
+  "created": 1782000000,
+  "model": "glm-5.3",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "Hi"
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 5,
+    "completion_tokens": 1,
+    "total_tokens": 6
+  }
+}

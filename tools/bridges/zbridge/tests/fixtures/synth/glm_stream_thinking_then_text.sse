@@ -1,0 +1,14 @@
+data: {"id":"2","model":"glm-5.3","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":""},"finish_reason":null}]}
+
+data: {"id":"2","model":"glm-5.3","choices":[{"index":0,"delta":{"reasoning_content":"Let me "},"finish_reason":null}]}
+
+data: {"id":"2","model":"glm-5.3","choices":[{"index":0,"delta":{"reasoning_content":"think."},"finish_reason":null}]}
+
+data: {"id":"2","model":"glm-5.3","choices":[{"index":0,"delta":{"content":"OK, "},"finish_reason":null}]}
+
+data: {"id":"2","model":"glm-5.3","choices":[{"index":0,"delta":{"content":"here."},"finish_reason":null}]}
+
+data: {"id":"2","model":"glm-5.3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":8}}
+
+data: [DONE]
+

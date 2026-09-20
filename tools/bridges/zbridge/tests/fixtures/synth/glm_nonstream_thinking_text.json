@@ -1,0 +1,20 @@
+{
+  "id": "202601020304050def456",
+  "created": 1782000001,
+  "model": "glm-5.3",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "reasoning_content": "The user greeted me; I should respond concisely.",
+      "content": "Hello!"
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 8,
+    "completion_tokens": 12,
+    "total_tokens": 20,
+    "prompt_tokens_details": {"cached_tokens": 3}
+  }
+}

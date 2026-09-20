@@ -1,0 +1,6 @@
+data: {"id":"6","model":"glm-5.3","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"6","model":"glm-5.3","choices":[{"index":0,"delta":{"content":"Hello."}}]}
+
+data: [DONE]
+

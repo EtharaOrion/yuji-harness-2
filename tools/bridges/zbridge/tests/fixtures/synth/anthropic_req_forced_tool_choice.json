@@ -1,0 +1,11 @@
+{
+  "model": "claude-3-5-sonnet-latest",
+  "max_tokens": 256,
+  "tools": [{
+    "name": "lookup",
+    "description": "Look up a value by key.",
+    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}
+  }],
+  "tool_choice": {"type": "tool", "name": "lookup"},
+  "messages": [{"role": "user", "content": "hi"}]
+}

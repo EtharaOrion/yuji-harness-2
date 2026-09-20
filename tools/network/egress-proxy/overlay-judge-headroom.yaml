@@ -1,0 +1,26 @@
+# Grader-path Headroom, inside the judge container where the grading happens.
+#
+# Added by scripts/run_task.sh only when GRADER_HEADROOM_ENABLED=true. The image
+# is a separate tag because the library adds ~440 MB (litellm and friends) to an
+# image every run pulls in, for a saving measured at 0 to 3% on real
+# trajectories -- see services/scoring/grader_compress.py.
+#
+# No network change: compression happens inside the judge process, before the
+# codex call, and made no outbound request in testing. The judge keeps its own
+# squid (chatgpt.com, auth.openai.com) exactly as before.
+services:
+  judge:
+    image: codex-judge-headroom:latest
+    environment:
+      GRADER_HEADROOM_ENABLED: "true"
+      # The vocab is baked into this image at /opt/tiktoken. Without it token
+      # counting falls back to estimation, since the judge cannot download it.
+      TIKTOKEN_CACHE_DIR: "/opt/tiktoken"
+      # headroom reaches for HuggingFace and litellm's price list on import.
+      # The judge's squid denies both; these keep it from trying.
+      HEADROOM_OFFLINE: "1"
+      HEADROOM_TELEMETRY: "off"
+      HEADROOM_UPDATE_CHECK: "off"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
