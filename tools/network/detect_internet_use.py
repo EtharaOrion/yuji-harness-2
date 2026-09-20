@@ -200,7 +200,7 @@ TOOL_CALLS = 0
 #
 # The file's existence is the better witness anyway, and it is cheap: only
 # tools/network/egress-proxy/entrypoint.sh creates it, with `tee -a` at
-# container start, and tools/delivery/harbor_to_output.py:429 copies nothing
+# container start, and tools/delivery_utils/harbor_to_output.py:429 copies nothing
 # that does not exist. So a file here -- even a zero-byte one -- means the
 # egress-proxy container came up with its mount attached, which means
 # overlay.yaml was applied, which is what puts `internal: true` on the agent's
@@ -248,7 +248,7 @@ def flag(step: int | None, tool: str, kind: str, detail: str, evidence: str,
 # squid's access.log is the other half: not what the model said it would do, but
 # what actually arrived at the proxy and what the proxy did about it. It is
 # written per attempt into the trial's agent-log dir (tools/network/egress-proxy/
-# entrypoint.sh) and reaches the run dir via tools/delivery/harbor_to_output.py.
+# entrypoint.sh) and reaches the run dir via tools/delivery_utils/harbor_to_output.py.
 # --------------------------------------------------------------------------
 
 # The one host squid lets out. tools/network/egress-proxy/squid.conf is the source of

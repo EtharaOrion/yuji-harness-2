@@ -1148,7 +1148,7 @@ stage_harbor() {
     echo "             $(printf '%s' "$_pre" | tr '\n' ' ')" >&2
     echo "           Delete them once inspected. To convert one deliberately (it was a" >&2
     echo "           real attempt whose reshape never finished):" >&2
-    echo "             python3 tools/delivery/harbor_to_output.py $_job_dir \\" >&2
+    echo "             python3 tools/delivery_utils/harbor_to_output.py $_job_dir \\" >&2
     echo "               --output-dir $OUTPUT_DIR --run-offset <n> --only-trials <name>" >&2
   fi
 
@@ -1934,7 +1934,7 @@ stage_reshape() {
     rm -rf "$stash"
   fi
 
-  local conv=(python3 tools/delivery/harbor_to_output.py "$OUTPUT_DIR/$JOB" \
+  local conv=(python3 tools/delivery_utils/harbor_to_output.py "$OUTPUT_DIR/$JOB" \
               --output-dir "$OUTPUT_DIR" --at "$AT" --run-offset "$offset")
   # Convert only the trials stage_harbor just made. Without this the reshaper
   # adopts every stale trial dir in the job dir as an extra run (see the
@@ -1973,7 +1973,7 @@ stage_mask() {
   [ -d "$dir" ] || { echo "[mask] no output dir to mask" >&2; return 0; }
   # Never fatal: a delivered tree with a stray path in it beats a run marked
   # failed after the agent phase already spent its money.
-  python3 tools/delivery/make_delivery.py --mask-only "$dir" \
+  python3 tools/delivery_utils/make_delivery.py --mask-only "$dir" \
     || echo "[mask] WARNING: path mask failed (non-fatal)" >&2
 }
 

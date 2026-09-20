@@ -14,7 +14,7 @@ not fail early and loudly; it fails late, leaving a trial directory with no
 ``config.json``, and every stage downstream treats that as "a run that produced
 nothing" rather than "a run that never started":
 
-  tools/delivery/harbor_to_output.py:1129 selects trial dirs with
+  tools/delivery_utils/harbor_to_output.py:1129 selects trial dirs with
       ``(p / "config.json").exists()``
   so an aborted trial is silently SKIPPED, ``written`` comes back empty, and
   reshape exits 0 having done nothing. No traceback, no error -- just a task

@@ -500,7 +500,7 @@ def main() -> int:
 
     # Repo-relative, not the absolute path resolve() gave us above: the receipt
     # ships inside the delivered output tree, and the operator's home directory
-    # is not part of what the run produced. tools/delivery/scrub_paths.py would
+    # is not part of what the run produced. tools/delivery_utils/scrub_paths.py would
     # strip it anyway -- writing it right here means the file is never wrong on
     # disk, including for a run whose scrub pass never gets to it.
     rel_run_dir = _repo_relative(run_dir)

@@ -18,7 +18,7 @@ def _cut(value: float, dp: int = 2) -> float:
     """Truncate to `dp` places, mirroring harbor_to_output.norm_reward.
 
     Defined here rather than imported: this module is mounted into the task
-    container at /harness/scoring, where tools/delivery does not exist. The
+    container at /harness/scoring, where tools/delivery_utils does not exist. The
     same reason ctrf_pytest_plugin.py carries its own copy. All three must
     agree, or the container and the host publish different numbers for the
     same run.
