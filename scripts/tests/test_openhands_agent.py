@@ -314,6 +314,132 @@ def test_refusals_are_counted_and_passed_through_untouched():
                    "unchanged": ["msg_ok", "content_filter"]}
 
 
+# A fake Anthropic endpoint that answers the statuses in `plan` first, the way a
+# bridge answers when the host has lost its network, and then `reply`.
+_FLAKY_ANTHROPIC = r"""
+import json, sys, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+sys.path.insert(0, "/src")
+import runner
+
+plan = []
+hits = []
+reply = {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length") or 0))
+        status = plan.pop(0) if plan else 200
+        hits.append(status)
+        if status == 200:
+            body = {"id": f"msg_{len(hits)}", "type": "message", "role": "assistant",
+                    "model": "claude-opus-5", "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 1}, **reply}
+        else:
+            body = {"type": "error", "error": {"type": "api_error", "message":
+                    "upstream network error: [Errno 8] nodename nor servname provided, or not known"}}
+        raw = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *a):
+        pass
+
+srv = HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{srv.server_port}"
+"""
+
+_BAD_GATEWAY_PROBE = _FLAKY_ANTHROPIC + r"""
+from openhands.sdk import LLM, Message, TextContent
+import openhands.sdk.llm.llm as sdk_llm
+from litellm.exceptions import BadGatewayError
+
+retries = []
+msgs = [Message(role="user", content=[TextContent(text="hi")])]
+
+def attempt(num_retries, statuses):
+    hits.clear(); retries.clear(); plan[:] = statuses
+    llm = LLM(model="anthropic/claude-opus-5", api_key="x", base_url=base, usage_id="probe",
+              num_retries=num_retries, retry_min_wait=0, retry_max_wait=0, retry_multiplier=0,
+              retry_listener=lambda a, t, e: retries.append([a, t, getattr(e, "status_code", None)]))
+    try:
+        llm.completion(msgs)
+        outcome = "ok"
+    except Exception as exc:  # noqa: BLE001
+        outcome = type(exc).__name__
+    return {"outcome": outcome, "hits": list(hits), "retries": list(retries)}
+
+out = {"stock": attempt(5, [502, 502])}
+out["installed"] = [runner.retry_bad_gateway(), runner.retry_bad_gateway()]
+out["listed"] = sum(k is BadGatewayError for k in sdk_llm.LLM_RETRY_EXCEPTIONS)
+out["recovers"] = attempt(5, [502, 502])
+out["gives_up"] = attempt(3, [502] * 5)
+print(json.dumps(out))
+"""
+
+
+def _in_runtime(probe: str) -> dict:
+    proc = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", "-v", f"{AGENT_DIR}:/src:ro",
+         "-e", "OPENHANDS_SUPPRESS_BANNER=1", "-e", "LITELLM_LOCAL_MODEL_COST_MAP=True",
+         "-e", "LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS=True", "openhands-runtime:latest",
+         "/opt/openhands-runtime/venv/bin/python", "-c", probe],
+        capture_output=True, text=True, timeout=240)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.skipif(not _runtime_image_ready(), reason="needs docker and openhands-runtime:latest")
+def test_a_bridge_502_is_retried_with_backoff_not_fatal():
+    """A bridge answers 502 when the host briefly loses its network. The pinned
+    SDK does not retry 502 (ed8fbb42 on glm-5.3 died on one); with the patch it
+    backs off and retries like a 503, and still gives up after num_retries."""
+    out = _in_runtime(_BAD_GATEWAY_PROBE)
+    assert out["stock"] == {"outcome": "BadGatewayError", "hits": [502], "retries": []}, (
+        "the SDK retries 502 by itself now; retry_bad_gateway may be unneeded")
+    assert out["installed"] == [True, True] and out["listed"] == 1
+    assert out["recovers"] == {"outcome": "ok", "hits": [502, 502, 200],
+                               "retries": [[1, 5, 502], [2, 5, 502]]}
+    assert out["gives_up"] == {"outcome": "BadGatewayError", "hits": [502, 502, 502],
+                               "retries": [[1, 3, 502], [2, 3, 502]]}
+
+
+_RUN_THROUGH_A_502_PROBE = _FLAKY_ANTHROPIC + r"""
+import os
+from pathlib import Path
+
+plan[:] = [502]
+reply = {"stop_reason": "tool_use", "content": [
+    {"type": "tool_use", "id": "toolu_1", "name": "finish", "input": {"message": "done"}}]}
+Path("/tmp/ws").mkdir()
+Path("/tmp/instruction.md").write_text("Say done.")
+os.environ.update(LLM_MODEL="anthropic/claude-opus-5", LLM_API_KEY="x", LLM_BASE_URL=base,
+                  MAX_ITERATIONS="3", MAX_CONTINUATIONS="0")
+rc = runner.main(["--instruction-file", "/tmp/instruction.md", "--logs-dir", "/tmp/logs",
+                  "--workspace", "/tmp/ws"])
+lines = [json.loads(l) for l in Path("/tmp/logs/openhands.txt").read_text().splitlines()]
+print(json.dumps({
+    "rc": rc, "hits": hits,
+    "retries": [{k: l.get(k) for k in ("attempt", "max_attempts", "error_status")}
+                for l in lines if l.get("subtype") == "api_retry"],
+    "result": [l.get("subtype") for l in lines if l.get("type") == "result"]}))
+"""
+
+
+@pytest.mark.skipif(not _runtime_image_ready(), reason="needs docker and openhands-runtime:latest")
+def test_a_run_rides_out_a_502_and_logs_the_retry():
+    """The whole runner, at the SDK's real backoff (8 s before the first retry):
+    the run finishes normally, and the stream says the model was unreachable."""
+    out = _in_runtime(_RUN_THROUGH_A_502_PROBE)
+    assert out == {"rc": 0, "hits": [502, 200],
+                   "retries": [{"attempt": 1, "max_attempts": 5, "error_status": 502}],
+                   "result": ["success"]}
+
+
 # =============================================================================
 # 2. AGENT -- under harbor's own interpreter
 # =============================================================================
@@ -580,11 +706,11 @@ def test_isolation_adds_the_ccbridge_squid_config(tmp_path, fake_bridge):
 def test_agent_kwargs_come_from_the_openhands_env(tmp_path, fake_bridge):
     run = _dispatch(tmp_path, fake_bridge, NETWORK_ISOLATION_OFF="1",
                     OPENHANDS_MAX_ITERATIONS="42", OPENHANDS_REASONING_EFFORT="medium",
-                    OPENHANDS_THINKING_DISPLAY="summarized")
+                    OPENHANDS_THINKING_DISPLAY="summarized", OPENHANDS_NUM_RETRIES="8")
     assert run.returncode == 0, run.stderr[-3000:]
     aks = [run.argv[i + 1] for i, a in enumerate(run.argv) if a == "--ak"]
     assert "max_iterations=42" in aks and "reasoning_effort=medium" in aks
-    assert "thinking_display=summarized" in aks
+    assert "thinking_display=summarized" in aks and "num_retries=8" in aks
 
 
 def test_a_bridge_holding_another_secret_is_refused(tmp_path, fake_bridge):

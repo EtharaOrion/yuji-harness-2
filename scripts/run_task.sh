@@ -30,6 +30,7 @@
 #                OPENHANDS_MAX_ITERATIONS (500) OPENHANDS_MAX_CONTINUATIONS (6)
 #                OPENHANDS_REASONING_EFFORT (SDK default) OPENHANDS_MAX_OUTPUT_TOKENS (32000)
 #                OPENHANDS_THINKING_DISPLAY (summarized | omitted)
+#                OPENHANDS_NUM_RETRIES (5 attempts per model call, backing off 8-64s)
 #
 # Values may also come from <repo>/.env, which is read as DEFAULTS only: anything
 # already in the environment wins over it. NETWORK_ISOLATION_OFF is the one key
@@ -1181,6 +1182,9 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
     # summarized (default, readable thinking in the trajectory) or omitted:
     # tools/openhands_agent/README.md, "Thinking".
     [ -n "${OPENHANDS_THINKING_DISPLAY:-}" ] && args+=(--ak "thinking_display=$OPENHANDS_THINKING_DISPLAY")
+    # How long a model call rides out an unreachable model (a bridge 502, a
+    # 503, a timeout): each attempt past the fourth adds 64s of waiting.
+    [ -n "${OPENHANDS_NUM_RETRIES:-}" ] && args+=(--ak "num_retries=$OPENHANDS_NUM_RETRIES")
   fi
   # Trial dirs left behind by EARLIER invocations. Harbor never removes a trial
   # that died (docker build failure, Ctrl-C, agent-setup timeout) and

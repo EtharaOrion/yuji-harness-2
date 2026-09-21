@@ -686,6 +686,36 @@ def count_refusals(on_refusal=None) -> bool:
     return True
 
 
+def retry_bad_gateway() -> bool:
+    """Let the SDK retry a 502 with backoff, as it already retries a 503.
+
+    Both bridges answer 502 when they cannot reach their upstream: a network
+    error, or their own few seconds of inline retries used up. LiteLLM raises
+    that as BadGatewayError, and the SDK's retry list
+    (openhands.sdk.llm.llm.LLM_RETRY_EXCEPTIONS) holds connection errors, 429,
+    500, 503 and timeouts (a 504 maps to Timeout) but not 502. So one short
+    network drop on the host ended the run: ed8fbb42 on glm-5.3, 2026-09-22,
+    stopped after 59 tool calls when the host briefly could not resolve
+    api.z.ai.
+
+    With 502 on the list, the SDK's own exponential backoff applies:
+    `num_retries` attempts in all, 8, 16, 32, then 64 s apart at its defaults
+    (about 2 minutes over the default 5 attempts). The list is read each time
+    a call's retry decorator is built, so rebinding the module attribute is
+    enough. Returns whether the patch was installed.
+    """
+    try:
+        import openhands.sdk.llm.llm as sdk_llm
+        from litellm.exceptions import BadGatewayError
+    except Exception as exc:  # noqa: BLE001
+        print(f"[openhands] 502 retry not installed: {exc}", file=sys.stderr)
+        return False
+    current = tuple(sdk_llm.LLM_RETRY_EXCEPTIONS)
+    if not any(issubclass(BadGatewayError, kind) for kind in current):
+        sdk_llm.LLM_RETRY_EXCEPTIONS = current + (BadGatewayError,)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -782,11 +812,24 @@ def main(argv: list[str] | None = None) -> int:
         count_refusals(lambda rid: stream.write({
             "type": "system", "subtype": "refusal", "response_id": rid,
             "detail": "Anthropic returned stop_reason \"refusal\" with no content"}))
+        retry_bad_gateway()
+
+        def on_retry(attempt: int, attempts: int, err: BaseException | None) -> None:
+            # Called before each backoff sleep, so a run that recovered still
+            # shows in its log that the model was unreachable for a while.
+            detail = f"{type(err).__name__}: {err}" if err is not None else "unknown error"
+            print(f"[openhands] model call failed (attempt {attempt}/{attempts}), "
+                  f"backing off: {detail[:300]}", file=sys.stderr)
+            stream.write({"type": "system", "subtype": "api_retry", "attempt": attempt,
+                          "max_attempts": attempts,
+                          "error_status": getattr(err, "status_code", None),
+                          "error": detail[:500]})
 
         llm_kwargs: dict[str, Any] = {
             "model": model, "api_key": api_key, "base_url": base_url,
             "usage_id": "agent",
             "num_retries": _env_int("LLM_NUM_RETRIES", 5),
+            "retry_listener": on_retry,
             # A single thinking turn on a large context runs for minutes; the
             # SDK's 300s default cut healthy turns off. The bridge's own read
             # timeout is raised to match (run_task.sh ensure_ccbridge).

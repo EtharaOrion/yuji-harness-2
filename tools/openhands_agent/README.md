@@ -88,6 +88,29 @@ it. It is sent one fixed sentence that carries no task content (the
 reference harness's `CONTINUATION_NOTICE`). This happens at most
 `max_continuations` times.
 
+## When the model is unreachable
+
+A failed model call is retried with exponential backoff: `num_retries` attempts
+in all, waiting 8, 16, 32 and then 64 s between them. At the default of 5,
+that rides out about 2 minutes of lost network; at 8, about 5.
+
+The SDK does this by itself for connection errors, 429, 500, 503 and timeouts
+(a 504 arrives as a timeout), but not for **502**. That is what both bridges
+answer when the host cannot reach the upstream, for example when the host loses
+Wi-Fi or DNS for a moment. On 2026-09-22 a single one ended a glm-5.3 run of
+ed8fbb42 after 59 tool calls: the host could not resolve `api.z.ai` for a few
+seconds. `retry_bad_gateway` in `runner.py` adds 502 to the SDK's list.
+
+Each retry writes a line to the stream, so a run that recovered still shows the
+outage:
+
+```json
+{"type": "system", "subtype": "api_retry", "attempt": 1, "max_attempts": 5, "error_status": 502, "error": "BadGatewayError: ..."}
+```
+
+Once the attempts are used up, the run ends as `error_during_execution`, and
+the reshaper classifies it as infrastructure, not as the model's failure.
+
 ## Models
 
 | | Claude (default) | GLM (`CC_MODE=zbridge`) |
@@ -114,6 +137,7 @@ kwargs:
 | `OPENHANDS_REASONING_EFFORT` | `reasoning_effort` | SDK default (`high`) |
 | `OPENHANDS_MAX_OUTPUT_TOKENS` | `max_output_tokens` | 32000 (SDK default 16384) |
 | `OPENHANDS_THINKING_DISPLAY` | `thinking_display` | `summarized` (or `omitted`, see "Thinking") |
+| `OPENHANDS_NUM_RETRIES` | `num_retries` | 5 (see "When the model is unreachable") |
 
 `MODEL` keeps its bare name (`claude-opus-5`). It keys every report and
 trajectory directory, and `agent.py` maps it to LiteLLM's `anthropic/claude-opus-5`.

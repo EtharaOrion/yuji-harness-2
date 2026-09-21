@@ -113,7 +113,8 @@ class OpenHandsAgentOptions(InstalledAgentOptions):
         default=1800, ge=1, description="Seconds one model call may take.",
     )
     num_retries: int = Field(
-        default=5, ge=0, description="SDK retries per model call.",
+        default=5, ge=0, description="Attempts per model call, with exponential backoff "
+        "(8, 16, 32, then 64 s between them). Covers 502/503/504, 429, timeouts.",
     )
     temperature: float | None = Field(
         default=None, description="Sampling temperature; dropped by the SDK for thinking models.",
