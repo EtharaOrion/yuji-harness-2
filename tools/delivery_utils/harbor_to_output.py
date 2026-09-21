@@ -41,6 +41,27 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 
+
+def task_source_root(task_slug: str) -> Path:
+    """The lane root that actually holds this bundle.
+
+    `tasks/` stays the first choice, so any layout that resolves today resolves
+    identically and this function is a no-op for it. A bundle authored under a
+    sibling lane root instead (staging/, delivery/, samples/) was previously
+    reported as a miss, and delivery then shipped it with no environment/ -- a
+    bundle that cannot start anywhere else. Falling back to those roots is
+    additive: when none of them holds the slug the default is returned unchanged
+    and the caller reports the same miss it reported before.
+    """
+    default = REPO / "tasks"
+    if (default / task_slug).is_dir():
+        return default
+    for candidate in (REPO.parent / "staging", REPO.parent / "delivery",
+                      REPO.parent / "samples"):
+        if (candidate / task_slug).is_dir():
+            return candidate
+    return default
+
 # The only reward digit count in the pipeline. Every reward-shaped number
 # derives from it; no call site writes a literal.
 REWARD_DP = 2
@@ -2053,7 +2074,7 @@ def main(argv=None) -> int:
     if _mod is not None and written:
         _delivery_dir = a.output_dir.parent / "delivery_output"
         for w in written:
-            _mod.make_delivery(w.name, a.output_dir, REPO / "tasks", _delivery_dir)
+            _mod.make_delivery(w.name, a.output_dir, task_source_root(w.name), _delivery_dir)
             print(f"[delivery] {w.name} → {_delivery_dir / w.name}")
     return 0
 
