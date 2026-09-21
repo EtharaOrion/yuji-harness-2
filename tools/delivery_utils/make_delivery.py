@@ -10,7 +10,7 @@ from typing import NamedTuple
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
-from harbor_to_output import norm_reward, pct_to_reward 
+from harbor_to_output import norm_reward, pct_to_reward, bundle_dir_names
 
 # tools/delivery/make_delivery.py -> the checkout root. Every path this
 # file masks is measured against it.
@@ -110,6 +110,11 @@ _VENDOR_IGNORE = shutil.ignore_patterns(
 # source silently, so the symptom is /harness/scoring existing and being empty:
 # test.sh exits 2 and no reward file is ever written.
 _SCORING_SRC = "../../../services/scoring"
+# A bundle authored in a lane root beside harness/ (staging/<uuid>/, delivery/,
+# samples/) reaches the same tree through harness/. Left unrewritten, it shipped
+# pointing outside the bundle while the compose header claimed ./scoring.
+_SCORING_SRC_LANE = "../../../harness/services/scoring"
+_SCORING_SRCS = (_SCORING_SRC_LANE, _SCORING_SRC)
 _SCORING_DST = "./scoring"
 
 _COMPOSE_NOTE = """\
@@ -332,11 +337,11 @@ def _rewrite_compose(compose: Path, shipped: list[str]) -> None:
         # says which of the two the reader is looking at.
         text = "".join(
             line if line.lstrip().startswith("#")
-            else line.replace(_SCORING_SRC, _SCORING_DST)
+            else line.replace(_SCORING_SRC_LANE, _SCORING_DST).replace(_SCORING_SRC, _SCORING_DST)
             for line in text.splitlines(keepends=True)
         )
         left = [ln for ln in text.splitlines()
-                if _SCORING_SRC in ln and not ln.lstrip().startswith("#")]
+                if any(src in ln for src in _SCORING_SRCS) and not ln.lstrip().startswith("#")]
         if left:
             sys.exit(f"Error: {compose} still binds {_SCORING_SRC}: {left}")
 
@@ -396,6 +401,15 @@ def make_delivery(
         nested = sorted(p for p in tasks_dir.glob(f"*/{task_slug}") if p.is_dir())
         if nested:
             task_src = nested[0]
+    if not task_src.exists():
+        # The slug carries task.toml's readable name, but the bundle folder is
+        # often the bare UUID (staging/<uuid>/). Same flat-then-nested order.
+        for name in bundle_dir_names(task_slug)[1:]:
+            hits = [tasks_dir / name] + sorted(p for p in tasks_dir.glob(f"*/{name}") if p.is_dir())
+            hit = next((p for p in hits if p.is_dir()), None)
+            if hit is not None:
+                task_src = hit
+                break
     if task_src.exists():
         shutil.copytree(
             task_src,

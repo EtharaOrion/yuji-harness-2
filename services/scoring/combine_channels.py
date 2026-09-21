@@ -65,10 +65,21 @@ def load_weights_components() -> dict:
 
 
 def load_channel_a() -> float | None:
+    """Channel A in [0, 1].
+
+    Bundle-local grade.py writes it as `score`; the harness grader
+    (tests/grade.py, run by evaluate.sh) writes it as `channel_a`. Reading only
+    `score` silently dropped traj_tests from the ledger for every bundle graded
+    by the harness, and the combined reward was computed without it.
+    """
     if not CHANNEL_A_FILE.exists():
         return None
     try:
-        return float(json.loads(CHANNEL_A_FILE.read_text()).get("score"))
+        data = json.loads(CHANNEL_A_FILE.read_text())
+        value = data.get("score")
+        if value is None:
+            value = data.get("channel_a")
+        return float(value)
     except (ValueError, TypeError, KeyError):
         return None
 

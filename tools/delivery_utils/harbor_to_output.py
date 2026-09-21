@@ -54,13 +54,31 @@ def task_source_root(task_slug: str) -> Path:
     and the caller reports the same miss it reported before.
     """
     default = REPO / "tasks"
-    if (default / task_slug).is_dir():
+    names = bundle_dir_names(task_slug)
+    if any((default / n).is_dir() for n in names):
         return default
     for candidate in (REPO.parent / "staging", REPO.parent / "delivery",
                       REPO.parent / "samples"):
-        if (candidate / task_slug).is_dir():
+        if any((candidate / n).is_dir() for n in names):
             return candidate
     return default
+
+
+_UUID_TAIL = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def bundle_dir_names(task_slug: str) -> list:
+    """Folder names a bundle may live under: its slug first, then its UUID.
+
+    The slug comes from task.toml's name (atlas/ethara_<name>_<uuid>), but lane
+    roots hold bundles under the bare UUID (staging/<uuid>/). Looking up the
+    slug alone missed every such bundle, and delivery shipped an empty data/.
+    """
+    names = [task_slug]
+    m = _UUID_TAIL.search(task_slug)
+    if m and m.group(0) != task_slug:
+        names.append(m.group(0))
+    return names
 
 # The only reward digit count in the pipeline. Every reward-shaped number
 # derives from it; no call site writes a literal.
@@ -227,7 +245,9 @@ def norm_metrics_file(path: Path) -> None:
 
 
 def reward_pct(x):
-    return None if x is None else norm_reward(float(x) * 100)
+    # Scale in Decimal, not float: 0.939 * 100 is 93.89999999999999 in float,
+    # which norm_reward then truncates to 93.89 instead of 93.9.
+    return None if x is None else norm_reward(float(Decimal(repr(float(x))) * 100))
 
 
 def pct_to_reward(x):
@@ -1107,9 +1127,10 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     test_pct = reward_pct(traj_val)
     rubric_pct = reward_pct(rubric_val)
     try:
+        # "reward" is left at full precision: it is a fraction here, and cutting
+        # it to REWARD_DP before reward_pct scales it to a percentage published
+        # 0.939 as 93.0. Both paths below cut it once, at the end.
         _orig_rew = json.loads((ver / "reward.json").read_bytes())
-        if "reward" in _orig_rew:
-            _orig_rew["reward"] = norm_reward(_orig_rew["reward"])
     except Exception:
         _orig_rew = {}
 
@@ -1169,6 +1190,15 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
            if _k in _orig_rew},
         **({"producer": "unscored"} if _producer == "unscored" else {}),
     }
+    # combine_channels.py's full block (quadrant, ledger, formulas) cannot ride in
+    # the container's reward.json: harbor accepts only numbers there and fails the
+    # trial on the first string. Bundles that combine channels write the block to
+    # reward_combined.json and it is folded in here, after harbor has parsed the
+    # numbers. Its keys lead so the published file reads in the combiner's order;
+    # the scored values above still win.
+    _combined = _load(ver / "reward_combined.json", {}) if (ver / "reward_combined.json").exists() else {}
+    if isinstance(_combined, dict) and _combined:
+        reward_pct_doc = {**_combined, **reward_pct_doc}
 
     failure_class, failure_reason = classify_failure(
         passed, traj_rows, rubric_rows, stream, exception,
