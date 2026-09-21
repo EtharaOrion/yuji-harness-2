@@ -49,7 +49,8 @@ CLAUDE_CODE_OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 BUNDLE_ROOT = Path(os.environ.get("BUNDLE_ROOT", "/tests")).parent
 TASK_INSTRUCTION_PATH = Path(os.environ.get("TASK_INSTRUCTION_PATH", "/tests/instruction.md"))
 TASK_TOML_PATH = Path(os.environ.get("TASK_TOML_PATH", str(BUNDLE_ROOT / "task.toml")))
-AGENT_LOG_PATH = Path(os.environ.get("AGENT_LOG_PATH", "/logs/agent/claude-code.txt"))
+AGENT_LOG_PATH = Path(os.environ.get("AGENT_LOG_PATH", "/logs/agent/openhands.txt"))
+TRAJECTORY_JSON_PATH = Path(os.environ.get("TRAJECTORY_JSON_PATH", "/logs/agent/openhands_trajectory.json"))
 REPORT_OUTPUT_PATH = Path(os.environ.get("REPORT_OUTPUT_PATH", "/workspace/out/report.md"))
 MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "100"))
 MODEL = os.environ.get("MODEL", "anthropic/claude-opus-5")
@@ -174,6 +175,34 @@ def main() -> int:
         print(f"openhands-adapter: elapsed={elapsed:.1f}s cost=${cost or 0:.4f}")
 
     log_fh.close()
+
+    try:
+        AGENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with AGENT_LOG_PATH.open("r") as read_fh:
+            events = []
+            for line in read_fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        trajectory = {
+            "agent": "openhands",
+            "model": MODEL,
+            "elapsed_sec": round(time.time() - started_at, 2),
+            "cost_usd": round(getattr(llm.metrics, "accumulated_cost", 0.0) or 0.0, 4),
+            "mcp_servers_configured": len(mcp_config.get("mcpServers", {})),
+            "event_count": len(events),
+            "events": events,
+        }
+        TRAJECTORY_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TRAJECTORY_JSON_PATH.write_text(json.dumps(trajectory, indent=2))
+        print(f"openhands-adapter: trajectory json -> {TRAJECTORY_JSON_PATH}")
+    except Exception as exc:
+        print(f"warn: trajectory.json emission failed: {exc}", file=sys.stderr)
+
     return 0
 
 
