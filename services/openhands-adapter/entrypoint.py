@@ -46,8 +46,8 @@ import tomllib
 from pathlib import Path
 
 CLAUDE_CODE_OAUTH_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-BUNDLE_ROOT = Path(os.environ.get("BUNDLE_ROOT", "/bundle"))
-TASK_INSTRUCTION_PATH = Path(os.environ.get("TASK_INSTRUCTION_PATH", str(BUNDLE_ROOT / "instruction.md")))
+BUNDLE_ROOT = Path(os.environ.get("BUNDLE_ROOT", "/tests")).parent
+TASK_INSTRUCTION_PATH = Path(os.environ.get("TASK_INSTRUCTION_PATH", "/tests/instruction.md"))
 TASK_TOML_PATH = Path(os.environ.get("TASK_TOML_PATH", str(BUNDLE_ROOT / "task.toml")))
 AGENT_LOG_PATH = Path(os.environ.get("AGENT_LOG_PATH", "/logs/agent/openhands.txt"))
 TRAJECTORY_JSON_PATH = Path(os.environ.get("TRAJECTORY_JSON_PATH", "/logs/agent/openhands_trajectory.json"))
@@ -62,13 +62,12 @@ def load_mcp_servers_from_task_toml(task_toml_path: Path) -> dict:
     with task_toml_path.open("rb") as handle:
         data = tomllib.load(handle)
     servers = data.get("environment", {}).get("mcp_servers", []) or []
-    mcp_config = {}
+    mcp_config = {"mcpServers": {}}
     for server in servers:
         name = server.get("name")
         url = server.get("url")
-        transport = server.get("transport", "streamable-http")
         if name and url:
-            mcp_config[name] = {"url": url, "transport": transport}
+            mcp_config["mcpServers"][name] = {"url": url}
     return mcp_config
 
 
@@ -130,7 +129,7 @@ def main() -> int:
     instruction = TASK_INSTRUCTION_PATH.read_text()
     mcp_config = load_mcp_servers_from_task_toml(TASK_TOML_PATH)
 
-    print(f"openhands-adapter: model={MODEL} max_iters={MAX_ITERATIONS} mcp_servers={len(mcp_config)}")
+    print(f"openhands-adapter: model={MODEL} max_iters={MAX_ITERATIONS} mcp_servers={len(mcp_config.get('mcpServers', {}))}")
 
     AGENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -194,7 +193,7 @@ def main() -> int:
             "model": MODEL,
             "elapsed_sec": round(time.time() - started_at, 2),
             "cost_usd": round(getattr(llm.metrics, "accumulated_cost", 0.0) or 0.0, 4),
-            "mcp_servers_configured": len(mcp_config),
+            "mcp_servers_configured": len(mcp_config.get("mcpServers", {})),
             "event_count": len(events),
             "events": events,
         }
