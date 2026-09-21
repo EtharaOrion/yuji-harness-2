@@ -24,5 +24,6 @@ package-lock.json.bak
 logs/
 *.log
 output/
+delivery_output/
 # Eval run outputs (per-run dirs: outputs, logs, scoring)
 results/

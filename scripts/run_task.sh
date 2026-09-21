@@ -1201,7 +1201,7 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
   _harbor_bin="$(command -v harbor)"
   if [ "$AGENT" = "openhands" ] && [ -n "$_harbor_bin" ]; then
     _pypath="$REPO${PYTHONPATH:+:$PYTHONPATH}"
-    _harbor_py="$(head -n 1 "$_harbor_bin" | sed -e 's|^#!||' -e 's|[[:space:]]-E$||' -e 's|[[:space:]]-E[[:space:]].*|\1|' | awk '{print $1}')"
+    _harbor_py="$(head -n 1 "$_harbor_bin" | sed 's|^#!||' | awk '{print $1}')"
     if [ -n "$_harbor_py" ] && [ -x "$_harbor_py" ]; then
       PYTHONPATH="$_pypath" HARBOR_OUTPUT_OFF=1 "$_harbor_py" "$_harbor_bin" "${args[@]}" \
         || { _hrc=$?; echo "[run_task] harbor exited $_hrc; checking whether a trial actually ran" >&2; }
