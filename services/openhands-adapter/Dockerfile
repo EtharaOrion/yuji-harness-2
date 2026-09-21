@@ -2,10 +2,10 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f2998
 
 WORKDIR /opt/openhands-adapter
 
-ARG OPENHANDS_SDK_VERSION=1.43.1
+ARG OPENHANDS_SDK_VERSION=0.31.2
 RUN uv pip install --system --no-cache \
-        "openhands-sdk==${OPENHANDS_SDK_VERSION}" \
-        "openhands-tools>=1.43.0" \
+        "openhands-agent-sdk==${OPENHANDS_SDK_VERSION}" \
+        "pydantic>=2.0" \
         "tomli"
 
 COPY entrypoint.py /opt/openhands-adapter/entrypoint.py
