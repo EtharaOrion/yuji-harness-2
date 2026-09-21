@@ -16,11 +16,14 @@ This writes one file of its own:
                          if not, why. The judge-container check reads it, and
                          so does scripts/run_task.sh.
 
+Before the call it also makes the agent's workspace readable to the judge; see
+open_workspace_to_judge.
+
 Exit 0 only when the judge reports a finished evaluation with a reward written.
 
 Env: JUDGE_TOKEN (required), JUDGE_URL (http://judge:8770),
      JUDGE_WAIT_SEC (120), JUDGE_REQUEST_TIMEOUT_SEC (1200 -- inside the
-     bundle's [verifier] timeout_sec of 1800).
+     bundle's [verifier] timeout_sec of 1800), JUDGE_WORKSPACE (/workspace).
 Stdlib only: `main` has no requests/httpx.
 """
 from __future__ import annotations
@@ -28,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -36,6 +40,9 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 MARKER_NAME = "judge_container.json"
 GRADED_IN = "judge-container"
+# Top-level workspace dirs that are not the agent's output: `../data:/workspace/data:ro`
+# is the bundle's own read-only input mount.
+WORKSPACE_SKIP = frozenset({"data"})
 
 # Never through squid. The judge is a sibling on the compose bridge; under
 # network isolation main's HTTP(S)_PROXY points at egress-proxy, which would
@@ -68,6 +75,51 @@ def wait_until_healthy(url: str, wait_sec: float) -> str | None:
         if time.monotonic() >= deadline:
             return last
         time.sleep(2)
+
+
+def open_workspace_to_judge(root: Path) -> tuple[int, list[str]]:
+    """Add read (and, on directories, search) bits for everyone under *root*.
+
+    The judge reads the agent's deliverables (e.g. /workspace/out/report.md)
+    off the shared workspace_data volume, read-only and as its own unprivileged
+    user (uid 1000, tools/judge/Dockerfile). The agent wrote them as root here
+    in main, and nothing makes it leave them world-readable: OpenHands'
+    file_editor writes through tempfile.NamedTemporaryFile, so every file it
+    creates is 0600 whatever the umask. The judge then cannot open the report,
+    test_outputs.py reads that as an empty deliverable, and every report check
+    returns False while pytest still prints PASSED for all of them.
+
+    Bits are only ever added, and no content is touched. The judge's mount is
+    read-only, so this is the last point where the modes can still change.
+    Symlinks are skipped, not followed: the agent made them, and a chmod through
+    one would reach whatever it points at in main.
+
+    Returns (paths changed, paths that could not be changed). Never raises: a
+    mode left as it was grades exactly as it did before this existed.
+    """
+    changed, failed = 0, []
+    if not root.is_dir():
+        return changed, failed
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        if here == root:
+            dirnames[:] = [d for d in dirnames if d not in WORKSPACE_SKIP]
+        for path in [here] + [here / n for n in filenames]:
+            try:
+                st = path.lstat()
+                if stat.S_ISDIR(st.st_mode):
+                    bits = 0o555
+                elif stat.S_ISREG(st.st_mode):
+                    bits = 0o444
+                else:  # symlink, socket, fifo
+                    continue
+                mode = stat.S_IMODE(st.st_mode)
+                if mode | bits != mode:
+                    os.chmod(path, mode | bits)
+                    changed += 1
+            except OSError as exc:
+                failed.append(f"{path}: {exc.strerror or exc}")
+    return changed, failed
 
 
 def request_evaluation(url: str, token: str, trajectory: dict, timeout: float) -> dict:
@@ -131,6 +183,16 @@ def main(argv: list[str] | None = None) -> int:
     why = wait_until_healthy(url, float(os.environ.get("JUDGE_WAIT_SEC", "120")))
     if why:
         return finish({"ok": False, "reason": why})
+
+    workspace = Path(os.environ.get("JUDGE_WORKSPACE", "/workspace"))
+    opened, stuck = open_workspace_to_judge(workspace)
+    if opened:
+        print(f"[judge-client] made {opened} path(s) under {workspace} readable by the judge")
+    for why in stuck[:10]:
+        print(f"[judge-client] the judge may not be able to read {why}", file=sys.stderr)
+    if len(stuck) > 10:
+        print(f"[judge-client] ... and {len(stuck) - 10} more", file=sys.stderr)
+
     return finish(request_evaluation(url, token, trajectory,
                                      float(os.environ.get("JUDGE_REQUEST_TIMEOUT_SEC", "1200"))))
 
