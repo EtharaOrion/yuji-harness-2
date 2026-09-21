@@ -35,7 +35,7 @@ def test_the_callers_display_choice_is_left_alone():
 
 
 def test_convert_mode_restores_the_reference_rewrite(monkeypatch):
-    monkeypatch.setenv("WCB_CC_ADAPTIVE_THINKING", "convert")
+    monkeypatch.setenv("CCBRIDGE_ADAPTIVE_THINKING", "convert")
     out = _normalized({"model": "claude-opus-5", "max_tokens": 16384,
                        "thinking": {"type": "adaptive", "display": "summarized"},
                        "output_config": {"effort": "high"}})
@@ -80,7 +80,8 @@ def stores(monkeypatch):
     """Every credential source, each returning whatever the test puts in it."""
     box: dict[str, str | None] = {"file": None, "keychain": None, "secret": None, "cache": None}
     monkeypatch.delenv("CLAUDE_CODE_CREDENTIALS", raising=False)
-    monkeypatch.delenv("WCB_CC_CREDS_PATH", raising=False)
+    monkeypatch.delenv("CCBRIDGE_CREDS_PATH", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.setattr(credentials, "_read_credentials_file", lambda: box["file"])
     monkeypatch.setattr(credentials, "_read_keychain_macos", lambda: box["keychain"])
     monkeypatch.setattr(credentials, "_read_secretservice_linux", lambda: box["secret"])
@@ -124,3 +125,22 @@ def test_refresh_happens_only_when_every_store_is_expired(stores, monkeypatch):
     monkeypatch.setattr(credentials, "write_cache", lambda c: None)
     assert CredentialProvider().get_access_token() == "new"
     assert seen == ["rt-old"]
+
+
+def test_a_bare_oauth_token_in_the_environment_is_used(stores, monkeypatch):
+    """The credential run_task.sh checks for and the harness .env carries. A
+    machine logged in only this way used to pass that check and get no bridge."""
+    stores["keychain"] = _creds("from-keychain", 3600)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-from-env")
+    assert credentials.load_credentials().access_token == "sk-ant-oat01-from-env"
+    assert CredentialProvider().get_access_token() == "sk-ant-oat01-from-env"
+
+
+def test_a_bare_token_is_never_refreshed(stores, monkeypatch):
+    """It has no refresh token; an expiry must fail loudly, not call the endpoint."""
+    provider = CredentialProvider()
+    provider._creds = OAuthCredentials("dead", "", int((time.time() - 60) * 1000), [])
+    monkeypatch.setattr(credentials, "refresh_credentials",
+                        lambda c: pytest.fail("tried to refresh a token with no refresh token"))
+    with pytest.raises(credentials.CredentialsError, match="no refresh token"):
+        provider.get_access_token()

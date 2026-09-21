@@ -15,7 +15,13 @@ Linux). The payload shape is::
 Sources:
 
   1. ``CLAUDE_CODE_CREDENTIALS`` env var (inline JSON, for tests/CI).
-  2. ``WCB_CC_CREDS_PATH`` env var (path to JSON file, for overrides).
+  2. ``CCBRIDGE_CREDS_PATH`` env var (path to JSON file, for overrides).
+  2b. ``CLAUDE_CODE_OAUTH_TOKEN`` env var: a bare OAuth access token, the form
+     ``claude setup-token`` prints and the harness's .env carries. It is the
+     credential scripts/run_task.sh checks for and hands to the verifier, so
+     the bridge honours it too: a machine logged in only that way used to pass
+     run_task.sh's credential check and then have no bridge. It has no refresh
+     token, so it is used as-is until Anthropic rejects it.
   3. ``~/.claude/.credentials.json`` (the primary source on Linux, where the
      ``claude`` CLI writes the token as a plaintext file).
   4. macOS Keychain (``security find-generic-password -s ...``; no-op off Darwin).
@@ -23,7 +29,7 @@ Sources:
      no-op off Linux or when no keyring is unlocked).
   6. ``~/.cache/yuji-ccbridge/claude_creds.json`` (bridge refresh cache).
 
-(1) and (2) are explicit overrides and win outright when set. Otherwise every
+(1), (2) and (2b) are explicit and win outright when set, in that order. Otherwise every
 store that holds a token is read and the one that expires LAST is used. A fixed
 priority order picked the Keychain even when it held an expired token and the
 bridge's own cache held the refreshed one, and refreshing from the stale copy
@@ -126,8 +132,25 @@ def _read_file(path: Path) -> Optional[str]:
 
 
 def _read_override_file() -> Optional[str]:
-    env_path = os.environ.get("WCB_CC_CREDS_PATH")
+    env_path = os.environ.get("CCBRIDGE_CREDS_PATH")
     return _read_file(Path(env_path)) if env_path else None
+
+
+# A bare token carries no expiry. Treat it as live for a year (the lifetime
+# `claude setup-token` issues) and let a 401 from Anthropic be the judge.
+_BARE_TOKEN_LIFETIME_MS = 365 * 24 * 3600 * 1000
+
+
+def _bare_token_credentials() -> Optional["OAuthCredentials"]:
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if not token:
+        return None
+    return OAuthCredentials(
+        access_token=token,
+        refresh_token="",
+        expires_at_ms=int(time.time() * 1000) + _BARE_TOKEN_LIFETIME_MS,
+        scopes=["user:inference"],
+    )
 
 
 def _read_credentials_file() -> Optional[str]:
@@ -195,7 +218,8 @@ def _no_credentials_hint() -> str:
     if system == "Darwin":
         return (
             "No Claude Code credentials found. Sign in via the `claude` CLI "
-            "first, then verify with:\n"
+            "(or set CLAUDE_CODE_OAUTH_TOKEN, e.g. from `claude setup-token`), "
+            "then verify with:\n"
             "  security find-generic-password -s 'Claude Code-credentials' -w"
         )
     if system == "Linux":
@@ -203,11 +227,12 @@ def _no_credentials_hint() -> str:
             "No Claude Code credentials found. Sign in via the `claude` CLI "
             "first (it writes ~/.claude/.credentials.json on Linux), then verify with:\n"
             "  test -f ~/.claude/.credentials.json && echo OK\n"
-            "Alternatively set WCB_CC_CREDS_PATH to a credentials JSON file, or "
+            "Alternatively set CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`), "
+            "CCBRIDGE_CREDS_PATH to a credentials JSON file, or "
             "CLAUDE_CODE_CREDENTIALS to inline JSON."
         )
     return (
-        "No Claude Code credentials found. Set WCB_CC_CREDS_PATH to a "
+        "No Claude Code credentials found. Set CCBRIDGE_CREDS_PATH to a "
         "credentials JSON file, or CLAUDE_CODE_CREDENTIALS to inline JSON."
     )
 
@@ -224,6 +249,9 @@ def load_credentials() -> OAuthCredentials:
     override = _read_inline_env() or _read_override_file()
     if override:
         return _parse(override)
+    bare = _bare_token_credentials()
+    if bare is not None:
+        return bare
 
     found: list[OAuthCredentials] = []
     errors: list[str] = []
@@ -376,6 +404,11 @@ class CredentialProvider:
                     return self._creds.access_token
                 if stored is not None:
                     self._creds = stored
+                if not self._creds.refresh_token:
+                    raise CredentialsError(
+                        "the Claude OAuth token has no refresh token and the stores hold "
+                        "nothing newer; run `claude login` or `claude setup-token`"
+                    )
                 _LOG.info("Refreshing Claude Code OAuth token")
                 self._creds = refresh_credentials(self._creds)
                 try:
@@ -525,7 +558,7 @@ class MultiAccountCredentialProvider:
     Drop-in replacement for ``CredentialProvider`` at the bridge layer: exposes
     ``get_access_token() -> str`` and ``force_reload()``. The bridge calls
     ``mark_account_exhausted`` / ``mark_account_invalid`` to record state from
-    upstream classification (see ``src.utils.claude_oauth.errors``).
+    upstream classification (see ``errors.py``).
 
     Selection policy: first available slot in insertion order. This makes the
     behavior predictable and lets a user put their "primary" account first.
@@ -656,7 +689,7 @@ def _add_token_prefix_to_provider(p: CredentialProvider) -> CredentialProvider:
 
 
 def load_account_pool(spec: str) -> Optional[MultiAccountCredentialProvider]:
-    """Parse a ``WCB_CC_ACCOUNT_POOL`` spec into a multi-account provider.
+    """Parse a ``CCBRIDGE_ACCOUNT_POOL`` spec into a multi-account provider.
 
     Spec format: colon-separated entries, each one of:
       - A file path (absolute or ``~``-relative) -> ``_FileCredentialProvider``

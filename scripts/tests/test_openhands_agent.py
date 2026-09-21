@@ -405,8 +405,8 @@ def test_runner_env_carries_model_bridge_and_namespaced_servers(tmp_path):
 
 @pytest.mark.parametrize("rc,output,expected", [
     (137, "rate_limit_error everywhere", "NonZeroAgentExitCodeError"),
-    (1, '{"wcb_bridge": {"kind": "subscription_cap"}}', "ApiUsageLimitError"),
-    (1, "wcb-bridge: missing/invalid bridge secret", "AgentAuthenticationError"),
+    (1, '{"ccbridge": {"kind": "subscription_cap"}}', "ApiUsageLimitError"),
+    (1, "ccbridge: missing/invalid bridge secret", "AgentAuthenticationError"),
     (1, "litellm.APIConnectionError: Connection refused", "NetworkConnectionError"),
 ])
 def test_failures_are_classified_by_how_they_died(tmp_path, rc, output, expected):
@@ -517,6 +517,9 @@ def _dispatch(tmp_path: Path, port: int, **overrides) -> SimpleNamespace:
         "JOB_DIR": str(tmp_path / "output" / "alpha"),
         "HARBOR_ARGS": str(args_file), "HARBOR_ENV": str(env_file),
         "RUN_OFFSET": "0", "MODEL": "claude-opus-5", "N": "1",
+        # The fake bridge stands in for a SHARED one; the per-run lifecycle
+        # has its own test below, against a real bridge and a fake upstream.
+        "CCBRIDGE_SHARED": "1",
         "CCBRIDGE_PORT": str(port), "CCBRIDGE_SECRET": SECRET,
         "AGENT_HEADROOM_ENABLED": "false", "GRADER_HEADROOM_ENABLED": "false",
         "SKIP_IMAGE_REFRESH": "1",
@@ -567,8 +570,11 @@ def test_isolation_adds_the_ccbridge_squid_config(tmp_path, fake_bridge):
     overlays = _overlays(run)
     assert overlays.index(str(PROXY_DIR / "overlay.yaml")) < overlays.index(
         str(PROXY_DIR / "overlay-ccbridge.yaml"))
-    conf = Path(run.env["EGRESS_SQUID_CONF"]).read_text()
-    assert f"acl ccbridge_port port {fake_bridge}" in conf
+    assert f"squid also allows the ccbridge at host.docker.internal:{fake_bridge}" in run.stderr
+    # One config per invocation (concurrent runs have different bridge ports),
+    # removed when the invocation exits.
+    conf = Path(run.env["EGRESS_SQUID_CONF"])
+    assert conf.name.startswith("squid-") and not conf.exists()
 
 
 def test_agent_kwargs_come_from_the_openhands_env(tmp_path, fake_bridge):
@@ -588,11 +594,124 @@ def test_a_bridge_holding_another_secret_is_refused(tmp_path, fake_bridge):
     assert not run.argv, "harbor ran against a bridge that would refuse every turn"
 
 
-def test_zbridge_is_refused_for_openhands(tmp_path, fake_bridge):
-    run = _dispatch(tmp_path, fake_bridge, CC_MODE="zbridge")
-    assert run.returncode == 2
-    assert "claude-code agent only" in run.stderr
-    assert not run.argv
+def _free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="the ccbridge runs from its uv project")
+def test_a_machine_with_no_usable_login_fails_fast_with_the_reason(tmp_path):
+    """No bridge running and no loadable Claude login: the bridge's own --check
+    says why, in seconds, before anything is launched. It used to start a bridge
+    that died at once and then poll the dead port for the full timeout."""
+    import time
+    port = _free_port()
+    started = time.monotonic()
+    run = _dispatch(tmp_path, port, NETWORK_ISOLATION_OFF="1",
+                    CLAUDE_CODE_CREDENTIALS="not-json", CCBRIDGE_START_TIMEOUT_SEC="120")
+    assert run.returncode == 4, run.stderr[-3000:]
+    assert "cannot load a Claude login" in run.stderr
+    assert "not valid JSON" in run.stderr
+    assert time.monotonic() - started < 90
+    assert not run.argv, "harbor ran with no model behind the agent"
+
+
+class _FakeAnthropic(BaseHTTPRequestHandler):
+    """api.anthropic.com as far as the bridge can tell: answers /v1/messages."""
+
+    seen: list = []
+
+    def do_POST(self):  # noqa: N802
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        type(self).seen.append({"path": self.path, "auth": self.headers.get("authorization"),
+                                "model": body.get("model")})
+        data = json.dumps({"id": "msg_1", "type": "message", "role": "assistant",
+                           "model": body.get("model"), "stop_reason": "end_turn",
+                           "content": [{"type": "text", "text": "p"}],
+                           "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):  # noqa: N802 -- /healthz, when this stands in for zbridge
+        data = b'{"ok": true}'
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture()
+def fake_anthropic():
+    _FakeAnthropic.seen = []
+    server = HTTPServer(("127.0.0.1", 0), _FakeAnthropic)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.server_address[1]
+    server.shutdown()
+
+
+def _listening(port: int) -> bool:
+    import socket
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="the ccbridge runs from its uv project")
+def test_each_run_starts_and_stops_its_own_bridge(tmp_path, fake_anthropic):
+    """The default lifecycle, end to end with the real bridge: a free port and a
+    fresh secret for this run only, the live check routed through the bridge
+    with the machine's token, and nothing left running afterwards."""
+    run = _dispatch(tmp_path, 0, NETWORK_ISOLATION_OFF="1", CCBRIDGE_SHARED="0",
+                    CCBRIDGE_PORT=None, CCBRIDGE_SECRET=None,
+                    CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-per-run-test",
+                    CCBRIDGE_UPSTREAM=f"http://127.0.0.1:{fake_anthropic}")
+    assert run.returncode == 0, run.stderr[-3000:]
+    base = run.env["OPENHANDS_LLM_BASE_URL"]
+    port = int(base.rsplit(":", 1)[1])
+    assert base == f"http://host.docker.internal:{port}" and port != 8765
+    secret = run.env["OPENHANDS_LLM_API_KEY"]
+    assert secret.startswith("ccb-run-")
+    shared = REPO / "tools" / "bridges" / "ccbridge" / ".bridge_secret"
+    assert not shared.exists() or shared.read_text().strip() != secret
+    assert any(r["path"] == "/v1/messages" and r["auth"] == "Bearer sk-ant-oat01-per-run-test"
+               for r in _FakeAnthropic.seen), _FakeAnthropic.seen
+    assert "ccbridge for this run stopped" in run.stderr
+    assert not _listening(port), "the run's bridge outlived the run"
+    assert secret not in run.stdout + run.stderr, "the per-run secret was printed"
+
+
+def test_glm_runs_the_same_agent_through_zbridge(tmp_path, fake_anthropic):
+    """CC_MODE=zbridge: the OpenHands agent on GLM. zbridge speaks the same
+    Anthropic protocol as the ccbridge, so only where the agent points changes;
+    no ccbridge is started and the model defaults to glm-5.3."""
+    # zbridge runs without auth (ensure_zbridge), so its stand-in answers anyone.
+    run = _dispatch(tmp_path, 1, NETWORK_ISOLATION_OFF="1", CC_MODE="zbridge",
+                    ZB_PORT=str(fake_anthropic), ZB_ZAI_API_KEY="zai-test", MODEL=None,
+                    CCBRIDGE_SHARED=None)
+    assert run.returncode == 0, run.stderr[-3000:]
+    assert run.argv[run.argv.index("--agent") + 1] == "tools.openhands_agent.agent:OpenHandsAgent"
+    assert run.argv[run.argv.index("--model") + 1] == "glm-5.3"
+    assert run.env["OPENHANDS_LLM_BASE_URL"] == f"http://host.docker.internal:{fake_anthropic}"
+    assert "ccbridge" not in run.stdout.replace("zbridge", "")
+
+
+@pytest.mark.skipif(not docker_is_usable(), reason="needs docker (egress-proxy image)")
+def test_glm_under_isolation_opens_zbridge_not_the_ccbridge(tmp_path, fake_anthropic):
+    run = _dispatch(tmp_path, 1, CC_MODE="zbridge", ZB_PORT=str(fake_anthropic),
+                    ZB_ZAI_API_KEY="zai-test", MODEL=None, CCBRIDGE_SHARED=None)
+    assert run.returncode == 0, run.stderr[-3000:]
+    overlays = _overlays(run)
+    assert str(PROXY_DIR / "overlay-zbridge.yaml") in overlays
+    assert str(PROXY_DIR / "overlay-ccbridge.yaml") not in overlays
+    assert f"acl zbridge_port port {fake_anthropic}" in Path(run.env["EGRESS_SQUID_CONF"]).read_text()
 
 
 def test_a_job_with_claude_code_runs_warns_before_mixing_agents(tmp_path, fake_bridge):

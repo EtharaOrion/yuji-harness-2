@@ -93,6 +93,9 @@ if [ "${#KILL[@]}" -eq 0 ]; then
 else
   for p in "${KILL[@]}"; do say "kill $p  $(cmd_of "$p")"; done
   run kill "${KILL[@]}" 2>/dev/null
+  # run_task.sh records which bridge code it started the ccbridge from; with
+  # the bridge gone that record describes nothing.
+  run rm -f "$(dirname "$0")/../tools/bridges/ccbridge/logs/.running-source"
   if [ "$DRY" != 1 ]; then
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       still=0; for p in "${KILL[@]}"; do kill -0 "$p" 2>/dev/null && still=1; done

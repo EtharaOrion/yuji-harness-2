@@ -7,8 +7,9 @@ same way the reference harness replaced its `claude -p` lane. `claude-code`
 is still available as `AGENT=claude-code`.
 
 ```bash
-scripts/run_task.sh tasks/<task>                 # openhands + claude-opus-5
-AGENT=claude-code scripts/run_task.sh tasks/<t>  # the previous default
+scripts/run_task.sh tasks/<task>                   # openhands + claude-opus-5
+CC_MODE=zbridge scripts/run_task.sh tasks/<task>   # openhands + glm-5.3
+AGENT=claude-code scripts/run_task.sh tasks/<t>    # the previous default
 ```
 
 ## The pieces
@@ -23,11 +24,24 @@ AGENT=claude-code scripts/run_task.sh tasks/<t>  # the previous default
 ```
 host                                            main (task container)
 ────────────────────────────────────────        ─────────────────────────────────────────
-ccbridge :8765  ◄── http://host.docker.internal:8765 ── runner.py (OpenHands SDK, LiteLLM)
-  secret check → OAuth bearer from Keychain          api_key = bridge secret, never the token
+ccbridge :<per-run port> ◄── host.docker.internal ── runner.py (OpenHands SDK, LiteLLM)
+  secret check → OAuth bearer                        api_key = per-run secret, never the token
   → api.anthropic.com                                MCP → light-servers:<port>/mcp (NO_PROXY)
-                                                     /opt/openhands-runtime  (ro, from sidecar)
+  (or zbridge :8766 → z.ai, on CC_MODE=zbridge)      /opt/openhands-runtime  (ro, from sidecar)
 ```
+
+**Where each piece runs.** The agent itself (the SDK's loop, its terminal and
+file editor, its MCP clients) runs **inside `main`**, as the task's user.
+Two things deliberately do not:
+
+- **The Python runtime** comes from a sidecar's volume rather than from the
+  bundle's image. Bundles stay agent-agnostic and need no rebuild; a bundle
+  that bakes in `COPY --from=openhands-runtime:latest /opt/openhands-runtime
+  /opt/openhands-runtime` would work too, but every bundle would then pin one
+  SDK build.
+- **The model proxy** runs on the host. Running it in `main` would put the
+  Claude OAuth token (or the z.ai key) in the container the agent has root in,
+  which is the one thing this design keeps out.
 
 Under network isolation the `main → host` hop goes through squid, which allows
 exactly `host.docker.internal:<bridge port>` in addition to the usual list
@@ -73,6 +87,20 @@ Alongside the stream:
 it. It is sent one fixed sentence that carries no task content (the
 reference harness's `CONTINUATION_NOTICE`). This happens at most
 `max_continuations` times.
+
+## Models
+
+| | Claude (default) | GLM (`CC_MODE=zbridge`) |
+|---|---|---|
+| `MODEL` default | `claude-opus-5` | `glm-5.3` |
+| Proxy | a ccbridge this run starts and stops (`CCBRIDGE_SHARED=1` for one long-lived bridge) | zbridge on `:8766`, shared, started on demand |
+| Auth held on the host | Claude OAuth login | `ZB_ZAI_API_KEY` |
+| Thinking | adaptive, `display` per `OPENHANDS_THINKING_DISPLAY` | GLM reasons by default; zbridge returns it as readable thinking blocks |
+| Cost in trajectories | LiteLLM's API-equivalent price | `0.0`: LiteLLM has no price for `glm-5.3` |
+
+zbridge speaks the same Anthropic protocol as the ccbridge, so the agent is
+identical on both; only the URL it is handed differs. Under isolation, squid
+opens zbridge's port instead of the ccbridge's.
 
 ## Options
 

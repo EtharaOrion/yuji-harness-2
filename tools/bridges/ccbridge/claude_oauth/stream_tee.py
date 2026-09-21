@@ -1,25 +1,21 @@
-"""Real-time SSE tee for the cc-bridge - live token feed on the OAuth path.
+"""Optional live tee of the bridge's streamed responses, for watching a run.
 
-WHY THIS EXISTS (docs/STREAMING_PLAN.md §1.5): with buffer-and-retry ON
-(default), the bridge replays the response to the client as an end-of-turn
-burst, so the LiteLLM sidecar's stream hook cannot see tokens in real time
-on this branch. The only place chunks exist live is INSIDE the bridge -
-this module observes them there and appends display events to the shared
-stream feed (bind-mounted host file, same JSONL schema as
-src/utils/stream_events.py).
+With buffer-and-retry on (the default), the bridge replays a streamed
+response to its client as one end-of-turn burst, so the only place the tokens
+exist as they arrive is inside the bridge. This module observes them there and
+appends display events, as JSON lines, to CCBRIDGE_STREAM_LOG_PATH.
 
-HARD RULES:
-  * OBSERVE-ONLY. The tee never modifies, drops, delays, or reorders the
-    bytes the bridge buffers/forwards (R5 - callers pass the chunk in and
-    keep using their own reference; nothing is returned).
-  * FAIL-OPEN (R2). Every public method swallows every exception and
-    self-disables; a broken tee can never affect a client response.
-  * INERT unless ``WCB_CC_STREAM_LOG_PATH`` is set (start_bridge sets it
-    only when the batch runs with --stream; R6 batch-scoped gate).
-  * Sink separation (m0130): writes ONLY to WCB_CC_STREAM_LOG_PATH.
+The OpenHands agent does not stream, so in this harness the tee is normally
+idle; it serves a streaming client pointed at the bridge.
 
-This file ships inside the bridge image automatically (docker/cc-bridge
-Dockerfile does ``COPY src/utils/claude_oauth /app/claude_oauth``).
+RULES:
+  * OBSERVE-ONLY. The tee never modifies, drops, delays, or reorders the bytes
+    the bridge buffers or forwards: callers pass a chunk in and keep using
+    their own reference, and nothing is returned.
+  * FAIL-OPEN. Every public method swallows every exception and disables
+    itself; a broken tee can never affect a client response.
+  * INERT unless ``CCBRIDGE_STREAM_LOG_PATH`` is set, and it writes nowhere
+    else. ``CCBRIDGE_STREAM_MAX_BYTES`` caps the file (64 MiB by default).
 """
 from __future__ import annotations
 
@@ -39,11 +35,11 @@ _capped = False
 
 
 def _feed_path() -> str:
-    return os.environ.get("WCB_CC_STREAM_LOG_PATH", "").strip()
+    return os.environ.get("CCBRIDGE_STREAM_LOG_PATH", "").strip()
 
 
 def _max_bytes() -> int:
-    raw = os.environ.get("WCB_STREAM_MAX_BYTES", "").strip()
+    raw = os.environ.get("CCBRIDGE_STREAM_MAX_BYTES", "").strip()
     try:
         n = int(raw) if raw else _MAX_BYTES_DEFAULT
     except ValueError:

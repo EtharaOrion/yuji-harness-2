@@ -9,7 +9,7 @@ description = "Anthropic-compatible local proxy backed by the host's Claude Code
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-# Same pins as tools/bridges/zbridge and the reference Dockerfile.cc-bridge.
+# Same pins as tools/bridges/zbridge.
 dependencies = [
     "fastapi==0.115.5",
     "uvicorn==0.32.1",

@@ -4,27 +4,29 @@
 #
 #   scripts/run_task.sh tasks/xenon-atomic-cube                 # openhands + opus-5 (defaults)
 #   AGENT=claude-code scripts/run_task.sh tasks/foo             # harbor's claude-code agent
-#   AGENT=claude-code CC_MODE=zbridge N=3 scripts/run_task.sh tasks/foo  # 3 attempts via GLM-5.3
+#   CC_MODE=zbridge N=3 scripts/run_task.sh tasks/foo           # openhands on GLM-5.3 (zbridge)
 #   AGENT=oracle scripts/run_task.sh tasks/foo                  # oracle gate
 #   COPY_TO=/some/dir scripts/run_task.sh tasks/foo           # optional extra mirror
 #
 #   scripts/run_task.sh --stage reshape tasks/foo               # one stage only
 #
 # The default agent is OpenHands (tools/openhands_agent), on the host's Claude
-# subscription through the ccbridge (tools/bridges/ccbridge, :8765). The bridge
-# is started on demand and holds the OAuth token; the agent's container gets
-# only the bridge's shared secret. See tools/openhands_agent/README.md.
+# subscription through a ccbridge (tools/bridges/ccbridge) that this run starts
+# and stops. The bridge holds the OAuth token; the agent's container gets only
+# the bridge's per-run secret. With CC_MODE=zbridge the same agent runs on GLM
+# through zbridge instead. See tools/openhands_agent/README.md.
 #
 # Env overrides: AGENT (openhands) MODEL (claude-opus-5) N (1) JOB (<task slug>)
 #                OUTPUT_DIR (<repo>/output) COPY_TO (unset) BUILD_MULT (3) AT (auto)
 #                STAGE (all) RUN_OFFSET (auto) SETUP_MULT (6) JUDGE_MODEL (gpt-5.6-sol)
 #                NETWORK_ISOLATION_OFF (unset) DISALLOWED_TOOLS (WebSearch,WebFetch)
-#                CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766,
-#                         claude-code only)
+#                CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766)
 #                CC_BRIDGE_ENABLED (0)
 #                AGENT_HEADROOM_ENABLED (false) GRADER_HEADROOM_ENABLED (false)
-#   openhands:   CCBRIDGE_PORT (8765) CCBRIDGE_HOST (127.0.0.1 on macOS, 0.0.0.0 on
-#                Linux) CCBRIDGE_SECRET (tools/bridges/ccbridge/.bridge_secret)
+#   openhands:   CCBRIDGE_SHARED (0: a ccbridge per run, on a free port, stopped
+#                at exit; 1: one long-lived bridge on CCBRIDGE_PORT (8765) with
+#                CCBRIDGE_SECRET or tools/bridges/ccbridge/.bridge_secret)
+#                CCBRIDGE_HOST (127.0.0.1 on macOS, 0.0.0.0 on Linux)
 #                OPENHANDS_MAX_ITERATIONS (500) OPENHANDS_MAX_CONTINUATIONS (6)
 #                OPENHANDS_REASONING_EFFORT (SDK default) OPENHANDS_MAX_OUTPUT_TOKENS (32000)
 #                OPENHANDS_THINKING_DISPLAY (summarized | omitted)
@@ -210,11 +212,6 @@ harbor_agent_ref() {
 # second zero rather than discovered in the agent phase -- and only by the
 # stages that start an agent, so reshaping an older GLM job is unaffected.
 if [ "$AGENT" = "openhands" ] && case "$STAGE" in preflight|harbor|all) true ;; *) false ;; esac; then
-  if [ "${CC_MODE:-}" = "zbridge" ]; then
-    echo "[run_task] ERROR: CC_MODE=zbridge is wired for the claude-code agent only." >&2
-    echo "[run_task]   GLM runs: AGENT=claude-code CC_MODE=zbridge scripts/run_task.sh <task>" >&2
-    exit 2
-  fi
   if [ "${AGENT_HEADROOM_ENABLED:-false}" = "true" ]; then
     echo "[run_task] ERROR: AGENT_HEADROOM_ENABLED=true compresses the claude-code agent's" >&2
     echo "[run_task]   traffic (it reroutes ANTHROPIC_BASE_URL); the openhands agent never" >&2
@@ -951,8 +948,12 @@ stage_preflight() {
   # GLM runs: prove the key works before the image builds, not after. Idempotent
   # -- stage_harbor calls it again and finds the bridge already up.
   [ "${CC_MODE:-}" = "zbridge" ] && ensure_zbridge
-  # OpenHands runs: the same, for the Claude subscription behind the ccbridge.
-  [ "$AGENT" = "openhands" ] && ensure_claude_oauth_bridge
+  # OpenHands runs on Claude: the same, for the subscription behind the
+  # ccbridge. A per-run bridge does not exist yet, so preflight proves the login
+  # with --check (no model call); the harbor stage starts the bridge.
+  if [ "$AGENT" = "openhands" ] && [ "${CC_MODE:-}" != "zbridge" ]; then
+    if [ "${CCBRIDGE_SHARED:-0}" = "1" ]; then ensure_shared_ccbridge; else ccbridge_prepare; fi
+  fi
 
   if ! docker info >/dev/null 2>&1; then
     echo "[run_task] docker not running — starting OrbStack/Docker"
@@ -1084,8 +1085,10 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
   ensure_cc_bridge
   [ "${CC_MODE:-}" = "zbridge" ] && ensure_zbridge
   # Exports OPENHANDS_LLM_BASE_URL / OPENHANDS_LLM_API_KEY, which the agent
-  # class reads from harbor's environment. Called directly for the exports.
-  [ "$AGENT" = "openhands" ] && ensure_claude_oauth_bridge
+  # class reads from harbor's environment: zbridge on a GLM run, else this
+  # run's own ccbridge (stopped by the EXIT trap). Called directly, not in
+  # $(...): the exports and the bridge must belong to this shell.
+  [ "$AGENT" = "openhands" ] && ensure_openhands_model_route
   # After ensure_zbridge: on a GLM run both set ANTHROPIC_BASE_URL, and with
   # agent-path Headroom on it is the headroom container that must win, with
   # zbridge behind it as the upstream.
@@ -1107,7 +1110,10 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
   # the zbridge pair above, for the same reason.
   if [ "$AGENT" = "openhands" ]; then
     args+=(--extra-docker-compose "$REPO/tools/openhands_agent/overlay.yaml")
-    if [ -n "$_iso" ]; then
+    # On a GLM run the zbridge pair above already let squid reach the model;
+    # both overlays mount EGRESS_SQUID_CONF, so adding this one would replace
+    # zbridge's port with the ccbridge's and cut the agent off.
+    if [ -n "$_iso" ] && [ "${CC_MODE:-}" != "zbridge" ]; then
       write_ccbridge_squid_conf
       args+=(--extra-docker-compose "$REPO/tools/network/egress-proxy/overlay-ccbridge.yaml")
     fi
@@ -1507,18 +1513,37 @@ PYEOF
 # ------------------------------------------------------------------ ccbridge
 # The OpenHands agent's route to Claude: tools/bridges/ccbridge, an
 # Anthropic-compatible proxy on the host that signs each request with the Claude
-# Code OAuth login on this machine (Keychain on macOS, ~/.claude/.credentials.json
-# on Linux) and forwards it to api.anthropic.com. Not to be confused with the
-# cbridge on :4000 above, which serves run_eval.py over the claude-agent-sdk.
+# Code OAuth login on this machine (CLAUDE_CODE_OAUTH_TOKEN, the Keychain on
+# macOS, ~/.claude/.credentials.json on Linux) and forwards it to
+# api.anthropic.com. Not to be confused with the cbridge on :4000 above, which
+# serves run_eval.py over the claude-agent-sdk.
 #
-# Shared by every concurrent run on the machine, like zbridge: started once,
-# found by its /healthz afterwards. Unlike zbridge its secret is ENFORCED -- the
-# agent presents it as its API key, and without it any local process could
-# spend the subscription.
+# PER RUN, by default. Each harbor stage starts its own bridge on a free port
+# with a fresh secret that is never written to disk, and stops it when the
+# stage exits -- normally, on error, or on Ctrl-C (the EXIT trap at dispatch).
+# A bridge that outlives its run is how a machine ends up serving old code,
+# holding a port another checkout wants, or refusing a secret it was never
+# given; a per-run bridge has none of those states to get into.
+#
+# CCBRIDGE_SHARED=1 keeps the older arrangement: one long-lived bridge on
+# CCBRIDGE_PORT (8765) shared by every run, with its secret in
+# tools/bridges/ccbridge/.bridge_secret, stopped only by scripts/stop_harness.sh.
 CCBRIDGE_DIR="$REPO/tools/bridges/ccbridge"
+CCBRIDGE_RUN_PID=""      # the per-run bridge this invocation started, if any
+CCBRIDGE_RUN_PORT=""
+CCBRIDGE_RUN_CONF=""     # this invocation's squid config for the bridge, if any
 
-# The shared secret: CCBRIDGE_SECRET if set, else a per-machine file created on
-# first use (0600, gitignored). Never printed.
+# Where the container's traffic arrives. Docker Desktop and OrbStack deliver
+# host.docker.internal to the host's loopback; plain Linux docker delivers it
+# to the bridge gateway, where a 127.0.0.1 listener is unreachable. The
+# secret gates the wider bind.
+ccbridge_host() {
+  if [ -n "${CCBRIDGE_HOST:-}" ]; then echo "$CCBRIDGE_HOST"; return; fi
+  case "$(uname -s)" in Darwin) echo "127.0.0.1" ;; *) echo "0.0.0.0" ;; esac
+}
+
+# The shared bridge's secret: CCBRIDGE_SECRET if set, else a per-machine file
+# created on first use (0600, gitignored). Never printed. Shared mode only.
 ccbridge_secret() {
   if [ -n "${CCBRIDGE_SECRET:-}" ]; then
     printf '%s' "$CCBRIDGE_SECRET"
@@ -1531,68 +1556,198 @@ ccbridge_secret() {
   tr -d '[:space:]' < "$f"
 }
 
-ensure_claude_oauth_bridge() {
-  local port="${CCBRIDGE_PORT:-8765}" host="${CCBRIDGE_HOST:-}" secret
+# Which bridge code a SHARED bridge was started from. It outlives every run, so
+# after the harness is updated it keeps serving the old code with nothing to
+# say so. Recorded at start, compared on every later run. (A per-run bridge is
+# always this checkout's code.)
+ccbridge_source_hash() {
+  python3 -c 'import glob,hashlib,sys
+h = hashlib.sha256()
+for f in sorted(glob.glob(sys.argv[1] + "/claude_oauth/*.py")):
+    h.update(open(f, "rb").read())
+print(h.hexdigest()[:16])' "$CCBRIDGE_DIR" 2>/dev/null
+}
+
+# The bridge's venv, and proof that this machine has a usable Claude login --
+# before anything is launched. A bridge that cannot find one exits at once, and
+# a wait loop would then poll a port nothing will ever open and report "did not
+# come up" instead of the reason. --check loads (and if needed refreshes) the
+# token and exits; it makes no model call, so preflight can afford it too.
+ccbridge_prepare() {
+  if [ ! -f "$CCBRIDGE_DIR/pyproject.toml" ]; then
+    echo "[run_task] ERROR: ccbridge not found at $CCBRIDGE_DIR" >&2
+    exit 3
+  fi
+  command -v uv >/dev/null 2>&1 || {
+    echo "[run_task] ERROR: uv is not installed; the ccbridge runs from its own uv project" >&2
+    exit 3
+  }
+  mkdir -p "$CCBRIDGE_DIR/logs"
+  # The first sync on a machine builds the venv -- minutes when cold. A venv
+  # copied from another machine is rebuilt here rather than half-working.
+  (cd "$CCBRIDGE_DIR" && uv sync --frozen --quiet) || {
+    echo "[run_task] ERROR: could not build the ccbridge venv (uv sync in $CCBRIDGE_DIR)" >&2
+    exit 3
+  }
+  local check_out
+  if ! check_out="$(cd "$CCBRIDGE_DIR" && CCBRIDGE_SECRET="${1:-check}" \
+                    .venv/bin/python -m claude_oauth --check 2>&1)"; then
+    echo "[run_task] ERROR: the ccbridge cannot load a Claude login on this machine:" >&2
+    printf '%s\n' "$check_out" | grep -v "UNAUTHENTICATED" | sed 's/^/[run_task]   /' >&2
+    echo "[run_task]   Fix: run \`claude login\` here, or put CLAUDE_CODE_OAUTH_TOKEN in .env." >&2
+    exit 4
+  fi
+}
+
+# Launch one bridge in the background from this checkout's venv; echoes its pid.
+# exec, so the pid IS the python process: signalling a `uv run` wrapper does not
+# reach the server it spawned.
+ccbridge_launch() {  # ccbridge_launch <host> <port> <secret> <log>
+  (cd "$CCBRIDGE_DIR" && \
+    CCBRIDGE_SECRET="$3" \
+    CCBRIDGE_READ_TIMEOUT="${CCBRIDGE_READ_TIMEOUT:-1800}" \
+    CCBRIDGE_REQUEST_TIMEOUT="${CCBRIDGE_REQUEST_TIMEOUT:-1800}" \
+    exec .venv/bin/python -m claude_oauth --host "$1" --port "$2" >>"$4" 2>&1) &
+  echo $!
+}
+
+# Timeouts, in both modes: the OpenHands SDK calls without streaming, so a long
+# thinking turn is one silent wait. The bridge's own defaults (180s between
+# bytes, 600s per request) would cut it; the agent allows 1800s (agent.py
+# llm_timeout) and squid-ccbridge.conf 30 minutes, so the bridge does too.
+
+start_run_ccbridge() {
+  local host port secret log pid i=0 wait_s="${CCBRIDGE_START_TIMEOUT_SEC:-180}"
+  host="$(ccbridge_host)"
+  port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  secret="$(python3 -c 'import secrets; print("ccb-run-" + secrets.token_hex(24))')"
+  ccbridge_prepare "$secret"
+  log="$CCBRIDGE_DIR/logs/run-${JOB//[^A-Za-z0-9._-]/_}-$$.log"
+  pid="$(ccbridge_launch "$host" "$port" "$secret" "$log")"
+  CCBRIDGE_RUN_PID="$pid"
+  CCBRIDGE_RUN_PORT="$port"
+  echo "[run_task] ccbridge for this run starting on $host:$port (pid $pid)"
+  while [ $i -lt "$wait_s" ]; do
+    curl -sf -m 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && break
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[run_task] ERROR: the ccbridge exited during startup. Last lines of $log:" >&2
+      tail -5 "$log" 2>/dev/null | sed 's/^/[run_task]   /' >&2
+      exit 3
+    fi
+    sleep 1; i=$((i+1))
+  done
+  curl -sf -m 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 || {
+    echo "[run_task] ERROR: the ccbridge did not come up in ${wait_s}s on :$port; see $log" >&2
+    exit 3
+  }
+  export CCBRIDGE_PORT="$port"     # write_ccbridge_squid_conf opens this port
+  ccbridge_live_check "$port" "$secret" || exit 4
+  export OPENHANDS_LLM_BASE_URL="http://host.docker.internal:$port"
+  export OPENHANDS_LLM_API_KEY="$secret"
+  echo "[run_task] openhands agent routed through this run's ccbridge ($OPENHANDS_LLM_BASE_URL)"
+}
+
+# The EXIT trap. Stops only what this invocation started; safe to call when it
+# started nothing, and safe to call twice.
+stop_run_ccbridge() {
+  if [ -n "${CCBRIDGE_RUN_PID:-}" ]; then
+    if kill -0 "$CCBRIDGE_RUN_PID" 2>/dev/null; then
+      kill "$CCBRIDGE_RUN_PID" 2>/dev/null || true
+      local i=0
+      while [ $i -lt 20 ] && kill -0 "$CCBRIDGE_RUN_PID" 2>/dev/null; do
+        sleep 0.25; i=$((i+1))
+      done
+      kill -9 "$CCBRIDGE_RUN_PID" 2>/dev/null || true
+      echo "[run_task] ccbridge for this run stopped (:$CCBRIDGE_RUN_PORT)" >&2
+    fi
+    CCBRIDGE_RUN_PID=""
+  fi
+  if [ -n "${CCBRIDGE_RUN_CONF:-}" ]; then
+    rm -f "$CCBRIDGE_RUN_CONF"
+    CCBRIDGE_RUN_CONF=""
+  fi
+  return 0
+}
+
+ensure_shared_ccbridge() {
+  local port="${CCBRIDGE_PORT:-8765}" host secret
   case "$port" in
     ''|*[!0-9]*) echo "[run_task] ERROR: CCBRIDGE_PORT must be a number, got '$port'" >&2; exit 2 ;;
   esac
-  # Where the container's traffic arrives. Docker Desktop and OrbStack deliver
-  # host.docker.internal to the host's loopback; plain Linux docker delivers it
-  # to the bridge gateway, where a 127.0.0.1 listener is unreachable. The
-  # secret gates the wider bind.
-  if [ -z "$host" ]; then
-    case "$(uname -s)" in Darwin) host="127.0.0.1" ;; *) host="0.0.0.0" ;; esac
-  fi
+  host="$(ccbridge_host)"
   secret="$(ccbridge_secret)" || {
     echo "[run_task] ERROR: could not create the ccbridge secret in $CCBRIDGE_DIR" >&2
     exit 4
   }
 
+  local running_src="$CCBRIDGE_DIR/logs/.running-source"
   if curl -sf -m 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
-    echo "[run_task] ccbridge already running on :$port"
-  else
-    if [ ! -f "$CCBRIDGE_DIR/pyproject.toml" ]; then
-      echo "[run_task] ERROR: ccbridge not found at $CCBRIDGE_DIR" >&2
-      exit 3
+    echo "[run_task] shared ccbridge already running on :$port"
+    local was now
+    was="$(cat "$running_src" 2>/dev/null || true)"
+    now="$(ccbridge_source_hash)"
+    if [ -z "$was" ]; then
+      echo "[run_task] NOTE: the ccbridge on :$port was not started by run_task.sh, so" >&2
+      echo "[run_task]   which bridge code it runs is unknown. If in doubt, restart it:" >&2
+      echo "[run_task]   bash scripts/stop_harness.sh   (the next run starts a fresh one)" >&2
+    elif [ -n "$now" ] && [ "$was" != "$now" ]; then
+      echo "[run_task] WARNING: the ccbridge on :$port runs OLDER bridge code than this" >&2
+      echo "[run_task]   checkout (started from $was, now $now). It keeps serving the old" >&2
+      echo "[run_task]   code until restarted: bash scripts/stop_harness.sh" >&2
     fi
-    command -v uv >/dev/null 2>&1 || {
-      echo "[run_task] ERROR: uv is not installed; the ccbridge runs from its own uv project" >&2
-      exit 3
-    }
-    mkdir -p "$CCBRIDGE_DIR/logs"
-    echo "[run_task] starting ccbridge on $host:$port"
-    # Timeouts: the OpenHands SDK calls without streaming, so a long thinking
-    # turn is one silent wait. The bridge's own defaults (180s between bytes,
-    # 600s per request) would cut it; the agent allows 1800s (agent.py
-    # llm_timeout) and squid-ccbridge.conf 30 minutes, so the bridge does too.
-    # Appended (>>), never truncated: a second start that loses the port race
-    # must not wipe the running bridge's log.
-    (cd "$CCBRIDGE_DIR" && \
-      WCB_CC_BRIDGE_SECRET="$secret" \
-      WCB_BRIDGE_READ_TIMEOUT="${CCBRIDGE_READ_TIMEOUT:-1800}" \
-      WCB_BRIDGE_REQUEST_TIMEOUT="${CCBRIDGE_REQUEST_TIMEOUT:-1800}" \
-      nohup uv run --quiet python -m claude_oauth --host "$host" --port "$port" \
-        >>"$CCBRIDGE_DIR/logs/ccbridge.log" 2>&1 &)
-    # The first `uv run` resolves and builds the bridge's venv before anything
-    # listens -- minutes on a cold machine, not seconds.
-    local i=0 wait_s="${CCBRIDGE_START_TIMEOUT_SEC:-180}"
+  else
+    ccbridge_prepare "$secret"
+    echo "[run_task] starting the shared ccbridge on $host:$port"
+    # Deliberately detached: it outlives this run. nohup, so a closed terminal
+    # does not take it down.
+    local pid i=0 wait_s="${CCBRIDGE_START_TIMEOUT_SEC:-180}"
+    pid="$(ccbridge_launch "$host" "$port" "$secret" "$CCBRIDGE_DIR/logs/ccbridge.log")"
     while [ $i -lt "$wait_s" ]; do
-      sleep 1; i=$((i+1))
       curl -sf -m 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && {
-        echo "[run_task] ccbridge ready on :$port"; break
+        echo "[run_task] shared ccbridge ready on :$port (pid $pid)"
+        ccbridge_source_hash > "$running_src" 2>/dev/null || true
+        break
       }
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "[run_task] ERROR: the ccbridge exited during startup; see $CCBRIDGE_DIR/logs/ccbridge.log" >&2
+        exit 3
+      fi
+      sleep 1; i=$((i+1))
     done
     curl -sf -m 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 || {
       echo "[run_task] ERROR: ccbridge did not come up in ${wait_s}s on :$port" >&2
       echo "[run_task]   The agent would fail every turn. See $CCBRIDGE_DIR/logs/ccbridge.log" >&2
-      echo "[run_task]   (a credentials error there means: run \`claude login\`)." >&2
       exit 3
     }
   fi
   ccbridge_live_check "$port" "$secret" || exit 4
   export OPENHANDS_LLM_BASE_URL="http://host.docker.internal:$port"
   export OPENHANDS_LLM_API_KEY="$secret"
-  echo "[run_task] openhands agent routed through ccbridge ($OPENHANDS_LLM_BASE_URL)"
+  echo "[run_task] openhands agent routed through the shared ccbridge ($OPENHANDS_LLM_BASE_URL)"
+}
+
+# Where the openhands agent's model calls go, for this run. Call it directly,
+# not in $(...): it exports, and a per-run bridge must belong to this shell.
+#
+#   CC_MODE=zbridge     GLM through zbridge (ensure_zbridge has already started
+#                       and verified it). zbridge speaks the same Anthropic
+#                       protocol as the ccbridge, so the agent is unchanged;
+#                       only where it points is.
+#   CCBRIDGE_SHARED=1   the long-lived shared ccbridge.
+#   otherwise           a ccbridge of this run's own.
+ensure_openhands_model_route() {
+  if [ "${CC_MODE:-}" = "zbridge" ]; then
+    # run_task.sh starts zbridge with auth off (ensure_zbridge); a zbridge
+    # started by hand with a secret checks x-api-key, which is where LiteLLM
+    # puts this value. LiteLLM refuses an empty key, hence the placeholder.
+    export OPENHANDS_LLM_BASE_URL="http://host.docker.internal:${ZB_PORT:-8766}"
+    export OPENHANDS_LLM_API_KEY="${ZB_BRIDGE_SECRET:-zbridge}"
+    echo "[run_task] openhands agent routed through zbridge ($OPENHANDS_LLM_BASE_URL, model $MODEL)"
+  elif [ "${CCBRIDGE_SHARED:-0}" = "1" ]; then
+    ensure_shared_ccbridge
+  else
+    start_run_ccbridge
+  fi
 }
 
 # /healthz answers ok for any caller, so it proves neither that this harness's
@@ -1659,13 +1814,17 @@ write_ccbridge_squid_conf() {
   esac
   mkdir -p "$dir"
   dir="$(cd "$dir" && pwd)"
+  # One file per invocation: concurrent runs each have their own bridge port,
+  # and a shared file would hand one run's squid the other's port.
+  local conf="$dir/squid-$$.conf"
   sed "s/^acl ccbridge_port port 8765\$/acl ccbridge_port port $port/" \
-    "$REPO/tools/network/egress-proxy/squid-ccbridge.conf" > "$dir/squid.conf"
-  grep -q "^acl ccbridge_port port $port\$" "$dir/squid.conf" || {
-    echo "[run_task] ERROR: could not set the ccbridge port in $dir/squid.conf" >&2
+    "$REPO/tools/network/egress-proxy/squid-ccbridge.conf" > "$conf"
+  grep -q "^acl ccbridge_port port $port\$" "$conf" || {
+    echo "[run_task] ERROR: could not set the ccbridge port in $conf" >&2
     exit 2
   }
-  export EGRESS_SQUID_CONF="$dir/squid.conf"
+  CCBRIDGE_RUN_CONF="$conf"
+  export EGRESS_SQUID_CONF="$conf"
   echo "[run_task] OpenHands run: squid also allows the ccbridge at host.docker.internal:$port" >&2
 }
 
@@ -2320,6 +2479,9 @@ esac
 
 trap on_interrupt INT
 trap on_terminate TERM
+# A per-run ccbridge dies with the run however the run ends: on_interrupt and
+# on_terminate call exit, which runs this too.
+trap stop_run_ccbridge EXIT
 
 refuse_uncmountable_paths
 resolve_auth

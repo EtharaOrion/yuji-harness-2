@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Honor WCB_CC_ACCOUNT_POOL if present (multi-account failover);
+    # Honor CCBRIDGE_ACCOUNT_POOL if present (multi-account failover);
     # otherwise falls through to single default CredentialProvider.
     provider = _resolve_provider()
     try:
@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[bridge] listening on http://{args.host}:{args.port}")
     print("[bridge] point clients at:")
     print(f"           export ANTHROPIC_API_BASE=http://{args.host}:{args.port}")
-    print('           export ANTHROPIC_API_KEY="$WCB_CC_BRIDGE_SECRET"')
+    print('           export ANTHROPIC_API_KEY="$CCBRIDGE_SECRET"')
     uvicorn.run(
         build_app(provider),
         host=args.host,

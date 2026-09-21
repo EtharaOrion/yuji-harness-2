@@ -135,7 +135,7 @@ class OpenHandsAgent(BaseInstalledAgent):
     ERROR_PATTERNS: ClassVar[list[ErrorPattern]] = [
         *BaseInstalledAgent.ERROR_PATTERNS,
         ErrorPattern(r"APIConnectionError", NetworkConnectionError),
-        ErrorPattern(r"wcb-bridge: missing/invalid bridge secret", AgentAuthenticationError),
+        ErrorPattern(r"ccbridge: missing/invalid bridge secret", AgentAuthenticationError),
         ErrorPattern(r"credentials_unavailable|OAuth refresh failed", AgentAuthenticationError),
         ErrorPattern(r"subscription_cap|\ball \d+ accounts exhausted\b", ApiUsageLimitError),
         ErrorPattern(r"OpenHands runtime is not mounted", NonZeroAgentExitCodeError),

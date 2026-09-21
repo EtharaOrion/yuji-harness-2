@@ -14,7 +14,7 @@ and preserves any caller-supplied system content.
 Point Anthropic SDK / litellm at the bridge with::
 
     export ANTHROPIC_API_BASE=http://localhost:8765
-    export ANTHROPIC_API_KEY="$WCB_CC_BRIDGE_SECRET"
+    export ANTHROPIC_API_KEY="$CCBRIDGE_SECRET"
 
 The key is the bridge's own shared secret, never an Anthropic credential: the
 bridge checks it, strips it, and forwards the OAuth bearer token instead.
@@ -23,7 +23,7 @@ Vendored into the yuji harness at tools/bridges/ccbridge; see the README there
 for how scripts/run_task.sh drives it for the OpenHands agent.
 
 Resilience: the bridge retries transient 429/529 inline (short waits), and
-if a multi-account pool is configured (``WCB_CC_ACCOUNT_POOL``) failover
+if a multi-account pool is configured (``CCBRIDGE_ACCOUNT_POOL``) failover
 to a different account on subscription-cap exhaustion. See ``errors.py``
 for the classification heuristics.
 """
@@ -67,7 +67,7 @@ SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 # 400, system[] must carry a billing-attribution block as system[0] AND the
 # harness's bulk prompt must be relocated out of system[] into the first user
 # message. Validated against real 2.1.x CLI traffic: opencode-claude-auth
-# #147/#148, hermes-claude-auth #9, sub2api. Gated by WCB_CC_BILLING_ATTRIBUTION.
+# #147/#148, hermes-claude-auth #9, sub2api. Gated by CCBRIDGE_BILLING_ATTRIBUTION.
 CLAUDE_CLI_VERSION = "2.1.123"
 BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 
@@ -80,7 +80,7 @@ DEFAULT_REQUEST_TIMEOUT = 600.0
 # reasoning can pause for 90-150s between streamed chunks. The previous httpx
 # default (5s on read) caused MidStreamFallbackError storms. 180s gives the
 # model headroom while still flagging genuine stalls. Configurable via
-# WCB_BRIDGE_READ_TIMEOUT (seconds, integer or float).
+# CCBRIDGE_READ_TIMEOUT (seconds, integer or float).
 DEFAULT_READ_TIMEOUT = 180.0
 DEFAULT_CONNECT_TIMEOUT = 30.0
 
@@ -97,38 +97,35 @@ def _bridge_timeout(streaming: bool = False) -> "httpx.Timeout":
     """Build the httpx.Timeout for upstream calls, honoring env overrides.
 
     Env vars (all optional, all in seconds):
-      - WCB_BRIDGE_REQUEST_TIMEOUT     (non-stream overall, default 600)
-      - WCB_BRIDGE_READ_TIMEOUT        (non-stream per-chunk read, default 180)
-      - WCB_BRIDGE_STREAM_READ_TIMEOUT (stream per-chunk read, default 600)
-      - WCB_BRIDGE_CONNECT_TIMEOUT     (TCP connect, default 30)"""
+      - CCBRIDGE_REQUEST_TIMEOUT     (non-stream overall, default 600)
+      - CCBRIDGE_READ_TIMEOUT        (non-stream per-chunk read, default 180)
+      - CCBRIDGE_STREAM_READ_TIMEOUT (stream per-chunk read, default 600)
+      - CCBRIDGE_CONNECT_TIMEOUT     (TCP connect, default 30)"""
     def _f(env, default):
         try:
             return float(os.environ.get(env, "").strip() or default)
         except (ValueError, TypeError):
             return default
-    connect = _f("WCB_BRIDGE_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)
+    connect = _f("CCBRIDGE_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)
     if streaming:
         # No total cap (None) - long thinking turns must not be killed by wall
         # time; the harness watchdog is the backstop. Generous per-chunk read.
-        read = _f("WCB_BRIDGE_STREAM_READ_TIMEOUT", DEFAULT_STREAM_READ_TIMEOUT)
+        read = _f("CCBRIDGE_STREAM_READ_TIMEOUT", DEFAULT_STREAM_READ_TIMEOUT)
         return httpx.Timeout(None, connect=connect, read=read, write=None, pool=None)
-    total = _f("WCB_BRIDGE_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)
-    read = _f("WCB_BRIDGE_READ_TIMEOUT", DEFAULT_READ_TIMEOUT)
+    total = _f("CCBRIDGE_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)
+    read = _f("CCBRIDGE_READ_TIMEOUT", DEFAULT_READ_TIMEOUT)
     return httpx.Timeout(total, connect=connect, read=read)
 
 # Headers that must never propagate inbound -> upstream.
 # CRITICAL: user-agent, x-app, and x-stainless-* are the "third-party app"
 # fingerprint Anthropic uses to route OAuth traffic to metered "extra usage"
-# instead of the Max plan quota. When a request arrives from openclaw ->
-# LiteLLM -> our bridge, these headers identify litellm/httpx/openclaw as a
-# third-party client, and Anthropic 400s or 429s the request with
-# "Third-party apps now draw from your extra usage, not your plan limits."
-# We strip them here and re-inject official-CLI identifiers in
-# _build_forward_headers so upstream sees the request as coming from the
-# `claude` CLI (the identity the OAuth token was actually issued to).
-# This match is what makes kaiju's bridge work in-process (aider ships the
-# anthropic-python SDK's default user-agent) while ours needs explicit
-# rewriting because the request passes through LiteLLM proxy first.
+# instead of the Max plan quota. The OpenHands agent reaches this bridge
+# through LiteLLM, whose user-agent identifies it as a third-party client, and
+# Anthropic answers such a request with a 400 or 429 reading "Third-party apps
+# now draw from your extra usage, not your plan limits." We strip them here and
+# re-inject official-CLI identifiers in _build_forward_headers so upstream sees
+# the request as coming from the `claude` CLI (the identity the OAuth token was
+# actually issued to).
 STRIP_HEADERS_IN = frozenset(
     {
         "host",
@@ -162,25 +159,25 @@ ProviderLike = Union[CredentialProvider, MultiAccountCredentialProvider]
 
 
 def _upstream_base() -> str:
-    return os.environ.get("WCB_CC_UPSTREAM", UPSTREAM_DEFAULT).rstrip("/")
+    return os.environ.get("CCBRIDGE_UPSTREAM", UPSTREAM_DEFAULT).rstrip("/")
 
 
 def _max_inline_retries() -> int:
     try:
-        return max(0, int(os.environ.get("WCB_CC_MAX_INLINE_RETRIES", "")))
+        return max(0, int(os.environ.get("CCBRIDGE_MAX_INLINE_RETRIES", "")))
     except ValueError:
         return DEFAULT_MAX_INLINE_RETRIES
 
 
 def _max_inline_wait_seconds() -> int:
     try:
-        return max(0, int(os.environ.get("WCB_CC_MAX_INLINE_WAIT", "")))
+        return max(0, int(os.environ.get("CCBRIDGE_MAX_INLINE_WAIT", "")))
     except ValueError:
         return DEFAULT_MAX_INLINE_WAIT_SECONDS
 
 
 def _billing_attribution_enabled() -> bool:
-    return os.environ.get("WCB_CC_BILLING_ATTRIBUTION", "1").strip().lower() not in (
+    return os.environ.get("CCBRIDGE_BILLING_ATTRIBUTION", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
@@ -196,20 +193,21 @@ def _billing_header_text(raw_body: bytes) -> str:
 
 
 # Load-bearing: Anthropic's OAuth validator rejects a request whose tools[]
-# contains 7+ tools with bare-lowercase-word names (openclaw's read/edit/exec/
-# cron/subagents/...) with the misleading "extra usage" 400. Empirically pinned
+# contains 7+ tools with bare-lowercase-word names (OpenHands' terminal,
+# file_editor, task_tracker, think, finish, ...) with the misleading "extra
+# usage" 400. Empirically pinned
 # by replaying real request bodies against api.anthropic.com: <=6 unknown names
 # pass, >=7 fail; ANY reversible rename (prefix/capitalize) makes all 15 pass;
 # no specific name is forbidden and the exact Claude Code toolset is NOT
 # required. We prefix every outbound tool name with TOOL_NAME_PREFIX (a
 # legitimate MCP-style namespace) and strip it back off responses. The prefix
 # is unique, so the reverse is a pure string op with no per-request map and no
-# collisions. Gated by WCB_CC_TOOL_RENAME (default on).
-TOOL_NAME_PREFIX = "mcp__wcb__"
+# collisions. Gated by CCBRIDGE_TOOL_RENAME (default on).
+TOOL_NAME_PREFIX = "mcp__ccb__"
 
 
 def _tool_rename_enabled() -> bool:
-    return os.environ.get("WCB_CC_TOOL_RENAME", "1").strip().lower() not in (
+    return os.environ.get("CCBRIDGE_TOOL_RENAME", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
@@ -255,7 +253,7 @@ def strip_tool_prefix_bytes(data: bytes) -> bytes:
     """Remove TOOL_NAME_PREFIX from tool names in an upstream response body.
 
     Works uniformly on non-streaming JSON and buffered SSE bytes: the prefix
-    only ever appears in a JSON ``"name":"mcp__wcb__..."`` we produced, so a
+    only ever appears in a JSON ``"name":"mcp__ccb__..."`` we produced, so a
     literal byte replace of the quoted-prefix token is exact and collision-free.
     """
     if not data:
@@ -266,17 +264,17 @@ def strip_tool_prefix_bytes(data: bytes) -> bytes:
     return data.replace(b'"' + TOOL_NAME_PREFIX.encode(), b'"')
 
 
-# Option D - buffer-and-retry: buffer the whole upstream SSE stream and re-issue
+# Buffer-and-retry: buffer the whole upstream SSE stream and re-issue
 # on a mid-stream drop so the client only ever sees a COMPLETE response.
 def _buffer_and_retry_enabled() -> bool:
-    return os.environ.get("WCB_CC_BUFFER_AND_RETRY", "1").strip().lower() not in (
+    return os.environ.get("CCBRIDGE_BUFFER_AND_RETRY", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
 
 def _max_stream_buffer_retries() -> int:
     try:
-        return max(0, int(os.environ.get("WCB_CC_STREAM_BUFFER_RETRIES", "3")))
+        return max(0, int(os.environ.get("CCBRIDGE_STREAM_BUFFER_RETRIES", "3")))
     except ValueError:
         return 3
 
@@ -308,7 +306,7 @@ def inject_system_prefix(body: dict[str, Any]) -> dict[str, Any]:
     Idempotent: if WE already injected the prefix (it sits at the very start of
     the system content) the body is returned unchanged.
 
-    B16: the idempotency test is ANCHORED at the start, not a substring search.
+    the idempotency test is ANCHORED at the start, not a substring search.
     A substring `SYSTEM_PREFIX in system` false-suppresses injection whenever a
     user prompt merely quotes the prefix text mid-content - we'd then forward a
     request with no real leading prefix and the upstream rejects it as not a
@@ -419,7 +417,7 @@ def _prepend_to_first_user_message(body: dict[str, Any], text: str) -> None:
 
 def _adaptive_thinking_mode() -> str:
     """``passthrough`` (default) or ``convert`` (the reference bridge's rewrite)."""
-    mode = os.environ.get("WCB_CC_ADAPTIVE_THINKING", "passthrough").strip().lower()
+    mode = os.environ.get("CCBRIDGE_ADAPTIVE_THINKING", "passthrough").strip().lower()
     return "convert" if mode == "convert" else "passthrough"
 
 
@@ -436,7 +434,7 @@ def normalize_body_for_anthropic_direct(body: dict[str, Any]) -> dict[str, Any]:
             -> thinking text "" (signature only), with or without tools
 
     The reference bridge rewrote every adaptive request to the enabled +
-    budget_tokens shape (``WCB_CC_ADAPTIVE_THINKING=convert`` restores that),
+    budget_tokens shape (``CCBRIDGE_ADAPTIVE_THINKING=convert`` restores that),
     on the belief that Anthropic-direct rejects adaptive. It accepts it today,
     alongside the billing-attribution and tool-rename transforms that fix the
     "extra usage" 400 the rewrite was blamed for. On claude-opus-5 the rewrite
@@ -486,7 +484,7 @@ def clamp_thinking_budget(body: dict[str, Any]) -> dict[str, Any]:
     """Keep ``thinking.budget_tokens`` strictly below ``max_tokens``.
 
     An enabled request -- the caller's own, or an adaptive one rewritten under
-    ``WCB_CC_ADAPTIVE_THINKING=convert`` -- gets a fixed 32000 budget when it
+    ``CCBRIDGE_ADAPTIVE_THINKING=convert`` -- gets a fixed 32000 budget when it
     names none, which is only valid when the caller asked for more output than
     that. OpenHands SDK 1.49 through LiteLLM 1.102 asks for ``max_tokens: 16384``
     for claude-opus-5, and Anthropic refuses ``budget_tokens >= max_tokens`` with
@@ -521,7 +519,7 @@ def _normalize_path(path: str) -> str:
 
 
 def _is_streaming_payload(raw_body: bytes) -> bool:
-    # B12: parse the JSON and read the real boolean. A substring probe both
+    # parse the JSON and read the real boolean. A substring probe both
     # false-positives (the literal "stream":true inside prompt content) and
     # false-negatives ("stream" : true with odd spacing), and mis-routing a
     # streaming response to the non-streaming path buffers a multi-MB body and
@@ -538,9 +536,9 @@ def _is_streaming_payload(raw_body: bytes) -> bool:
 
 
 CLAUDE_CLI_USER_AGENT = os.environ.get(
-    "WCB_CC_USER_AGENT", "claude-cli/1.0.60 (external, cli)"
+    "CCBRIDGE_USER_AGENT", "claude-cli/1.0.60 (external, cli)"
 )
-CLAUDE_CLI_X_APP = os.environ.get("WCB_CC_X_APP", "cli")
+CLAUDE_CLI_X_APP = os.environ.get("CCBRIDGE_X_APP", "cli")
 
 
 def _build_forward_headers(
@@ -590,7 +588,7 @@ def _apply_classification_to_provider(
     # Pass the FULL token so the provider can attribute the error to the exact
     # slot that produced it (it matches on slot.last_token); a 20-char prefix is
     # ambiguous because all OAuth tokens share the `sk-ant-oat01-` prefix.
-    # B5: stash the cap reset on the provider so /quota can surface it even for a
+    # stash the cap reset on the provider so /quota can surface it even for a
     # SINGLE account (whose /quota otherwise always reports next_reset_at=None,
     # forcing recovery to a 300s guess and premature give-up against a 5h cap).
     if classified.kind == ErrorKind.SUBSCRIPTION_CAP:
@@ -621,8 +619,8 @@ def _build_error_response(
     classified: ClassifiedError, upstream_headers: Any = None
 ) -> JSONResponse:
     """Return a structured error response to the client."""
-    headers: dict[str, str] = {"X-WCB-Bridge-Error": classified.kind.value}
-    # B10: forward the genuine upstream rate-limit/request-id headers so the
+    headers: dict[str, str] = {"X-CCBridge-Error": classified.kind.value}
+    # forward the genuine upstream rate-limit/request-id headers so the
     # client's own back-off logic (which keys on anthropic-ratelimit-*) and
     # debugging (request-id) keep working through the bridge.
     if upstream_headers is not None:
@@ -633,14 +631,14 @@ def _build_error_response(
     if classified.retry_after_seconds is not None:
         headers["Retry-After"] = str(max(1, classified.retry_after_seconds))
     if classified.reset_at_unix is not None:
-        headers["X-WCB-Reset-At"] = f"{classified.reset_at_unix:.0f}"
+        headers["X-CCBridge-Reset-At"] = f"{classified.reset_at_unix:.0f}"
     body = {
         "type": "error",
         "error": {
             "type": classified.raw_error_type or "rate_limit_error",
             "message": classified.message,
         },
-        "wcb_bridge": {
+        "ccbridge": {
             "kind": classified.kind.value,
             "retry_after_seconds": classified.retry_after_seconds,
             "reset_at_unix": classified.reset_at_unix,
@@ -663,7 +661,7 @@ async def _forward_non_streaming(
     max_wait = _max_inline_wait_seconds()
     attempt = 0
     last_response: Union[httpx.Response, None] = None
-    # B9: track tokens already tried this call so we never spin re-selecting a
+    # track tokens already tried this call so we never spin re-selecting a
     # slot whose exhaustion/invalid marking didn't stick (attribution miss).
     _tried_tokens: set[str] = set()
 
@@ -678,12 +676,12 @@ async def _forward_non_streaming(
                 {
                     "type": "error",
                     "error": {"type": "authentication_error", "message": str(e)},
-                    "wcb_bridge": {"kind": "credentials_unavailable"},
+                    "ccbridge": {"kind": "credentials_unavailable"},
                 },
                 status_code=401,
             )
 
-        # B9: if failover handed us a slot we already burned this call (its
+        # if failover handed us a slot we already burned this call (its
         # exhausted/invalid marking didn't stick), stop rather than tight-spin
         # against a dead account. Mirrors the streaming path's guard.
         if access_token in _tried_tokens and last_response is not None:
@@ -715,7 +713,7 @@ async def _forward_non_streaming(
                         {
                             "type": "error",
                             "error": {"type": "api_error", "message": str(e)},
-                            "wcb_bridge": {"kind": "network_error"},
+                            "ccbridge": {"kind": "network_error"},
                         },
                         status_code=502,
                     )
@@ -725,7 +723,7 @@ async def _forward_non_streaming(
 
         last_response = upstream
         if 200 <= upstream.status_code < 300:
-            # B5/H2: a success means we're no longer capped - clear any stale
+            # a success means we're no longer capped - clear any stale
             # cap-reset so /quota doesn't keep reporting a phantom cap after a
             # brief throttle recovered.
             try:
@@ -769,7 +767,7 @@ async def _forward_non_streaming(
                 attempt += 1
                 if attempt > max_retries:
                     break
-                # B9: floor the failover retry so a marking-miss can't tight-spin;
+                # floor the failover retry so a marking-miss can't tight-spin;
                 # the top-of-loop guard breaks if we get a burned token back.
                 await asyncio.sleep(0.5)
                 continue  # retry with next account
@@ -798,7 +796,7 @@ async def _forward_non_streaming(
         {
             "type": "error",
             "error": {"type": "api_error", "message": "max retries exceeded"},
-            "wcb_bridge": {"kind": "max_retries_exceeded"},
+            "ccbridge": {"kind": "max_retries_exceeded"},
         },
         status_code=502,
     )
@@ -822,7 +820,7 @@ async def _stream_with_failover(
     max_retries = _max_inline_retries()
     max_wait = _max_inline_wait_seconds()
     attempt = 0
-    _tried_tokens: set[str] = set()  # B9: burned slots this call
+    _tried_tokens: set[str] = set()  # burned slots this call
     _last_classified: Optional[ClassifiedError] = None
     _last_headers: Any = None
 
@@ -837,12 +835,12 @@ async def _stream_with_failover(
                 {
                     "type": "error",
                     "error": {"type": "authentication_error", "message": str(e)},
-                    "wcb_bridge": {"kind": "credentials_unavailable"},
+                    "ccbridge": {"kind": "credentials_unavailable"},
                 },
                 status_code=401,
             )
 
-        # B9: stop if failover handed us an already-failed slot (marking miss).
+        # stop if failover handed us an already-failed slot (marking miss).
         if access_token in _tried_tokens and _last_classified is not None:
             _LOG.warning(
                 "stream failover re-selected an already-failed account; stopping "
@@ -873,7 +871,7 @@ async def _stream_with_failover(
                     {
                         "type": "error",
                         "error": {"type": "api_error", "message": str(e)},
-                        "wcb_bridge": {"kind": "network_error"},
+                        "ccbridge": {"kind": "network_error"},
                     },
                     status_code=502,
                 )
@@ -883,7 +881,7 @@ async def _stream_with_failover(
 
         if 200 <= upstream.status_code < 300:
             async def event_stream():
-                # B2: a 200 only means the stream OPENED. Anthropic can still drop
+                # a 200 only means the stream OPENED. Anthropic can still drop
                 # the connection mid-stream or emit an `event: error` frame AFTER
                 # the 200. If we relay bytes blindly and the stream ends without a
                 # terminal `message_stop`, the client records a TRUNCATED turn as a
@@ -898,9 +896,9 @@ async def _stream_with_failover(
                 # a small rolling buffer so a marker split across two chunks is still
                 # matched on a line boundary.
                 tail = b""
-                # Live-stream tee (docs/STREAMING_PLAN.md §3.2), passthrough
+                # Live-stream tee (stream_tee.py), passthrough
                 # variant: observe-only beside the existing tail bookkeeping;
-                # inert without WCB_CC_STREAM_LOG_PATH, fail-open.
+                # inert without CCBRIDGE_STREAM_LOG_PATH, fail-open.
                 tee = StreamTee(source="agent")
                 tee.attempt_started()
                 try:
@@ -918,7 +916,7 @@ async def _stream_with_failover(
                     yield (
                         b"\nevent: error\n"
                         b'data: {"type":"error","error":{"type":"api_error",'
-                        b'"message":"wcb-bridge: upstream stream aborted mid-response"}}\n\n'
+                        b'"message":"ccbridge: upstream stream aborted mid-response"}}\n\n'
                     )
                     saw_error = True
                 finally:
@@ -933,7 +931,7 @@ async def _stream_with_failover(
                     yield (
                         b"\nevent: error\n"
                         b'data: {"type":"error","error":{"type":"api_error",'
-                        b'"message":"wcb-bridge: upstream stream ended without message_stop (truncated)"}}\n\n'
+                        b'"message":"ccbridge: upstream stream ended without message_stop (truncated)"}}\n\n'
                     )
                 else:
                     tee.finish()
@@ -983,7 +981,7 @@ async def _stream_with_failover(
                 attempt += 1
                 if attempt > max_retries:
                     return _build_error_response(classified, upstream.headers)
-                # B9: floor the failover retry so a marking-miss can't tight-spin.
+                # floor the failover retry so a marking-miss can't tight-spin.
                 await asyncio.sleep(0.5)
                 continue
 
@@ -1005,7 +1003,7 @@ async def _stream_buffered_with_retry(
     headers_in: Any,
     params: dict[str, str],
 ) -> Response:
-    """Option D - buffer the ENTIRE upstream SSE stream and re-issue on a
+    """Buffer the ENTIRE upstream SSE stream and re-issue on a
     mid-stream drop, so the client only ever receives a COMPLETE response (or a
     clean error), never a truncated one.
 
@@ -1016,12 +1014,12 @@ async def _stream_buffered_with_retry(
 
     Trade vs ``_stream_with_failover``: no incremental token delivery (the whole
     response is replayed at once) and upstream ratelimit headers aren't forwarded
-    on the success path. Gated by ``WCB_CC_BUFFER_AND_RETRY`` (default on).
+    on the success path. Gated by ``CCBRIDGE_BUFFER_AND_RETRY`` (default on).
     """
     max_retries = _max_stream_buffer_retries()
     max_wait = _max_inline_wait_seconds()
-    # Live-stream tee (docs/STREAMING_PLAN.md §3.2): observe-only, inert
-    # without WCB_CC_STREAM_LOG_PATH, fail-open. This is the ONLY real-time
+    # Live-stream tee (stream_tee.py): observe-only, inert
+    # without CCBRIDGE_STREAM_LOG_PATH, fail-open. This is the ONLY real-time
     # token tap on the OAuth path - the client-facing replay below stays an
     # end-of-turn burst by design (buffer-and-retry semantics unchanged).
     tee = StreamTee(source="agent")
@@ -1074,7 +1072,7 @@ async def _stream_buffered_with_retry(
                             continue
                         # Log the actual upstream body so operators can diagnose
                         # payload-level 400s from bridge logs even when the client
-                        # (openclaw) swallows the SSE error frame we relay.
+                        # swallows the SSE error frame we relay.
                         try:
                             body_preview = body[:2048].decode("utf-8", "replace")
                         except Exception:  # noqa: BLE001
@@ -1100,7 +1098,7 @@ async def _stream_buffered_with_retry(
                         if b"\nevent: error" in tail or tail.startswith(b"event: error"):
                             saw_error = True
                         # Observe-only live tap; `buf`/`tail`/client bytes are
-                        # untouched (R5) and tee failures self-disable (R2).
+                        # untouched and tee failures self-disable.
                         tee.feed(chunk)
                 finally:
                     await cm.__aexit__(None, None, None)
@@ -1149,7 +1147,7 @@ async def _stream_buffered_with_retry(
                 # frame only when body is empty (e.g. failover-to-burned-slot).
                 if body:
                     err_type = "api_error"
-                    err_msg = "wcb-bridge: upstream error (buffered)"
+                    err_msg = "ccbridge: upstream error (buffered)"
                     try:
                         parsed = json.loads(body)
                         if isinstance(parsed, dict):
@@ -1164,9 +1162,9 @@ async def _stream_buffered_with_retry(
                         err_msg = body.decode("utf-8", "replace")[:1024] or err_msg
                     yield _sse_error_bytes(err_type, err_msg)
                 else:
-                    yield _sse_error_bytes("api_error", "wcb-bridge: upstream error (buffered)")
+                    yield _sse_error_bytes("api_error", "ccbridge: upstream error (buffered)")
             else:  # incomplete
-                yield _sse_error_bytes("api_error", "wcb-bridge: upstream stream incomplete after retries")
+                yield _sse_error_bytes("api_error", "ccbridge: upstream stream incomplete after retries")
         finally:
             # If the client disconnected mid-buffer, don't leak the capture task.
             if not task.done():
@@ -1175,13 +1173,13 @@ async def _stream_buffered_with_retry(
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"X-WCB-Bridge-Mode": "buffer-and-retry"},
+        headers={"X-CCBridge-Mode": "buffer-and-retry"},
     )
 
 
 def _resolve_provider() -> ProviderLike:
     """Pick single-account or multi-account provider based on env."""
-    pool_spec = os.environ.get("WCB_CC_ACCOUNT_POOL", "").strip()
+    pool_spec = os.environ.get("CCBRIDGE_ACCOUNT_POOL", "").strip()
     if pool_spec:
         pool = load_account_pool(pool_spec)
         if pool is not None:
@@ -1193,16 +1191,16 @@ def _resolve_provider() -> ProviderLike:
 def build_app(provider: ProviderLike | None = None) -> FastAPI:
     app = FastAPI(title="Claude Code OAuth Bridge", version="1.1.0")
     prov: ProviderLike = provider if provider is not None else _resolve_provider()
-    inject = os.environ.get("WCB_CC_SKIP_SYSTEM_PREFIX") != "1"
+    inject = os.environ.get("CCBRIDGE_SKIP_SYSTEM_PREFIX") != "1"
 
-    # B1: optional shared secret. Without it, ANY local process can spend the
-    # user's subscription by POSTing to the bridge. When WCB_CC_BRIDGE_SECRET is
+    # optional shared secret. Without it, ANY local process can spend the
+    # user's subscription by POSTing to the bridge. When CCBRIDGE_SECRET is
     # set, every proxied request must present it (x-api-key OR Authorization
-    # bearer OR x-wcb-bridge-secret). Bind to 127.0.0.1 regardless.
-    bridge_secret = os.environ.get("WCB_CC_BRIDGE_SECRET", "").strip()
+    # bearer OR x-ccbridge-secret). Bind to 127.0.0.1 regardless.
+    bridge_secret = os.environ.get("CCBRIDGE_SECRET", "").strip()
     if not bridge_secret:
         _LOG.warning(
-            "WCB_CC_BRIDGE_SECRET is not set - the bridge is UNAUTHENTICATED; any "
+            "CCBRIDGE_SECRET is not set - the bridge is UNAUTHENTICATED; any "
             "local process can spend this subscription. Set it (and point clients' "
             "ANTHROPIC_API_KEY at the same value) to lock it down."
         )
@@ -1211,7 +1209,7 @@ def build_app(provider: ProviderLike | None = None) -> FastAPI:
         if not bridge_secret:
             return True
         presented = (
-            request.headers.get("x-wcb-bridge-secret")
+            request.headers.get("x-ccbridge-secret")
             or request.headers.get("x-api-key")
             or ""
         )
@@ -1226,11 +1224,11 @@ def build_app(provider: ProviderLike | None = None) -> FastAPI:
     @app.get("/healthz")
     async def healthz(request: Request):
         # Liveness must work WITHOUT the secret (the launcher/monitor poll it),
-        # but M1: don't leak the token prefix / account state to unauthenticated
+        # but don't leak the token prefix / account state to unauthenticated
         # callers when a secret is configured - redact instead of 401.
         _auth = _authorized(request)
         try:
-            # B11: get_access_token can block (Keychain subprocess / refresh /
+            # get_access_token can block (Keychain subprocess / refresh /
             # flock); run it off the loop so /healthz can't stall and trigger a
             # spurious monitor restart that wipes account state.
             token = await asyncio.to_thread(prov.get_access_token)
@@ -1252,7 +1250,7 @@ def build_app(provider: ProviderLike | None = None) -> FastAPI:
 
         recovery.py needs the reset time without coordinating a secret, so this
         stays reachable; but the per-account token_prefix is redacted unless the
-        caller is authorized (M1)."""
+        caller is authorized."""
         _auth = _authorized(request)
         if isinstance(prov, MultiAccountCredentialProvider):
             snap = prov.snapshot()
@@ -1264,7 +1262,7 @@ def build_app(provider: ProviderLike | None = None) -> FastAPI:
                 "accounts": snap,
                 "next_reset_at_unix": prov.next_reset_at(),
             }
-        # B5: surface the most recent observed cap reset for the single account
+        # surface the most recent observed cap reset for the single account
         # so recovery can wait the real duration instead of a 300s fallback.
         _reset = getattr(prov, "last_cap_reset_at", None)
         if _reset is not None and _reset <= time.time():
@@ -1279,7 +1277,7 @@ def build_app(provider: ProviderLike | None = None) -> FastAPI:
         if not _authorized(request):
             return JSONResponse(
                 {"type": "error", "error": {"type": "authentication_error",
-                 "message": "wcb-bridge: missing/invalid bridge secret"}},
+                 "message": "ccbridge: missing/invalid bridge secret"}},
                 status_code=401,
             )
         raw_body = await request.body()
@@ -1305,7 +1303,7 @@ def build_app(provider: ProviderLike | None = None) -> FastAPI:
             except ValueError as e:
                 _LOG.warning("Skipping system-prefix injection (bad JSON): %s", e)
 
-        if os.environ.get("WCB_CC_DEBUG_LOG_BODY", "0") == "1" and raw_body:
+        if os.environ.get("CCBRIDGE_DEBUG_LOG_BODY", "0") == "1" and raw_body:
             try:
                 bj = json.loads(raw_body)
                 if isinstance(bj, dict):
@@ -1332,8 +1330,8 @@ def build_app(provider: ProviderLike | None = None) -> FastAPI:
                     )
                     _LOG.warning("REQ_BODY_HEADERS %s", dict(request.headers))
                     try:
-                        _dump_dir = os.environ.get("WCB_CC_BODY_DUMP_DIR", "/tmp")
-                        _dump_path = f"{_dump_dir}/wcb_bridge_last_body_{int(time.time())}.json"
+                        _dump_dir = os.environ.get("CCBRIDGE_BODY_DUMP_DIR", "/tmp")
+                        _dump_path = f"{_dump_dir}/ccbridge_last_body_{int(time.time())}.json"
                         with open(_dump_path, "wb") as _f:
                             _f.write(raw_body)
                         _LOG.warning("REQ_BODY_DUMP wrote %d bytes to %s", len(raw_body), _dump_path)
@@ -1346,7 +1344,7 @@ def build_app(provider: ProviderLike | None = None) -> FastAPI:
         params = dict(request.query_params)
 
         if _is_streaming_payload(raw_body):
-            # Option D: buffer-and-retry recovers a mid-stream drop transparently
+            # Buffer-and-retry recovers a mid-stream drop transparently
             # (default on); the incremental path is the fallback when disabled.
             if _buffer_and_retry_enabled():
                 return await _stream_buffered_with_retry(

@@ -736,6 +736,10 @@ def main(argv: list[str] | None = None) -> int:
     # to reach. The bundled copies are what the pinned runtime was built with.
     os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     os.environ.setdefault("LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS", "True")
+    # A model LiteLLM has no price for (glm-5.3 behind zbridge) warns on every
+    # call; its cost is recorded as 0, which the README says, and once is enough.
+    import warnings
+    warnings.filterwarnings("ignore", message="Cost calculation failed")
     instruction = Path(args.instruction_file).read_text(encoding="utf-8")
     logs_dir = Path(args.logs_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)

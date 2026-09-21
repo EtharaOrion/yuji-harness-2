@@ -188,8 +188,8 @@ def test_bundle_prebakes_cli(task_toml: Path):
 
 
 # --- tool-level deny ---------------------------------------------------------
-# The second layer, borrowed from WildClawBench's tools.deny: the routing block
-# already makes WebSearch/WebFetch fail, but a failing tool still costs a turn.
+# The second layer: the routing block already makes WebSearch/WebFetch fail,
+# but a failing tool still costs a turn.
 # Denying them removes them from the tool list entirely.
 #
 # These drive run_task.sh with a stub `harbor` on PATH and read the argv it

@@ -236,7 +236,7 @@ Forward the following upstream headers to the client, prefixed with `zbridge-ups
 
 Strip: `content-encoding`, `transfer-encoding`, `content-length`, `connection` (chunking artifacts).
 
-Emit `zbridge-error-kind: <ErrorKind.value>` on every non-2xx response (mirrors ccbridge's `X-WCB-Bridge-Error`).
+Emit `zbridge-error-kind: <ErrorKind.value>` on every non-2xx response (mirrors ccbridge's `X-CCBridge-Error`).
 
 ### 5.3 SSE Translation: GLM stream → Anthropic events
 
@@ -278,7 +278,7 @@ Rules:
 3. On successful capture (terminal seen), replay through `SseTranslator` and stream the resulting Anthropic events to the client atomically.
 4. On mid-stream drop (upstream closes without terminal): discard buffer, wait `min(2**attempt, ZB_MAX_INLINE_WAIT_S)`, re-issue upstream. Cap at `ZB_STREAM_BUFFER_RETRIES=3`.
 5. During capture: emit `event: ping` to client every `ZB_PING_INTERVAL_S` to keep connection alive.
-6. If all retries exhausted: emit `event: error` with `type:"api_error", message:"wcb-bridge: upstream stream incomplete after retries"`, close.
+6. If all retries exhausted: emit `event: error` with `type:"api_error", message:"zbridge: upstream stream incomplete after retries"`, close.
 
 **Passthrough mode** (`ZB_BUFFER_AND_RETRY=0`): stream translated frames directly through `SseTranslator` as they arrive from upstream; on mid-stream drop, close client stream with `event: error`.
 
@@ -361,22 +361,22 @@ No `Retry-After` header from z.ai → we compute backoff ourselves. Base 1s, fac
 | Env var | Default | Purpose | ccbridge counterpart |
 |---|---|---|---|
 | `ZB_ZAI_API_KEY` | (required) | z.ai bearer token | (via OAuth in ccbridge) |
-| `ZB_BRIDGE_SECRET` | (required; generated to `.bridge_secret` on first `--check`) | Local caller auth | `WCB_CC_BRIDGE_SECRET` |
-| `ZB_HOST` | `127.0.0.1` | Bind host | `WCB_CC_HOST` |
-| `ZB_PORT` | `8766` | Bind port | `WCB_CC_PORT` (8765) |
+| `ZB_BRIDGE_SECRET` | (required; generated to `.bridge_secret` on first `--check`) | Local caller auth | `CCBRIDGE_SECRET` |
+| `ZB_HOST` | `127.0.0.1` | Bind host | `CCBRIDGE_HOST` |
+| `ZB_PORT` | `8766` | Bind port | `CCBRIDGE_PORT` (8765) |
 | `ZB_UPSTREAM_URL` | `https://api.z.ai/api/coding/paas/v4/chat/completions` | GLM endpoint | (Anthropic hard-coded) |
 | `ZB_DEFAULT_MODEL` | `glm-5.3` | Fallback if model missing | — |
 | `ZB_MODEL_ALIAS_JSON` | `{"claude-3-5-sonnet-latest":"glm-5.3","claude-3-opus-latest":"glm-5.3","claude-sonnet-4-5":"glm-5.3","claude-opus-4-8":"glm-5.3"}` | Flat alias map (no globs) | — |
-| `ZB_STREAM_LOG_PATH` | unset | Enable JSONL tee if set | `WCB_CC_STREAM_LOG_PATH` |
-| `ZB_BUFFER_AND_RETRY` | `1` | Buffer full stream + retry on drop | `WCB_CC_BUFFER_AND_RETRY` (also default 1) |
-| `ZB_STREAM_BUFFER_RETRIES` | `3` | Buffer mode: mid-drop re-issue count | `WCB_CC_STREAM_BUFFER_RETRIES` |
+| `ZB_STREAM_LOG_PATH` | unset | Enable JSONL tee if set | `CCBRIDGE_STREAM_LOG_PATH` |
+| `ZB_BUFFER_AND_RETRY` | `1` | Buffer full stream + retry on drop | `CCBRIDGE_BUFFER_AND_RETRY` (also default 1) |
+| `ZB_STREAM_BUFFER_RETRIES` | `3` | Buffer mode: mid-drop re-issue count | `CCBRIDGE_STREAM_BUFFER_RETRIES` |
 | `ZB_READ_TIMEOUT_NONSTREAM_S` | `180` | httpx read timeout | (matches ccbridge default) |
 | `ZB_READ_TIMEOUT_STREAM_S` | `600` | httpx stream read timeout | (matches ccbridge default) |
-| `ZB_MAX_INLINE_RETRIES` | `3` | Retry count for retriable non-stream | `WCB_CC_MAX_INLINE_RETRIES` |
-| `ZB_MAX_INLINE_WAIT_S` | `30` | Total wait ceiling | `WCB_CC_MAX_INLINE_WAIT` |
+| `ZB_MAX_INLINE_RETRIES` | `3` | Retry count for retriable non-stream | `CCBRIDGE_MAX_INLINE_RETRIES` |
+| `ZB_MAX_INLINE_WAIT_S` | `30` | Total wait ceiling | `CCBRIDGE_MAX_INLINE_WAIT` |
 | `ZB_THINKING_SIG_KEY` | empty (see §5.2.1) | HMAC key for deterministic thinking signatures | — |
 | `ZB_PRESERVE_THINKING_IN_CONTEXT` | `0` | Send prior thinking back to GLM | — |
-| `ZB_LOG_LEVEL` | `INFO` | Python logging | `WCB_CC_LOG_LEVEL` |
+| `ZB_LOG_LEVEL` | `INFO` | Python logging | `--log-level` |
 | `ZB_PING_INTERVAL_S` | `10` | SSE keepalive | — |
 
 ## 8. Task Dependency Graph (revised — 25 tasks)
@@ -654,7 +654,7 @@ Deliberately dropped from the port:
 
 Retained verbatim from ccbridge:
 - Stream tee JSONL schema `{ts,seq,source,request_id,model,kind,event,delta}`.
-- Env-var-driven config style (`ZB_*` mirrors `WCB_CC_*`).
+- Env-var-driven config style (`ZB_*` mirrors `CCBRIDGE_*`).
 - 127.0.0.1 default bind + secret gate.
 - Timeout defaults (180s non-stream, 600s stream).
 - CLI shape (`--host --port --check`).
