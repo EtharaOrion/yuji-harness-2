@@ -1,0 +1,17 @@
+services:
+  main:
+    image: harness/openhands-adapter:latest
+    build: null
+    environment:
+      CLAUDE_CODE_OAUTH_TOKEN: '${CLAUDE_CODE_OAUTH_TOKEN:?required for openhands agent auth}'
+      MODEL: '${MODEL:-anthropic/claude-opus-5}'
+      MAX_ITERATIONS: '${MAX_ITERATIONS:-100}'
+      BUNDLE_ROOT: /bundle
+      TASK_INSTRUCTION_PATH: /bundle/instruction.md
+      TASK_TOML_PATH: /bundle/task.toml
+      AGENT_LOG_PATH: /logs/agent/openhands.txt
+      TRAJECTORY_JSON_PATH: /logs/agent/openhands_trajectory.json
+      REPORT_OUTPUT_PATH: /workspace/out/report.md
+      OPENHANDS_SUPPRESS_BANNER: '1'
+    volumes:
+      - '${BUNDLE_ROOT_HOST}:/bundle:ro'
