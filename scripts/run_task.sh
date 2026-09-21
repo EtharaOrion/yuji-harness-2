@@ -1023,44 +1023,6 @@ stage_harbor() {
   # agent-path Headroom on it is the headroom container that must win, with
   # zbridge behind it as the upstream.
   route_agent_through_headroom
-
-  if [ "$AGENT" = "openhands" ]; then
-    # OpenHands adapter path: bypasses harbor's --agent dispatch (harbor only
-    # knows claude-code, oracle, zbridge). Uses docker compose directly with
-    # bundle's environment/docker-compose.yaml + services/openhands-adapter/
-    # compose-override.yaml so main runs the openhands-adapter image while
-    # light-servers + judge come up on the same compose network as claude-code.
-    # See services/openhands-adapter/README.md.
-    local _bundle_uuid; _bundle_uuid="$(basename "$TASK")"
-    local _run_dir="$OUTPUT_DIR/$JOB/trajectory/run_1"
-    local _logs_dir="$_run_dir/logs"
-    local _workspace_dir="$_run_dir/workspace"
-    local _verifier_logs_dir="$_logs_dir/verifier"
-    mkdir -p "$_logs_dir/agent" "$_verifier_logs_dir" "$_workspace_dir/out"
-    export CLAUDE_CODE_OAUTH_TOKEN
-    export JUDGE_TOKEN="${JUDGE_TOKEN:-$(openssl rand -hex 16 2>/dev/null || echo "openhands-judge-$$")}"
-    export CODEX_AUTH_FILE="${CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
-    export HOST_VERIFIER_LOGS_PATH="$_verifier_logs_dir"
-    export BUNDLE_ROOT_HOST="$TASK"
-    export MODEL MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
-    [ -f "$CODEX_AUTH_FILE" ] || { mkdir -p "$(dirname "$CODEX_AUTH_FILE")"; echo '{}' > "$CODEX_AUTH_FILE"; }
-    local _image="${OPENHANDS_ADAPTER_IMAGE:-harness/openhands-adapter:latest}"
-    if ! docker image inspect "$_image" >/dev/null 2>&1; then
-      docker build -t "$_image" "$REPO/services/openhands-adapter/" || return 1
-    fi
-    local _project="openhands-$_bundle_uuid-$$"
-    (cd "$TASK/environment" && docker compose -p "$_project" \
-        -f "$TASK/environment/docker-compose.yaml" \
-        -f "$REPO/services/openhands-adapter/compose-override.yaml" \
-        up --abort-on-container-exit --exit-code-from main main light-servers judge)
-    local _rc=$?
-    docker compose -p "$_project" \
-        -f "$TASK/environment/docker-compose.yaml" \
-        -f "$REPO/services/openhands-adapter/compose-override.yaml" \
-        down --volumes --remove-orphans >/dev/null 2>&1
-    return $_rc
-  fi
-
   local args=(run -y --path "$TASK" --agent "$AGENT" --jobs-dir "$OUTPUT_DIR" --job-name "$JOB" \
               --environment-build-timeout-multiplier "$BUILD_MULT" \
               --agent-setup-timeout-multiplier "$SETUP_MULT" --n-attempts "$N")
