@@ -1193,10 +1193,27 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
   local _hrc=0
   # harbor resolves --agent tools.openhands_agent.agent:OpenHandsAgent with
   # importlib, so the checkout has to be importable from harbor's interpreter.
+  # pipx-installed harbor has shebang `python -E`; -E strips PYTHONPATH, so
+  # simply exporting PYTHONPATH before `command harbor` is a no-op. Invoke the
+  # venv's Python directly (no -E) instead, keeping the same argv shape.
   local _pypath="${PYTHONPATH:-}"
-  [ "$AGENT" = "openhands" ] && _pypath="$REPO${PYTHONPATH:+:$PYTHONPATH}"
-  PYTHONPATH="$_pypath" HARBOR_OUTPUT_OFF=1 command harbor "${args[@]}" \
-    || { _hrc=$?; echo "[run_task] harbor exited $_hrc; checking whether a trial actually ran" >&2; }
+  local _harbor_bin _harbor_py
+  _harbor_bin="$(command -v harbor)"
+  if [ "$AGENT" = "openhands" ] && [ -n "$_harbor_bin" ]; then
+    _pypath="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+    _harbor_py="$(head -n 1 "$_harbor_bin" | sed -e 's|^#!||' -e 's|[[:space:]]-E$||' -e 's|[[:space:]]-E[[:space:]].*|\1|' | awk '{print $1}')"
+    if [ -n "$_harbor_py" ] && [ -x "$_harbor_py" ]; then
+      PYTHONPATH="$_pypath" HARBOR_OUTPUT_OFF=1 "$_harbor_py" "$_harbor_bin" "${args[@]}" \
+        || { _hrc=$?; echo "[run_task] harbor exited $_hrc; checking whether a trial actually ran" >&2; }
+    else
+      echo "[run_task] WARN: cannot locate harbor's Python from shebang; falling back to \`command harbor\` (PYTHONPATH may be stripped by -E)" >&2
+      PYTHONPATH="$_pypath" HARBOR_OUTPUT_OFF=1 command harbor "${args[@]}" \
+        || { _hrc=$?; echo "[run_task] harbor exited $_hrc; checking whether a trial actually ran" >&2; }
+    fi
+  else
+    PYTHONPATH="$_pypath" HARBOR_OUTPUT_OFF=1 command harbor "${args[@]}" \
+      || { _hrc=$?; echo "[run_task] harbor exited $_hrc; checking whether a trial actually ran" >&2; }
+  fi
 
   # An interrupted harbor is not a failed trial. Continuing into reshape, mask
   # and finance would publish a half-run, and -- because harbor never reached
