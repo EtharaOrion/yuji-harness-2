@@ -52,8 +52,11 @@ def find_agent_log(agent_dir: Path) -> Path | None:
     """
     if not agent_dir.is_dir():
         return None
+    # openhands.txt is tools/openhands_agent/runner.py's stream, written in the
+    # same Claude stream-json dialect (openhands.jsonl once reshaped).
     named = [agent_dir / n for n in
-             ("claude-code.jsonl", "claude-code.txt", "oracle.jsonl", "oracle.txt")]
+             ("claude-code.jsonl", "claude-code.txt", "openhands.jsonl", "openhands.txt",
+              "oracle.jsonl", "oracle.txt")]
     rest = sorted(
         (p for p in list(agent_dir.glob("*.jsonl")) + list(agent_dir.glob("*.txt"))
          if p not in named),

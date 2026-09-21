@@ -44,6 +44,10 @@ def task_dir(tmp_path_factory):
 def run(task_dir, stage="preflight", **overrides):
     e = dict(os.environ)
     e.update(VALID)
+    # "Nothing here builds an image or reaches the network": true of the
+    # claude-code preflight. The default agent (openhands) starts the ccbridge
+    # and checks the subscription with a live call, which is not this gate.
+    e["AGENT"] = "claude-code"
     e.update(overrides)
     return subprocess.run(
         [str(RUN_TASK), "--stage", stage, task_dir],
@@ -118,3 +122,13 @@ def test_the_gate_can_be_bypassed(task_dir):
     r = run(task_dir, FINANCE_ENV_CHECK_OFF="1", FINANCE_PROJECT_ID="")
     assert r.returncode != 4
     assert "finance env check FAILED" not in r.stderr
+
+
+def test_an_explicitly_empty_odoo_url_disables_the_post(task_dir):
+    """`ODOO_URL= scripts/run_task.sh ...` is the opt-out. stage_finance used to
+    test emptiness, find the value in .env, and post regardless -- while the
+    startup check had already printed "usage reporting disabled"."""
+    r = run(task_dir, stage="finance", ODOO_URL="")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "usage reporting disabled for this run" in r.stderr
+    assert "finance_reporter" not in r.stdout + r.stderr

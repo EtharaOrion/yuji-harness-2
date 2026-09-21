@@ -1,0 +1,16 @@
+# OpenHands runs (AGENT=openhands) under network isolation only.
+#
+# scripts/run_task.sh adds this after overlay.yaml and sets EGRESS_SQUID_CONF.
+# It swaps in the squid-ccbridge.conf copy, so main can reach the ccbridge on
+# the host through squid. The internal network and everything else in
+# overlay.yaml stay: the agent still has no route of its own.
+
+services:
+  egress-proxy:
+    extra_hosts:
+      # squid resolves the bridge's host name itself. Docker Desktop and
+      # OrbStack answer host.docker.internal from any container; plain Linux
+      # docker needs it spelled out.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - "${EGRESS_SQUID_CONF:?set by scripts/run_task.sh for OpenHands runs}:/etc/squid/squid.conf:ro"

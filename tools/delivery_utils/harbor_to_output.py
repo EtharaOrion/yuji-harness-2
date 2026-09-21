@@ -7,7 +7,7 @@ and complex-mcp task runs land in one consistent shape:
     ├── config.json  lock.json  result.json          (Harbor job files, verbatim)
     ├── summary.json  pass_summary.json  pass@N.json (N = run count)
     ├── trajectory/Run_N/                            (one per trial, Harbor-shaped)
-    │   ├── agent/{claude-code.jsonl, trajectory.json}
+    │   ├── agent/{claude-code.jsonl | openhands.jsonl, trajectory.json}
     │   ├── logs/{agent-stream.jsonl, verifier-ctrf.json, verifier-reward.txt, verifier-stdout.txt}
     │   ├── verifier/{ctrf.json, reward.txt, test-stdout.txt, reward.json, detail.json, rubric_breakdown.json}
     │   ├── artifacts/{<files the agent produced>, manifest.json, index.json}
@@ -407,13 +407,20 @@ def strip_client_authored_tree(agent_dir: Path, model: str, extra=()) -> int:
 PASS_THRESHOLD_DEFAULT = 0.5
 MCP_PREFIX = "mcp__"
 
-# Claude Code built-ins -- not MCP tools, so they don't count as "valid" task
-# tool calls but are not "invalid" either (they're always callable).
+# Agent built-ins -- not MCP tools, so they don't count as "valid" task tool
+# calls but are not "invalid" either (they're always callable). Claude Code's,
+# then the OpenHands SDK's (tools/openhands_agent/runner.py loads terminal,
+# file_editor and task_tracker; finish and think come with every SDK agent).
 BUILTIN_TOOLS = {
     "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch",
     "ToolSearch", "Task", "Agent", "TodoWrite", "NotebookEdit", "Skill",
     "AskUserQuestion", "KillShell", "BashOutput", "ExitPlanMode", "EnterPlanMode",
+    "terminal", "file_editor", "task_tracker", "finish", "think",
 }
+
+# The OpenHands agent's stream (tools/openhands_agent/runner.py), in Claude
+# Code's stream-json dialect so parse_stream reads it unchanged.
+OPENHANDS_STREAM = "openhands.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1272,9 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
         (run_dir / "agent" / "claude-code.txt").unlink(missing_ok=True)
     elif _copy(ag / "claude-code.txt", run_dir / "agent" / "claude-code.jsonl"):
         pass
+    # Published as .jsonl like Claude Code's; the trial keeps the .txt name the
+    # bundles' test.sh globs for.
+    _copy(ag / OPENHANDS_STREAM, run_dir / "agent" / "openhands.jsonl")
     _copy(ag / "oracle.txt", run_dir / "agent" / "oracle.txt")
     _copy(ag / "trajectory.json", run_dir / "agent" / "trajectory.json")
     # Its total_cost_usd is cut, but NOT here -- see the .raw staging below.
@@ -1666,6 +1676,24 @@ def _mean_or_none(vals):
     return norm_reward(sum(vals) / len(vals)) if vals else None
 
 
+def _display_agent_name(name: str, job_dir: Path) -> str:
+    """The agent's own name for an agent harbor imported by path.
+
+    `harbor run --agent tools.openhands_agent.agent:OpenHandsAgent` records that
+    import path as the agent's name in the job config, and it would otherwise
+    ride into summary.json and every report as the agent. The trial's
+    result.json carries what the agent calls itself (`agent_info.name`); the
+    class name is the fallback.
+    """
+    if ":" not in (name or ""):
+        return name
+    for p in sorted(job_dir.iterdir()) if job_dir.is_dir() else []:
+        info = ((_load(p / "result.json", {}) or {}).get("agent_info") or {}) if p.is_dir() else {}
+        if isinstance(info, dict) and info.get("name") and ":" not in str(info["name"]):
+            return str(info["name"])
+    return name.rsplit(":", 1)[-1]
+
+
 def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: int = 0,
                 only_trials: set[str] | None = None) -> list[Path]:
     job_cfg = _load(job_dir / "config.json", {}) or {}
@@ -1688,6 +1716,7 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
             if a.get("name"):
                 agent_name = a["name"]; model = a.get("model_name") or agent_name
                 break
+    agent_name = _display_agent_name(agent_name, job_dir)
     # group trial dirs by task
     trials = sorted(p for p in job_dir.iterdir()
                     if p.is_dir() and p.name not in ("trajectory", ".raw") and (p / "config.json").exists())

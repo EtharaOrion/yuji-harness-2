@@ -151,6 +151,22 @@ def test_glm_config_is_opus_config_plus_zbridge_only(squid_lines):
     assert glm.index(zbridge_only[-1]) < glm.index("http_access deny all")
 
 
+def test_openhands_config_is_opus_config_plus_ccbridge_only(squid_lines):
+    """OpenHands runs load squid-ccbridge.conf: squid.conf exactly, plus the
+    one host:port the agent's model calls go to and a read timeout long enough
+    for a non-streamed thinking turn. Nothing else may differ."""
+    ccbridge_only = [
+        "acl ccbridge_host dstdomain host.docker.internal",
+        "acl ccbridge_port port 8765",
+        "http_access allow ccbridge_host ccbridge_port",
+        "read_timeout 30 minutes",
+    ]
+    oh = _directives((PROXY_DIR / "squid-ccbridge.conf").read_text())
+    assert [l for l in oh if l not in ccbridge_only] == squid_lines
+    assert all(l in oh for l in ccbridge_only), oh
+    assert oh.index("http_access allow ccbridge_host ccbridge_port") < oh.index("http_access deny all")
+
+
 # ------------------------------------------------- operational invariants
 # Each of these is called load-bearing in squid.conf's own comments; a proxy
 # that dies at startup is indistinguishable from a network outage inside main.

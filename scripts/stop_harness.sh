@@ -29,9 +29,10 @@ done
 say()  { echo "[stop-harness] $*"; }
 run()  { if [ "$DRY" = 1 ]; then echo "[dry-run]      $*"; else "$@"; fi; }
 
-# Ports the harness binds. zbridge is shared by every concurrent run_task.sh on
-# this machine, which is why the live-run guard below exists at all.
-PORTS=(8766 4000 4001 8787 8788)
+# Ports the harness binds. zbridge and the ccbridge (8765, the openhands agent's
+# route to the Claude subscription) are shared by every concurrent run_task.sh
+# on this machine, which is why the live-run guard below exists at all.
+PORTS=(8765 8766 4000 4001 8787 8788)
 
 cmd_of()  { ps -o command= -p "$1" 2>/dev/null; }
 ppid_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
@@ -42,7 +43,7 @@ ppid_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
 # the real server. Only the last does any work; the other two are dead weight
 # that makes it look like a run is still going.
 SERVICE_PIDS=()
-for pat in 'python -m zbridge' 'cbridge\.py' 'zbridge_adapter\.py' 'headroom.*proxy'; do
+for pat in 'python -m zbridge' 'python3? -m claude_oauth' 'cbridge\.py' 'zbridge_adapter\.py' 'headroom.*proxy'; do
   while read -r p; do [ -n "$p" ] && SERVICE_PIDS+=("$p"); done < <(pgrep -f "$pat" 2>/dev/null)
 done
 

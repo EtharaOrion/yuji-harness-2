@@ -351,7 +351,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--all", action="store_true", help="run every task under --tasks-dir")
     ap.add_argument("--tasks-dir", default="tasks", help="where --all looks (default: tasks)")
     ap.add_argument("--model", default="claude-opus-5")
-    ap.add_argument("--agent", default="claude-code")
+    ap.add_argument("--agent", default="openhands",
+                    help="openhands (default; the ccbridge-backed OpenHands SDK agent), "
+                         "claude-code, oracle, ...")
     ap.add_argument("--n", type=int, default=1, help="attempts per task (default: 1)")
     ap.add_argument("--at", default="auto",
                     help="pass@k ks handed to the reshaper ('auto' = every k from 1..runs)")

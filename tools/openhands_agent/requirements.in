@@ -1,0 +1,7 @@
+# The OpenHands SDK the agent runs on. Compiled to requirements.lock with:
+#   uv pip compile --universal --python-version 3.12 --generate-hashes \
+#     requirements.in -o requirements.lock
+# 1.49.2 is the first line on PyPI that registers claude-opus-5 for prompt
+# caching and adaptive thinking natively; the reference harness needed a fork.
+openhands-sdk==1.49.2
+openhands-tools==1.49.2

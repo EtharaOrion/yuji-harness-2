@@ -81,6 +81,11 @@ INTERNAL_HOSTS = {
 # can make them local.
 WEB_TOOLS = {"WebSearch", "WebFetch"}
 
+# Tools whose `command` argument is a shell command line: Claude Code's Bash,
+# and the OpenHands SDK's terminal (execute_bash before SDK 1.0). An audit that
+# knew only "Bash" would read every OpenHands command as a no-op tool call.
+SHELL_TOOLS = {"Bash", "terminal", "execute_bash"}
+
 # Shell verbs that move bytes to or from a host named on the command line.
 FETCHERS = {
     "curl", "wget", "nc", "ncat", "netcat", "telnet",
@@ -638,7 +643,7 @@ def classify_tool(tool_name: str, tool_input: dict) -> list[Finding]:
 
     MCP tools are the closed world and are never egress, however they are
     named. Everything else is judged by name (the web tools) or by its command
-    (Bash).
+    (a shell tool).
     """
     if tool_name.startswith("mcp__"):
         return []
@@ -646,7 +651,7 @@ def classify_tool(tool_name: str, tool_input: dict) -> list[Finding]:
     if tool_name in WEB_TOOLS or base in WEB_TOOLS:
         target = tool_input.get("url") or tool_input.get("query") or ""
         return [Finding("web-tool", f"{tool_name} called on {target}"[:200])]
-    if base == "Bash":
+    if base in SHELL_TOOLS:
         return classify(str(tool_input.get("command") or ""))
     return []
 

@@ -116,6 +116,7 @@ from egress_rules import (            # noqa: E402
     INTERNAL_HOSTS,
     NAMESPACE_URI_PREFIXES,
     OFFLINE_FLAGS,
+    SHELL_TOOLS,
     URL_RE,
     WEB_TOOLS,
     classify_tool,
@@ -473,7 +474,7 @@ def scan(traj: dict) -> None:
     the install and the agent removed the only other record of it.
     """
     for step, tool, args, response in normalise(traj):
-        cmd = str(args.get("command") or "") if tool.split("__")[-1] == "Bash" else ""
+        cmd = str(args.get("command") or "") if tool.split("__")[-1] in SHELL_TOOLS else ""
         for f in classify_tool(tool, args):
             evidence = cmd or str(args.get("url") or args.get("query") or "")
             out = response_text(response)

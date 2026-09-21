@@ -1,0 +1,63 @@
+# OpenHands agent runs (AGENT=openhands) only. claude-code runs never load it.
+#
+# scripts/run_task.sh passes this to harbor as --extra-docker-compose, which
+# lands it after the bundle's own environment/docker-compose.yaml. One file
+# covers every bundle; none of them is edited, and none of them needs to know
+# which agent is being evaluated.
+#
+# WHAT IT DOES
+#
+#   openhands-runtime  a sidecar from the openhands-runtime image
+#                      (tools/openhands_agent/Dockerfile). Mounting the empty
+#                      named volume below at /opt/openhands-runtime makes docker
+#                      copy the image's tree into it when the sidecar is
+#                      created -- the volume-population rule for named volumes.
+#                      It has no network and does nothing else.
+#
+#   main               mounts that volume READ-ONLY at the same path, so the
+#                      venv's symlinks resolve and the agent cannot rewrite the
+#                      code that is driving it. service_started is enough to
+#                      order the two: the copy happens at the sidecar's create,
+#                      before compose starts main.
+#
+# Why a sidecar and not a one-shot init container: harbor brings the project up
+# with `compose up --detach --wait`, which treats a service that has exited as
+# a failed start. The sidecar sleeps instead, under init so a SIGTERM stops it
+# at once rather than after compose's grace period.
+#
+# The volume belongs to the compose project, so harbor's own teardown (`down
+# --volumes`) removes it with everything else; each trial copies a fresh tree
+# (~0.7 GB, a few seconds).
+
+services:
+  openhands-runtime:
+    image: openhands-runtime:latest
+    # Built by scripts/run_task.sh preflight (ensure_image). Never `build:`
+    # here -- a task project would rebuild it on every trial.
+    network_mode: none
+    init: true
+    stop_grace_period: 2s
+    volumes:
+      - openhands_runtime:/opt/openhands-runtime
+
+  main:
+    depends_on:
+      openhands-runtime:
+        condition: service_started
+    volumes:
+      - openhands_runtime:/opt/openhands-runtime:ro
+    extra_hosts:
+      # The ccbridge listens on the host. Most bundles already declare this;
+      # restated so one that does not still reaches the model.
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Several bundles hand main the host's Claude OAuth token because the
+      # claude-code agent authenticates with it. OpenHands never does -- its
+      # model calls go through the ccbridge, which keeps the token on the host
+      # -- so the agent's container does not get it either. The verifier still
+      # does: harbor applies [verifier.env] to the test script's own exec, not
+      # to the container, and that is where every bundle declares it.
+      CLAUDE_CODE_OAUTH_TOKEN: ""
+
+volumes:
+  openhands_runtime:

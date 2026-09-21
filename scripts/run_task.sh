@@ -2,20 +2,32 @@
 # Run one mcp-atlas Harbor task end-to-end and emit the per-task output/ tree
 # (same layout complex-mcp's --layout harbor writer produces).
 #
-#   scripts/run_task.sh tasks/xenon-atomic-cube                 # claude-code + opus-5 (defaults)
-#   CC_MODE=zbridge N=3 scripts/run_task.sh tasks/foo            # 3 attempts via GLM-5.3 (zbridge)
+#   scripts/run_task.sh tasks/xenon-atomic-cube                 # openhands + opus-5 (defaults)
+#   AGENT=claude-code scripts/run_task.sh tasks/foo             # harbor's claude-code agent
+#   AGENT=claude-code CC_MODE=zbridge N=3 scripts/run_task.sh tasks/foo  # 3 attempts via GLM-5.3
 #   AGENT=oracle scripts/run_task.sh tasks/foo                  # oracle gate
 #   COPY_TO=/some/dir scripts/run_task.sh tasks/foo           # optional extra mirror
 #
 #   scripts/run_task.sh --stage reshape tasks/foo               # one stage only
 #
-# Env overrides: AGENT (claude-code) MODEL (claude-opus-5) N (1) JOB (<task slug>)
+# The default agent is OpenHands (tools/openhands_agent), on the host's Claude
+# subscription through the ccbridge (tools/bridges/ccbridge, :8765). The bridge
+# is started on demand and holds the OAuth token; the agent's container gets
+# only the bridge's shared secret. See tools/openhands_agent/README.md.
+#
+# Env overrides: AGENT (openhands) MODEL (claude-opus-5) N (1) JOB (<task slug>)
 #                OUTPUT_DIR (<repo>/output) COPY_TO (unset) BUILD_MULT (3) AT (auto)
 #                STAGE (all) RUN_OFFSET (auto) SETUP_MULT (6) JUDGE_MODEL (gpt-5.6-sol)
 #                NETWORK_ISOLATION_OFF (unset) DISALLOWED_TOOLS (WebSearch,WebFetch)
-#                CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766)
+#                CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766,
+#                         claude-code only)
 #                CC_BRIDGE_ENABLED (0)
 #                AGENT_HEADROOM_ENABLED (false) GRADER_HEADROOM_ENABLED (false)
+#   openhands:   CCBRIDGE_PORT (8765) CCBRIDGE_HOST (127.0.0.1 on macOS, 0.0.0.0 on
+#                Linux) CCBRIDGE_SECRET (tools/bridges/ccbridge/.bridge_secret)
+#                OPENHANDS_MAX_ITERATIONS (500) OPENHANDS_MAX_CONTINUATIONS (6)
+#                OPENHANDS_REASONING_EFFORT (SDK default) OPENHANDS_MAX_OUTPUT_TOKENS (32000)
+#                OPENHANDS_THINKING_DISPLAY (summarized | omitted)
 #
 # Values may also come from <repo>/.env, which is read as DEFAULTS only: anything
 # already in the environment wins over it. NETWORK_ISOLATION_OFF is the one key
@@ -177,11 +189,39 @@ case "$STAGE" in
 esac
 SLUG="$(basename "$TASK")"
 
-AGENT="${AGENT:-claude-code}"
+AGENT="${AGENT:-openhands}"
 if [ "${CC_MODE:-}" = "zbridge" ]; then
   MODEL="${MODEL:-glm-5.3}"
 else
   MODEL="${MODEL:-claude-opus-5}"
+fi
+
+# The OpenHands agent is not one of harbor's built-ins: harbor imports it from
+# this checkout, which is why stage_harbor puts $REPO on harbor's PYTHONPATH.
+OPENHANDS_AGENT_IMPORT="tools.openhands_agent.agent:OpenHandsAgent"
+harbor_agent_ref() {
+  case "$AGENT" in
+    openhands) echo "$OPENHANDS_AGENT_IMPORT" ;;
+    *)         echo "$AGENT" ;;
+  esac
+}
+
+# Combinations that would run, and would not mean what they say. Refused at
+# second zero rather than discovered in the agent phase -- and only by the
+# stages that start an agent, so reshaping an older GLM job is unaffected.
+if [ "$AGENT" = "openhands" ] && case "$STAGE" in preflight|harbor|all) true ;; *) false ;; esac; then
+  if [ "${CC_MODE:-}" = "zbridge" ]; then
+    echo "[run_task] ERROR: CC_MODE=zbridge is wired for the claude-code agent only." >&2
+    echo "[run_task]   GLM runs: AGENT=claude-code CC_MODE=zbridge scripts/run_task.sh <task>" >&2
+    exit 2
+  fi
+  if [ "${AGENT_HEADROOM_ENABLED:-false}" = "true" ]; then
+    echo "[run_task] ERROR: AGENT_HEADROOM_ENABLED=true compresses the claude-code agent's" >&2
+    echo "[run_task]   traffic (it reroutes ANTHROPIC_BASE_URL); the openhands agent never" >&2
+    echo "[run_task]   reads that variable, so the run would say compressed and not be." >&2
+    echo "[run_task]   Unset it, or use AGENT=claude-code." >&2
+    exit 2
+  fi
 fi
 N="${N:-1}"
 # Pin the rubric grader for the whole run. Left unset, rubric_judge_cli picks a
@@ -800,6 +840,7 @@ image_build_context() {
     codex-judge)   echo "$REPO/tools/judge" ;;
     codex-judge-headroom) echo "$REPO/tools/judge" ;;
     headroom-compress) echo "$REPO/tools/headroom" ;;
+    openhands-runtime) echo "$REPO/tools/openhands_agent" ;;
   esac
 }
 
@@ -899,7 +940,9 @@ stage_preflight() {
       echo "           bypass with PREFLIGHT_NETWORK_OFF=1" >&2
       exit 2
     }
-    "$_hpy" "$REPO/tools/network/preflight_network.py" "$TASK" || {
+    # AGENT decides which image checks apply (the claude CLI pre-bake is a
+    # claude-code requirement); it is a shell variable here, not an export.
+    AGENT="$AGENT" "$_hpy" "$REPO/tools/network/preflight_network.py" "$TASK" || {
       echo "[run_task] network policy preflight failed — refusing to build or run" >&2
       exit 2
     }
@@ -908,6 +951,8 @@ stage_preflight() {
   # GLM runs: prove the key works before the image builds, not after. Idempotent
   # -- stage_harbor calls it again and finds the bridge already up.
   [ "${CC_MODE:-}" = "zbridge" ] && ensure_zbridge
+  # OpenHands runs: the same, for the Claude subscription behind the ccbridge.
+  [ "$AGENT" = "openhands" ] && ensure_claude_oauth_bridge
 
   if ! docker info >/dev/null 2>&1; then
     echo "[run_task] docker not running — starting OrbStack/Docker"
@@ -930,6 +975,10 @@ stage_preflight() {
   done
 
   headroom_memory_check
+
+  # The OpenHands SDK tree tools/openhands_agent/overlay.yaml mounts into main.
+  # Declared in an overlay, not the bundle, so the loop above never sees it.
+  [ "$AGENT" = "openhands" ] && ensure_image "openhands-runtime:latest"
 
   # The optional Headroom images, built here and only when this run asks for
   # them. They are declared in overlays rather than in the bundle's compose
@@ -1003,6 +1052,21 @@ stage_harbor() {
     state_put stash_dir "$STASH_DIR"
   fi
 
+  # The default agent changed from claude-code to openhands, and a job dir keeps
+  # numbering runs across invocations. Appending one agent's runs to another's
+  # would publish a pass@k over two different solvers under one name. Read the
+  # agent the job was last run with before harbor's config is cleared below.
+  local _prev_agent=""
+  _prev_agent="$(python3 -c 'import json,sys
+print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name") or "")' \
+    "$OUTPUT_DIR/$JOB/config.json" 2>/dev/null || true)"
+  if [ -n "$_prev_agent" ] && [ "$_prev_agent" != "$(harbor_agent_ref)" ]; then
+    echo "[run_task] WARNING: $OUTPUT_DIR/$JOB holds runs from agent '$_prev_agent';" >&2
+    echo "[run_task]   this run uses '$(harbor_agent_ref)' and will be numbered after them," >&2
+    echo "[run_task]   so pass@k and summary.json will mix the two. Use JOB=<new name> to keep" >&2
+    echo "[run_task]   them apart, or AGENT=claude-code to continue the earlier series." >&2
+  fi
+
   rm -f "$OUTPUT_DIR/$JOB/lock.json"
   rm -f "$OUTPUT_DIR/$JOB/config.json"
   normalise_stale_job_result "$OUTPUT_DIR/$JOB/result.json"
@@ -1019,11 +1083,14 @@ stage_harbor() {
   # container (empty values are dropped, so a failed proxy start is a no-op).
   ensure_cc_bridge
   [ "${CC_MODE:-}" = "zbridge" ] && ensure_zbridge
+  # Exports OPENHANDS_LLM_BASE_URL / OPENHANDS_LLM_API_KEY, which the agent
+  # class reads from harbor's environment. Called directly for the exports.
+  [ "$AGENT" = "openhands" ] && ensure_claude_oauth_bridge
   # After ensure_zbridge: on a GLM run both set ANTHROPIC_BASE_URL, and with
   # agent-path Headroom on it is the headroom container that must win, with
   # zbridge behind it as the upstream.
   route_agent_through_headroom
-  local args=(run -y --path "$TASK" --agent "$AGENT" --jobs-dir "$OUTPUT_DIR" --job-name "$JOB" \
+  local args=(run -y --path "$TASK" --agent "$(harbor_agent_ref)" --jobs-dir "$OUTPUT_DIR" --job-name "$JOB" \
               --environment-build-timeout-multiplier "$BUILD_MULT" \
               --agent-setup-timeout-multiplier "$SETUP_MULT" --n-attempts "$N")
   # Must come after the proxy helpers above: they decide whether the agent is
@@ -1034,6 +1101,16 @@ stage_harbor() {
   if [ -n "$_iso" ] && [ "${CC_MODE:-}" = "zbridge" ]; then
     write_zbridge_squid_conf
     args+=(--extra-docker-compose "$REPO/tools/network/egress-proxy/overlay-zbridge.yaml")
+  fi
+  # OpenHands runs: the SDK tree for main, and under isolation the squid
+  # config that lets main reach the ccbridge on the host -- the same shape as
+  # the zbridge pair above, for the same reason.
+  if [ "$AGENT" = "openhands" ]; then
+    args+=(--extra-docker-compose "$REPO/tools/openhands_agent/overlay.yaml")
+    if [ -n "$_iso" ]; then
+      write_ccbridge_squid_conf
+      args+=(--extra-docker-compose "$REPO/tools/network/egress-proxy/overlay-ccbridge.yaml")
+    fi
   fi
   # Bundles that grade the rubric in a judge container of their own: a per-run
   # token and the login to mount, and under isolation the judge's own
@@ -1085,6 +1162,20 @@ stage_harbor() {
       [ -n "$_guard" ] && args+=(--ak "config=$_guard")
     fi
   fi
+  # OpenHands options (tools/openhands_agent/agent.py OpenHandsAgentOptions),
+  # passed only when set so the agent's own defaults stay the defaults. None of
+  # the claude-code layers above apply: there are no web tools to withhold
+  # (the browser tool is not loaded) and no PreToolUse hook to install. The
+  # routing table is the enforcement boundary for this agent, as for any other.
+  if [ "$AGENT" = "openhands" ]; then
+    [ -n "${OPENHANDS_MAX_ITERATIONS:-}" ] && args+=(--ak "max_iterations=$OPENHANDS_MAX_ITERATIONS")
+    [ -n "${OPENHANDS_MAX_CONTINUATIONS:-}" ] && args+=(--ak "max_continuations=$OPENHANDS_MAX_CONTINUATIONS")
+    [ -n "${OPENHANDS_REASONING_EFFORT:-}" ] && args+=(--ak "reasoning_effort=$OPENHANDS_REASONING_EFFORT")
+    [ -n "${OPENHANDS_MAX_OUTPUT_TOKENS:-}" ] && args+=(--ak "max_output_tokens=$OPENHANDS_MAX_OUTPUT_TOKENS")
+    # summarized (default, readable thinking in the trajectory) or omitted:
+    # tools/openhands_agent/README.md, "Thinking".
+    [ -n "${OPENHANDS_THINKING_DISPLAY:-}" ] && args+=(--ak "thinking_display=$OPENHANDS_THINKING_DISPLAY")
+  fi
   # Trial dirs left behind by EARLIER invocations. Harbor never removes a trial
   # that died (docker build failure, Ctrl-C, agent-setup timeout) and
   # stage_harbor only clears lock.json/config.json, so those directories sit in
@@ -1100,7 +1191,11 @@ stage_harbor() {
   # and carries harbor's "__" marker belongs to this invocation.
   snapshot_compose_projects
   local _hrc=0
-  HARBOR_OUTPUT_OFF=1 command harbor "${args[@]}" \
+  # harbor resolves --agent tools.openhands_agent.agent:OpenHandsAgent with
+  # importlib, so the checkout has to be importable from harbor's interpreter.
+  local _pypath="${PYTHONPATH:-}"
+  [ "$AGENT" = "openhands" ] && _pypath="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+  PYTHONPATH="$_pypath" HARBOR_OUTPUT_OFF=1 command harbor "${args[@]}" \
     || { _hrc=$?; echo "[run_task] harbor exited $_hrc; checking whether a trial actually ran" >&2; }
 
   # An interrupted harbor is not a failed trial. Continuing into reshape, mask
@@ -1390,6 +1485,171 @@ PYEOF
       echo "[run_task] WARNING: could not verify the GLM credential (${verdict:-no answer}); continuing" >&2 ;;
   esac
   return 0
+}
+
+# ------------------------------------------------------------------ ccbridge
+# The OpenHands agent's route to Claude: tools/bridges/ccbridge, an
+# Anthropic-compatible proxy on the host that signs each request with the Claude
+# Code OAuth login on this machine (Keychain on macOS, ~/.claude/.credentials.json
+# on Linux) and forwards it to api.anthropic.com. Not to be confused with the
+# cbridge on :4000 above, which serves run_eval.py over the claude-agent-sdk.
+#
+# Shared by every concurrent run on the machine, like zbridge: started once,
+# found by its /healthz afterwards. Unlike zbridge its secret is ENFORCED -- the
+# agent presents it as its API key, and without it any local process could
+# spend the subscription.
+CCBRIDGE_DIR="$REPO/tools/bridges/ccbridge"
+
+# The shared secret: CCBRIDGE_SECRET if set, else a per-machine file created on
+# first use (0600, gitignored). Never printed.
+ccbridge_secret() {
+  if [ -n "${CCBRIDGE_SECRET:-}" ]; then
+    printf '%s' "$CCBRIDGE_SECRET"
+    return 0
+  fi
+  local f="$CCBRIDGE_DIR/.bridge_secret"
+  if [ ! -s "$f" ]; then
+    ( umask 077 && python3 -c 'import secrets; print("ccb-" + secrets.token_hex(24))' > "$f" ) || return 1
+  fi
+  tr -d '[:space:]' < "$f"
+}
+
+ensure_claude_oauth_bridge() {
+  local port="${CCBRIDGE_PORT:-8765}" host="${CCBRIDGE_HOST:-}" secret
+  case "$port" in
+    ''|*[!0-9]*) echo "[run_task] ERROR: CCBRIDGE_PORT must be a number, got '$port'" >&2; exit 2 ;;
+  esac
+  # Where the container's traffic arrives. Docker Desktop and OrbStack deliver
+  # host.docker.internal to the host's loopback; plain Linux docker delivers it
+  # to the bridge gateway, where a 127.0.0.1 listener is unreachable. The
+  # secret gates the wider bind.
+  if [ -z "$host" ]; then
+    case "$(uname -s)" in Darwin) host="127.0.0.1" ;; *) host="0.0.0.0" ;; esac
+  fi
+  secret="$(ccbridge_secret)" || {
+    echo "[run_task] ERROR: could not create the ccbridge secret in $CCBRIDGE_DIR" >&2
+    exit 4
+  }
+
+  if curl -sf -m 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
+    echo "[run_task] ccbridge already running on :$port"
+  else
+    if [ ! -f "$CCBRIDGE_DIR/pyproject.toml" ]; then
+      echo "[run_task] ERROR: ccbridge not found at $CCBRIDGE_DIR" >&2
+      exit 3
+    fi
+    command -v uv >/dev/null 2>&1 || {
+      echo "[run_task] ERROR: uv is not installed; the ccbridge runs from its own uv project" >&2
+      exit 3
+    }
+    mkdir -p "$CCBRIDGE_DIR/logs"
+    echo "[run_task] starting ccbridge on $host:$port"
+    # Timeouts: the OpenHands SDK calls without streaming, so a long thinking
+    # turn is one silent wait. The bridge's own defaults (180s between bytes,
+    # 600s per request) would cut it; the agent allows 1800s (agent.py
+    # llm_timeout) and squid-ccbridge.conf 30 minutes, so the bridge does too.
+    # Appended (>>), never truncated: a second start that loses the port race
+    # must not wipe the running bridge's log.
+    (cd "$CCBRIDGE_DIR" && \
+      WCB_CC_BRIDGE_SECRET="$secret" \
+      WCB_BRIDGE_READ_TIMEOUT="${CCBRIDGE_READ_TIMEOUT:-1800}" \
+      WCB_BRIDGE_REQUEST_TIMEOUT="${CCBRIDGE_REQUEST_TIMEOUT:-1800}" \
+      nohup uv run --quiet python -m claude_oauth --host "$host" --port "$port" \
+        >>"$CCBRIDGE_DIR/logs/ccbridge.log" 2>&1 &)
+    # The first `uv run` resolves and builds the bridge's venv before anything
+    # listens -- minutes on a cold machine, not seconds.
+    local i=0 wait_s="${CCBRIDGE_START_TIMEOUT_SEC:-180}"
+    while [ $i -lt "$wait_s" ]; do
+      sleep 1; i=$((i+1))
+      curl -sf -m 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && {
+        echo "[run_task] ccbridge ready on :$port"; break
+      }
+    done
+    curl -sf -m 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 || {
+      echo "[run_task] ERROR: ccbridge did not come up in ${wait_s}s on :$port" >&2
+      echo "[run_task]   The agent would fail every turn. See $CCBRIDGE_DIR/logs/ccbridge.log" >&2
+      echo "[run_task]   (a credentials error there means: run \`claude login\`)." >&2
+      exit 3
+    }
+  fi
+  ccbridge_live_check "$port" "$secret" || exit 4
+  export OPENHANDS_LLM_BASE_URL="http://host.docker.internal:$port"
+  export OPENHANDS_LLM_API_KEY="$secret"
+  echo "[run_task] openhands agent routed through ccbridge ($OPENHANDS_LLM_BASE_URL)"
+}
+
+# /healthz answers ok for any caller, so it proves neither that this harness's
+# secret is the one the bridge holds nor that the subscription will serve the
+# model. Two checks: /healthz WITH the secret (free -- the bridge loads its
+# token and says so only to an authorised caller), then one minimal completion
+# on the run's model. Only a definite auth/permission answer refuses the run.
+ccbridge_live_check() {
+  local port="$1" secret="$2" verdict
+  verdict="$(CCB_SECRET="$secret" CCB_MODEL="$MODEL" python3 - "$port" <<'PYEOF' 2>/dev/null || true
+import json, os, sys, urllib.error, urllib.request
+base = f"http://127.0.0.1:{sys.argv[1]}"
+secret, model = os.environ["CCB_SECRET"], os.environ["CCB_MODEL"]
+try:
+    req = urllib.request.Request(f"{base}/healthz", headers={"x-api-key": secret})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        health = json.loads(r.read() or b"{}")
+except urllib.error.HTTPError as exc:
+    print(f"creds {exc.code} {(exc.read() or b'')[:160].decode('utf-8', 'replace')}")
+    sys.exit(0)
+except Exception as exc:
+    print(f"unverified {exc}"); sys.exit(0)
+if "token_prefix" not in health:
+    print("secret the bridge on this port does not accept this harness's secret"); sys.exit(0)
+body = json.dumps({"model": model, "max_tokens": 1,
+                   "messages": [{"role": "user", "content": "ping"}]}).encode()
+req = urllib.request.Request(f"{base}/v1/messages", data=body,
+                             headers={"content-type": "application/json", "x-api-key": secret})
+try:
+    with urllib.request.urlopen(req, timeout=120) as r:
+        print("ok" if r.status == 200 else f"http {r.status}")
+except urllib.error.HTTPError as exc:
+    detail = (exc.read() or b"")[:200].decode("utf-8", "replace").replace("\n", " ")
+    print(f"{'auth' if exc.code in (401, 403) else 'http'} {exc.code} {detail}")
+except Exception as exc:
+    print(f"unverified {exc}")
+PYEOF
+)"
+  case "$verdict" in
+    ok)
+      echo "[run_task] ccbridge: Claude subscription verified for $MODEL" ;;
+    secret*)
+      echo "[run_task] ERROR: the bridge on :$port does not accept this harness's secret." >&2
+      echo "[run_task]   It was started with another one. Stop it (bash scripts/stop_harness.sh)" >&2
+      echo "[run_task]   or set CCBRIDGE_SECRET to the secret it was started with." >&2
+      return 1 ;;
+    creds*|auth*)
+      echo "[run_task] ERROR: the Claude subscription behind the ccbridge refused -- $verdict" >&2
+      echo "[run_task]   Every agent turn would fail auth. Run: claude login" >&2
+      return 1 ;;
+    *)
+      echo "[run_task] WARNING: could not verify the ccbridge (${verdict:-no answer}); continuing" >&2 ;;
+  esac
+  return 0
+}
+
+# OpenHands runs under isolation. Writes squid-ccbridge.conf with the real
+# bridge port and exports its path for overlay-ccbridge.yaml. Call it directly,
+# not in $(...), or the export is lost.
+write_ccbridge_squid_conf() {
+  local port="${CCBRIDGE_PORT:-8765}" dir="$OUTPUT_DIR/.egress-ccbridge"
+  case "$port" in
+    ''|*[!0-9]*) echo "[run_task] ERROR: CCBRIDGE_PORT must be a number, got '$port'" >&2; exit 2 ;;
+  esac
+  mkdir -p "$dir"
+  dir="$(cd "$dir" && pwd)"
+  sed "s/^acl ccbridge_port port 8765\$/acl ccbridge_port port $port/" \
+    "$REPO/tools/network/egress-proxy/squid-ccbridge.conf" > "$dir/squid.conf"
+  grep -q "^acl ccbridge_port port $port\$" "$dir/squid.conf" || {
+    echo "[run_task] ERROR: could not set the ccbridge port in $dir/squid.conf" >&2
+    exit 2
+  }
+  export EGRESS_SQUID_CONF="$dir/squid.conf"
+  echo "[run_task] OpenHands run: squid also allows the ccbridge at host.docker.internal:$port" >&2
 }
 
 # Point the agent at the Headroom container, and tell the pieces around it what
@@ -1792,8 +2052,11 @@ stage_netaudit() {
   # the system working -- one recorded run did exactly that and went on to
   # finish. Blocking it would discard good runs.
   [ -n "${INTERNET_AUDIT_STRICT:-}" ] && flags+=(--strict)
-  # GLM runs reach zbridge on the host through squid. That is the model call, not a breach.
-  [ "${CC_MODE:-}" = "zbridge" ] && flags+=(--proxy-allow host.docker.internal)
+  # GLM runs reach zbridge on the host through squid, and OpenHands runs reach
+  # the ccbridge the same way. That is the model call, not a breach.
+  if [ "${CC_MODE:-}" = "zbridge" ] || [ "${AGENT:-}" = "openhands" ]; then
+    flags+=(--proxy-allow host.docker.internal)
+  fi
 
   local traj run_dir dirty=0 seen=0 empty=0
   # Iterate RUN DIRECTORIES, not trajectory files.
@@ -1983,8 +2246,13 @@ stage_mask() {
 # from there when the environment doesn't already provide it.
 stage_finance() {
   # The .env may live above the harness when it is vendored into a larger
-  # workspace, so search upward the way finance_reporter.py does.
-  if [ -z "${ODOO_URL:-}" ]; then
+  # workspace, so search upward the way finance_reporter.py does -- but only
+  # when ODOO_URL is UNSET. `ODOO_URL= scripts/run_task.sh ...` is the
+  # documented opt-out, and check_finance_env already reports it as "usage
+  # reporting disabled"; testing emptiness here instead of presence read the
+  # value back out of .env and posted anyway (two test runs reached Odoo that
+  # way). Presence, not emptiness, is the rule load_dotenv uses too.
+  if [ -z "${ODOO_URL+set}" ]; then
     local d="$REPO"
     while [ -n "$d" ] && [ "$d" != "/" ]; do
       if [ -f "$d/.env" ]; then
@@ -1996,7 +2264,11 @@ stage_finance() {
     done
   fi
   if [ -z "${ODOO_URL:-}" ]; then
-    echo "[finance] WARNING: ODOO_URL unset (no .env at or above $REPO) — usage NOT reported" >&2
+    if [ -n "${ODOO_URL+set}" ]; then
+      echo "[finance] ODOO_URL set empty -- usage reporting disabled for this run" >&2
+    else
+      echo "[finance] WARNING: ODOO_URL unset (no .env at or above $REPO) — usage NOT reported" >&2
+    fi
     return 0
   fi
   if [ "${FINANCE_ENV_BAD:-0}" = "1" ]; then

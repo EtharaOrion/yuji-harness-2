@@ -75,6 +75,10 @@ def env(tmp_path):
                 "JOB": "alpha",
                 "JOB_DIR": str(self.output / "alpha"),
                 "HARBOR_ARGS": str(self.harbor_args),
+                # The stage logic under test is agent-independent. Left to the
+                # default (openhands), the harbor stage would start the real
+                # ccbridge and spend a live check call on every test.
+                "AGENT": "claude-code",
             })
             e.update({k: str(v) for k, v in overrides.items()})
             return subprocess.run(

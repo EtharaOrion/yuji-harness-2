@@ -102,6 +102,20 @@ def test_raw_harbor_trajectory_shape_is_understood(tmp_path):
     assert r.returncode == 2, r.stdout
 
 
+@pytest.mark.parametrize("name", ["terminal", "execute_bash"])
+def test_openhands_shell_tool_is_audited_like_bash(name, tmp_path):
+    """The OpenHands agent's shell is `terminal`, with the same `command`
+    argument. An audit that only knew "Bash" would read every one of its
+    commands as a harmless tool call and certify the run clean."""
+    steps = [{"tool_calls": [
+        {"function_name": name, "arguments": {"command": "pip install pandas"}}]}]
+    r = run(steps, tmp_path=tmp_path)
+    assert r.returncode == 2, r.stdout
+    local = [{"tool_calls": [{"function_name": name,
+                              "arguments": {"command": "ls /workspace/data"}}]}]
+    assert run(local, tmp_path=tmp_path).returncode == 0
+
+
 def test_warn_only_reports_without_blocking(tmp_path):
     r = run([bash("curl https://evil.test")], "--warn-only", tmp_path=tmp_path)
     assert r.returncode == 0

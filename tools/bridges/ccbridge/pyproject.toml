@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccbridge"
+version = "0.1.0"
+description = "Anthropic-compatible local proxy backed by the host's Claude Code OAuth subscription"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+# Same pins as tools/bridges/zbridge and the reference Dockerfile.cc-bridge.
+dependencies = [
+    "fastapi==0.115.5",
+    "uvicorn==0.32.1",
+    "httpx==0.27.2",
+    "pydantic==2.10.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["claude_oauth*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -474,13 +474,27 @@ def check_isolation(task_dir: Path, raw: dict) -> None:
     else:
         ok("every MCP sidecar host is reachable under network isolation")
 
-    # 2. The CLI the agent phase cannot download -------------------------
+    # 2. Proof of denial, whatever the agent ------------------------------
+    if not _captures_access_log(repo):
+        bad("the egress overlay does not carry squid's access.log off the container",
+            "without it the run is audited on trajectory inference alone and "
+            "reports 'no denials' whether or not the block held. Restore the "
+            "/egress-out mount in tools/network/egress-proxy/overlay.yaml and the tee "
+            "in entrypoint.sh")
+    else:
+        ok("the proxy's access log is captured per run (proof of denial)")
+
+    # 3. The CLI the agent phase cannot download -------------------------
     #
     # harbor's ClaudeCode.install() fetches it from downloads.claude.ai INSIDE
     # the container, which the allowlist denies. The trial then dies in agent
     # setup with an empty /logs/agent -- indistinguishable from an agent that
     # ran and produced nothing.
-    agent = os.environ.get("AGENT") or "claude-code"
+    #
+    # claude-code only. The openhands agent (scripts/run_task.sh's default)
+    # brings its SDK in from the openhands-runtime image through
+    # tools/openhands_agent/overlay.yaml, so the bundle needs nothing baked.
+    agent = os.environ.get("AGENT") or "openhands"
     if agent != "claude-code":
         return
     dockerfile = task_dir / "environment" / "Dockerfile"
@@ -492,14 +506,6 @@ def check_isolation(task_dir: Path, raw: dict) -> None:
         missing.append("the Claude Code CLI")
     if "procps" not in body:
         missing.append("procps (claude shells out to ps/pgrep to kill subtrees)")
-    if not _captures_access_log(repo):
-        bad("the egress overlay does not carry squid's access.log off the container",
-            "without it the run is audited on trajectory inference alone and "
-            "reports 'no denials' whether or not the block held. Restore the "
-            "/egress-out mount in tools/network/egress-proxy/overlay.yaml and the tee "
-            "in entrypoint.sh")
-    else:
-        ok("the proxy's access log is captured per run (proof of denial)")
 
     if missing:
         bad(f"{dockerfile} does not pre-bake: " + ", ".join(missing),

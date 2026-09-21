@@ -4,7 +4,8 @@ IMAGE_NAME = agent-environment
 VERSION = 1.2.7
 GHCR_REPO = ghcr.io/scaleapi/mcp-atlas
 
-.PHONY: build run-docker shell push install-harness run-harness install-python run-eval test
+.PHONY: build run-docker shell push install-harness run-harness install-python run-eval test \
+	build-openhands-runtime ccbridge-check test-ccbridge
 
 # ---------------------------------------------------------------------------
 # Agent Environment (docker image with the 36 MCP servers)
@@ -57,3 +58,16 @@ run-eval: # run the full HuggingFace eval (usage: make run-eval MODEL=... OUTPUT
 
 test: # verify mcp_server_template.json and install_mcp_packages.sh stay in sync
 	cd services/agent-environment && uv sync && uv run pytest
+
+# ---------------------------------------------------------------------------
+# OpenHands agent (scripts/run_task.sh's default AGENT) and its ccbridge
+# ---------------------------------------------------------------------------
+
+build-openhands-runtime: # the OpenHands SDK tree the agent mounts; run_task.sh preflight builds it too
+	docker build -t openhands-runtime:latest tools/openhands_agent
+
+ccbridge-check: # does this machine's Claude login load and refresh? spends no tokens
+	cd tools/bridges/ccbridge && uv run python -m claude_oauth --check
+
+test-ccbridge: # the ccbridge's own unit tests
+	cd tools/bridges/ccbridge && uv run --extra dev pytest -q
