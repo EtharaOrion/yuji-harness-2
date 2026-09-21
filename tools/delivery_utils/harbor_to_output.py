@@ -1284,6 +1284,7 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     # the rubric alone. Leaving it behind made the published tree look complete
     # while quietly not being enough to reproduce its own reward.
     for f in ("ctrf.json", "reward.json", "reward_channel_a.json",
+              "reward_channel_c.json",
               "detail.json",
               "rubric_breakdown.json", "judge_tokens.json",
               "state_channel.json", "end_env.json"):
