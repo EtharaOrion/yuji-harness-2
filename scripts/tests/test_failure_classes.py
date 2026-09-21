@@ -11,7 +11,7 @@ import ast
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
-SOURCE = REPO / "tools" / "delivery" / "harbor_to_output.py"
+SOURCE = REPO / "tools" / "delivery_utils" / "harbor_to_output.py"
 
 
 def _returned_classes() -> set[str]:

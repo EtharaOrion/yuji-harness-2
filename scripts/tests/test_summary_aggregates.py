@@ -26,7 +26,7 @@ _SCRIPTS = Path(__file__).resolve().parents[1]
 
 def _load_module():
     spec = importlib.util.spec_from_file_location(
-        "harbor_to_output", _SCRIPTS.parent / "tools" / "delivery" / "harbor_to_output.py"
+        "harbor_to_output", _SCRIPTS.parent / "tools" / "delivery_utils" / "harbor_to_output.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -38,7 +38,7 @@ h2o = _load_module()
 
 def _load_delivery():
     spec = importlib.util.spec_from_file_location(
-        "make_delivery", _SCRIPTS.parent / "tools" / "delivery" / "make_delivery.py"
+        "make_delivery", _SCRIPTS.parent / "tools" / "delivery_utils" / "make_delivery.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

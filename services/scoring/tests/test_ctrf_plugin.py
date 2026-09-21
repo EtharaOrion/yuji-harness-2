@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(REPO / "tools" / "delivery"))
+sys.path.insert(0, str(REPO / "tools" / "delivery_utils"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import collect_artifacts as ca  # noqa: E402

@@ -28,7 +28,7 @@ _REPO = Path(__file__).resolve().parents[2]
 
 def _load_delivery():
     spec = importlib.util.spec_from_file_location(
-        "make_delivery", _REPO / "tools" / "delivery" / "make_delivery.py"
+        "make_delivery", _REPO / "tools" / "delivery_utils" / "make_delivery.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
