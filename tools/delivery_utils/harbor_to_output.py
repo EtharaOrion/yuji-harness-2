@@ -433,7 +433,7 @@ PRUNE_FROM_OUTPUT = ("trial.log", "lock.json")
 JUDGE_MARKERS = ("judge_container.json", "reward_producer.json",
                  "judge-container-test.txt")
 
-PRUNE_FROM_VERIFIER = ("junit.xml", "reward_channel_a.json",
+PRUNE_FROM_VERIFIER = ("junit.xml",
                        "test-stdout.txt", "grade_report.md") + JUDGE_MARKERS
 
 
