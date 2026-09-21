@@ -4,9 +4,11 @@
 # See squid.conf for why this exists rather than a Harbor network_mode.
 # Pinned by digest, not by :latest. This container IS the enforcement boundary:
 # an unpinned tag means the thing deciding what the agent may reach can change
-# between two runs of the same benchmark, silently. Every other image in this
-# repo pins a version, and squid.conf already argues the reproducibility case
-# for disabling the cache -- the same argument applies to the proxy itself.
+# between two runs of the same benchmark, silently. Most images in this repo
+# pin a digest (tools/headroom, tools/judge, tools/bridges/zbridge, and this
+# one); services/agent-environment is the outstanding exception and tracked
+# as a coverage gap. squid.conf already argues the reproducibility case for
+# disabling the cache -- the same argument applies to the proxy itself.
 #
 # ubuntu/squid, Squid Cache 6.13. To move: docker pull ubuntu/squid:latest &&
 # docker image inspect ubuntu/squid:latest --format '{{index .RepoDigests 0}}'

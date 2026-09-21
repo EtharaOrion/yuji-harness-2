@@ -1,11 +1,16 @@
-# Python deps for all eval scripts: run_eval.py, scoring, diagnostics, test_servers
-aiohttp>=3.9
-pandas>=2.0
-numpy>=1.24
-datasets>=2.14
-python-dotenv>=1.0
-tenacity>=8.0
-tqdm>=4.64
-matplotlib>=3.6
-nest-asyncio>=1.5
-httpx>=0.28
+# Python deps for all eval scripts: run_eval.py, scoring, diagnostics, test_servers.
+# Compatible-release pins per PEP 440: `~= X.Y.Z` means `>= X.Y.Z, < X.(Y+1)`.
+# Locks minor version while allowing patch bumps. Tighter than the prior
+# lower-bound-only pins per CRUCIBLE audit finding
+# F-HARNESS-PYTHON-REQUIREMENTS-LOOSE-PIN. For fully deterministic builds,
+# generate a lock via `uv pip compile` or `pip-compile` and commit alongside.
+aiohttp~=3.9.0
+pandas~=2.0.0
+numpy~=1.24.0
+datasets~=2.14.0
+python-dotenv~=1.0.0
+tenacity~=8.0.0
+tqdm~=4.64.0
+matplotlib~=3.6.0
+nest-asyncio~=1.5.0
+httpx~=0.28.0
