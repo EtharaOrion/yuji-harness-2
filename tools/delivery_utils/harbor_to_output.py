@@ -461,7 +461,8 @@ JUDGE_MARKERS = ("judge_container.json", "reward_producer.json",
                  "judge-container-test.txt")
 
 PRUNE_FROM_VERIFIER = ("junit.xml",
-                       "test-stdout.txt", "grade_report.md") + JUDGE_MARKERS
+                       "test-stdout.txt", "pytest-stdout.txt",
+                       "grade_report.md") + JUDGE_MARKERS
 
 
 def _prune(*paths: Path) -> None:
@@ -1310,6 +1311,11 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     _copy(ver / "ctrf.json", run_dir / "logs" / "verifier-ctrf.json")
     _copy(ver / "reward.txt", run_dir / "logs" / "verifier-reward.txt")
     _copy(ver / "test-stdout.txt", run_dir / "logs" / "verifier-stdout.txt")
+    # evaluate.sh's pytest step, which used to redirect onto test-stdout.txt and
+    # therefore never ran. It writes pytest-stdout.txt now, so this is the only
+    # place the suite's own output survives; verifier-stdout.txt above is
+    # harbor's verifier log and never contained it.
+    _copy(ver / "pytest-stdout.txt", run_dir / "logs" / "pytest-stdout.txt")
     # Light-servers fleet logs (health report + tool calls), staged into
     # /logs/light-servers by tests/test.sh from the shared server_logs volume.
     # They are their own files, not a slice of verifier-stdout.txt: that one is
@@ -1587,7 +1593,12 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
         "grader": "weighted(" + "+".join(k for k in ["traj_tests", "rubric", "state_completion", "state_misbehave", "graph_plan"] if _comp_w(k) != 0) + ")",
     }
     episode = {
-        "index": run_no, "name": task_name, "passed": passed, "gradeable": reward is not None,
+        # The model THIS attempt ran on. convert_job derives its aggregate label
+        # from these rather than from whichever harbor job happened to be last,
+        # because run_batch.py dispatches one job per run and an append
+        # otherwise relabels every earlier attempt with the newest model.
+        "index": run_no, "name": task_name, "model": model,
+        "passed": passed, "gradeable": reward is not None,
         # "scored" is narrower than "gradeable": a trial can carry a verifier
         # result and still go ungraded when the host rubric pass refuses an
         # empty trajectory. Aggregates use this to keep unscored trials out of
@@ -1605,7 +1616,7 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     pair = {"task": task_name, "seed": None, "attempt": run_no,
             "instruction": stream["instruction"] or ((task_dir / "instruction.md").read_text() if task_dir and (task_dir / "instruction.md").exists() else None),
             "final_answer": stream["final_answer"], "reward": final_reward, "passed": passed}
-    per_run = {"run_index": run_no, "include_multimodal": False,
+    per_run = {"run_index": run_no, "model": model, "include_multimodal": False,
                "test_weights_percentage": test_pct, "rubric_weights_percentage": rubric_pct,
                "scored": _scored,
                "combined_score": final_reward}
@@ -1674,6 +1685,17 @@ def _mean_or_none(vals):
     """
     vals = [v for v in vals if v is not None]
     return norm_reward(sum(vals) / len(vals)) if vals else None
+
+
+def _sum_or_none(vals):
+    """Total of the measured values, or None when nothing was measured.
+
+    The counterpart to _mean_or_none, and it draws the same line: a tree where
+    no attempt recorded a cache-creation count has not written zero of them, it
+    has not measured them. Summing to 0.0 there would read as a measurement.
+    """
+    vals = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return sum(vals) if vals else None
 
 
 def _display_agent_name(name: str, job_dir: Path) -> str:
@@ -1806,6 +1828,23 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         n = len(all_eps)
         c = sum(1 for e in all_eps if e["passed"])
         rewards = [e["judge"]["reward"] for e in all_eps]
+        # The aggregates below belong to the attempts they cover, not to the
+        # harbor job that happened to run last. `model` above is read from this
+        # job's config, and run_batch.py dispatches one job per run, so on an
+        # append it is only run N's. Publishing it as the tree's label is what
+        # made summary.json, pass_summary.json, pass@N.json and the raw summary
+        # declare nine glm-5.3 attempts over a tree whose runs 1-8 were
+        # claude-opus-5 -- while report.json and the per-run config.json beside
+        # them, written by reshape_trial at their own job's time, said otherwise.
+        #
+        # Episodes carried forward from a summary.json written before this
+        # landed have no "model" key, hence the fallback to the job's own.
+        _models = sorted({e.get("model") for e in all_eps if e.get("model")}) or [model]
+        agg_model = _models[0] if len(_models) == 1 else "+".join(_models)
+        if len(_models) > 1:
+            print(f"[output] WARNING: {task_name} mixes models {_models} in one "
+                  f"cohort; pass@k over it is not a single-model measurement",
+                  file=sys.stderr)
         # Episodes carried forward from an older summary.json predate the
         # "scored" flag; default them to True so a re-run does not retroactively
         # drop them from the average. n/c and per_trial_rewards stay over all attempts
@@ -1855,7 +1894,8 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         # summary.json
         summary = {
             "run_id": job_dir.name, "timestamp": stamp,
-            "config": {"model": model, "agent": agent_name, "method": "harbor", "benchmark": "mcp-atlas",
+            "config": {"model": agg_model, "models": _models,
+                       "agent": agent_name, "method": "harbor", "benchmark": "mcp-atlas",
                        "task_dir": str(task_dir) if task_dir else None,
                        "image": _load_image(task_dir), "episodes": n,
                        "harbor_job": str(job_dir)},
@@ -1889,6 +1929,23 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
                 "avg_prompt_tokens": _mean([e["tokens"]["prompt"] for e in all_eps]),
                 "avg_llm_tokens": _mean([e["tokens"]["llm"] for e in all_eps]),
                 "avg_tool_tokens": _mean([e["tokens"]["tool"] for e in all_eps]),
+                # Totals over every accumulated attempt. Harbor's result.json
+                # carries counters too, but they are scoped to ONE harbor job
+                # and run_batch.py dispatches one job per run, so before this
+                # existed the only tree-wide figure a reader could reach was
+                # that last job's. These average the same per-episode records
+                # the avg_* fields above do, so the two cannot disagree.
+                "total_prompt_tokens": _sum_or_none(
+                    [e["tokens"]["prompt"] for e in all_eps]),
+                "total_completion_tokens": _sum_or_none(
+                    [e["tokens"]["llm"] for e in all_eps]),
+                "total_cache_read_tokens": _sum_or_none(
+                    [(e.get("usage") or {}).get("cache_read_tokens") for e in all_eps]),
+                "total_cache_creation_tokens": _sum_or_none(
+                    [(e.get("usage") or {}).get("cache_creation_tokens") for e in all_eps]),
+                "total_cost_usd": (norm_reward(_tc) if (_tc := _sum_or_none(
+                    [(e.get("usage") or {}).get("cost_usd") for e in all_eps])) is not None
+                    else None),
             },
             "episodes": all_eps,
         }
@@ -1921,7 +1978,7 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         errored = [p for p in per_run
                    if p.get("test_weights_percentage") is None or not p.get("scored", True)]
         pass_summary = {
-            "model": model, "runs": n,
+            "model": agg_model, "models": _models, "runs": n,
             "runs_completed": len(completed),
             "runs_errored": len(errored),
             "errored_run_indices": [p.get("run_index") for p in errored],
@@ -2000,7 +2057,8 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         per_trial_rewards = {f"pass@{i + 1}": norm_reward(r) for i, r in enumerate(rewards)}
         per_task = [{"task": task_name, "per_trial_rewards": per_trial_rewards}]
         passk = {
-            "model": model, "tasks": 1, "passed": c, "accuracy": norm_reward(c / n) if n else 0.0,
+            "model": agg_model, "models": _models,
+            "tasks": 1, "passed": c, "accuracy": norm_reward(c / n) if n else 0.0,
             "mean_reward": _mean_or_none(scored_rewards),
             "runs_unscored": n_unscored,
             "per_trial_rewards": per_trial_rewards,
@@ -2028,11 +2086,55 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
             _passk_native = {k: norm_reward(pass_at_k(n, c, k)) for k in ks_eff}
             for _eval_data in _evals.values():
                 _eval_data["pass_at_k"] = _passk_native
+            # Harbor's job-level counters cover ONE harbor job. The copy at the
+            # top of this loop brings them in verbatim on every call, including
+            # an append, so stats.n_input_tokens / n_cache_tokens /
+            # n_output_tokens / cost_usd published the LAST job's numbers as if
+            # they covered the whole tree: a nine-run tree reported run 9's
+            # 964,605 prompt tokens and $0.00 against real totals of 18,704,637
+            # and $18.28, understating by ~19x. The reward fields just above are
+            # already re-derived across all attempts; these never were.
+            #
+            # Recount from the per-run result.json files on disk, the same way
+            # the pass@k block above recounts n/c from each run's
+            # verifier/reward.json. Disk is the ground truth for how many
+            # attempts exist, and recomputing rather than accumulating keeps a
+            # re-conversion idempotent instead of doubling the totals.
+            #
+            # Every field written here already exists on harbor's own models
+            # with the same type (JobStats.n_*_tokens are int | None, cost_usd
+            # is float | None, JobResult.n_total_trials is int), so harbor still
+            # re-reads and validates this file on startup (harbor/job.py:80).
+            # No new keys: the token breakdown belongs in summary.json, which is
+            # ours, and it is published there.
+            _tt = {"n_input_tokens": 0, "n_cache_tokens": 0, "n_output_tokens": 0}
+            _tcost, _tseen, _tcost_seen = 0.0, 0, False
+            _traj_root = out_task / "trajectory"
+            for _rd in (sorted(_traj_root.glob("run_*"),
+                               key=lambda q: int(q.name.split("_")[-1])
+                               if q.name.split("_")[-1].isdigit() else 0)
+                        if _traj_root.is_dir() else []):
+                _ar = ((_load(_rd / "result.json", {}) or {}).get("agent_result") or {})
+                if not _ar:
+                    continue
+                _tseen += 1
+                for _k in _tt:
+                    if isinstance(_ar.get(_k), (int, float)):
+                        _tt[_k] += int(_ar[_k])
+                if isinstance(_ar.get("cost_usd"), (int, float)):
+                    _tcost += float(_ar["cost_usd"])
+                    _tcost_seen = True
+            if _tseen and isinstance(_top_res.get("stats"), dict):
+                _top_res["stats"].update(_tt)
+                _top_res["stats"]["cost_usd"] = round(_tcost, 6) if _tcost_seen else None
+                _top_res["n_total_trials"] = max(_top_res.get("n_total_trials") or 0,
+                                                 _tseen)
             _dump(out_task / "result.json", norm_result_metrics(_top_res))
 
         # .raw summary / pairs / failure_analysis
         _dump(raw_trials / "summary.json", {
-            "task": task_name, "model": model, "agent": agent_name, "seed": None,
+            "task": task_name, "model": agg_model, "models": _models,
+            "agent": agent_name, "seed": None,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "metrics": {"n": n, "c": c, "pass@1": norm_reward(pass_at_k(n, c, 1)),
                         "p_hat": norm_reward(c / n) if n else 0.0, "ci95": wilson_ci(c, n),
@@ -2042,10 +2144,14 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
                         # of an entry sitting beside it.
                         "pass@k": pass_at_k_map,
                         "failure_breakdown": hist},
-            "attempts": [{"attempt": e["index"], "passed": e["passed"], "reward": e["judge"]["reward"],
+            # all_eps, not eps: the metrics block above is computed over every
+            # accumulated attempt, so listing only the ones THIS job produced
+            # published n=9, c=9 and a ci95 beside a one-element array.
+            "attempts": [{"attempt": e["index"], "model": e.get("model"),
+                          "passed": e["passed"], "reward": e["judge"]["reward"],
                           "rubric_score": e["judge"]["rubric_score"],
                           "traj_tests": e["judge"]["components"]["traj_tests"]["value"],
-                          "failure_class": e["failure_class"]} for e in eps],
+                          "failure_class": e["failure_class"]} for e in all_eps],
         })
         with (raw_trials / "pairs.jsonl").open("a" if run_offset > 0 else "w", encoding="utf-8") as fh:
             for r in recs:

@@ -66,13 +66,38 @@ fi
 # Reporting only for bundles that grade in step 4b. It may fail softly for that
 # reason. Older bundles still write the reward from inside this run, from
 # test_write_reward_json in test_outputs.py; step 4b sees that and stands down.
+#
+# NOT $LOGS/test-stdout.txt. Harbor owns that name
+# (harbor/models/trial/paths.py, TrialPaths.test_stdout_path) and its verifier
+# holds it open for tests/test.sh's stdout over in the main container. This
+# script runs in the judge container, as uid 1000, and cannot truncate it.
+# Bash sets a redirection up BEFORE it execs, so the redirect failing meant
+# python3 never started: pytest did not run at all, junit.xml and ctrf.json
+# were never written, and the `|| true` plus an unconditional success echo
+# reported it as fine. The reward was never affected -- grade.py computes
+# Channel A itself in step 4b -- but every run lost its per-test evidence.
+PYTEST_LOG="$LOGS/pytest-stdout.txt"
 python3 -m pytest /tests/test_outputs.py \
         -p ctrf_pytest_plugin \
         --junitxml="$LOGS/junit.xml" -v -p no:cacheprovider \
         -W ignore::pytest.PytestReturnNotNoneWarning \
-        > "$LOGS/test-stdout.txt" 2>&1 || true
-tail -n 30 "$LOGS/test-stdout.txt"
-echo "[4/5 pytest] -> $LOGS/ctrf.json (junit.xml as fallback)"
+        > "$PYTEST_LOG" 2>&1
+_pytest_rc=$?
+tail -n 30 "$PYTEST_LOG" 2>/dev/null \
+    || echo "WARNING: $PYTEST_LOG was never written" >&2
+# Say which artifact actually landed. The old echo named ctrf.json whether or
+# not one existed, which is what kept this silent for so long.
+if [ -s "$LOGS/ctrf.json" ]; then
+    echo "[4/5 pytest] rc=$_pytest_rc -> $LOGS/ctrf.json"
+elif [ -s "$LOGS/junit.xml" ]; then
+    echo "[4/5 pytest] rc=$_pytest_rc -> $LOGS/junit.xml (no ctrf.json; the host derives it)"
+else
+    echo "WARNING: pytest produced neither ctrf.json nor junit.xml (rc=$_pytest_rc)." >&2
+    echo "         Per-test detail is NOT available for this run: detail.json and" >&2
+    echo "         report.json will carry empty test rows. The reward is unaffected;" >&2
+    echo "         grade.py computes Channel A itself in step 4b." >&2
+    echo "rc=$_pytest_rc, no ctrf.json and no junit.xml" > "$LOGS/ctrf_missing.txt"
+fi
 
 # ---------------------------------------------------------------- 4b. grade
 # The score. It was test_write_reward_json inside test_outputs.py, where pytest
@@ -91,7 +116,7 @@ elif grep -q 'def test_write_reward_json' /tests/test_outputs.py 2>/dev/null; th
     # the reward to step 5, which publishes zeros exactly as this bundle did
     # before the grading moved out of it.
     echo "ERROR: the bundle's own reward writer produced nothing; Channel A is NOT" >&2
-    echo "       graded for this run. See $LOGS/test-stdout.txt." >&2
+    echo "       graded for this run. See $PYTEST_LOG." >&2
     echo "the bundle's own test_write_reward_json did not run" > "$LOGS/channel_a_not_graded.txt"
 else
     python3 /harness/scoring/tests/grade.py \
