@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -158,12 +159,19 @@ def test_main_build_context_excludes_the_vendored_trees(bundle):
 
 
 def test_readme_covers_the_required_variables(bundle):
-    """Three variables use compose's `:?` form, which aborts with a bare name
-    and no hint. run_task.sh supplied all three and does not ship."""
+    """Variables in compose's `:?` form abort with a bare name and no hint.
+    run_task.sh supplied them and does not ship, so the README has to.
+
+    Derived from the compose rather than hardcoded: a bundle whose judge takes
+    its codex login from the harness overlay names no CODEX_AUTH_FILE, and a
+    README that documented one anyway would send the recipient looking for a
+    mount that is not there."""
     text = (bundle / "README.md").read_text()
-    for var in ("JUDGE_TOKEN", "CODEX_AUTH_FILE", "HOST_VERIFIER_LOGS_PATH",
-                "SCORING_DIR"):
-        assert var in text
+    compose = (bundle / "docker-compose.yaml").read_text()
+    required = set(re.findall(r"\$\{([A-Z_]+)[:}]", compose))
+    assert required, "the compose fixture names no variables; nothing to check"
+    for var in sorted(required):
+        assert var in text, f"{var} is required by compose but undocumented"
 
 
 def test_judge_backend_credential_never_ships(tmp_path):

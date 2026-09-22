@@ -1894,7 +1894,7 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         # summary.json
         summary = {
             "run_id": job_dir.name, "timestamp": stamp,
-            "config": {"model": agg_model, "models": _models,
+            "config": {"models": _models,
                        "agent": agent_name, "method": "harbor", "benchmark": "mcp-atlas",
                        "task_dir": str(task_dir) if task_dir else None,
                        "image": _load_image(task_dir), "episodes": n,

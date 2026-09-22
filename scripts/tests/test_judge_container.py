@@ -52,7 +52,32 @@ SQUID_JUDGE = PROXY_DIR / "squid-judge.conf"
 RUN_TASK = REPO / "scripts" / "run_task.sh"
 JUDGE_IMAGE = "codex-judge:latest"
 AUTH_TARGET = "/run/codex-auth/auth.json"
+OVERLAY_JUDGE_SERVICE = JUDGE_DIR / "overlay-judge-service.yaml"
 BUNDLES = sorted(REPO.glob("tasks/*/task.toml"))
+
+# Bundles that declare the judge but not its codex login, so the credential
+# arrives from overlay-judge-service.yaml. Only these are held to the
+# no-host-credential contract below -- older bundles still mount the login
+# themselves and are migrated one at a time. Searched across every real bundle
+# root, because harness/ is a submodule of yuji and the bundles live in the
+# superproject.
+def _overlay_contract_bundles() -> list[Path]:
+    found: list[Path] = []
+    for root in (REPO / "tasks", REPO.parent / "staging", REPO.parent / "delivery"):
+        for task_toml in sorted(root.glob("*/task.toml")):
+            compose = task_toml.parent / "environment" / "docker-compose.yaml"
+            if not compose.is_file():
+                continue
+            text = compose.read_text()
+            if not re.search(r"^  judge:[ \t]*$", text, re.M):
+                continue                       # no judge to hold to a contract
+            if "CODEX_AUTH_FILE" in text:
+                continue                       # older shape: mounts it itself
+            found.append(task_toml)
+    return found
+
+
+OVERLAY_BUNDLES = _overlay_contract_bundles()
 
 # The grading scripts are the harness's, one copy for every bundle, mounted into
 # the judge with the rest of services/scoring. They used to be copied into each
@@ -288,6 +313,8 @@ def test_the_login_is_a_private_copy(bridge):
 # =============================================================================
 
 pytest_bundles = pytest.mark.skipif(not BUNDLES, reason="no task bundles in this checkout")
+pytest_overlay_bundles = pytest.mark.skipif(
+    not OVERLAY_BUNDLES, reason="no bundle uses the judge overlay in this checkout")
 
 
 def _ids(paths):
@@ -303,8 +330,39 @@ def _code(script: str) -> str:
     return "\n".join(l for l in script.splitlines() if not l.lstrip().startswith("#"))
 
 
-def _compose(task_toml: Path) -> dict:
+def _bundle_compose(task_toml: Path) -> dict:
+    """The compose file exactly as it ships. What a recipient gets."""
     return yaml.safe_load((task_toml.parent / "environment" / "docker-compose.yaml").read_text())
+
+
+def _merge(base: dict, over: dict) -> dict:
+    """Compose's own overlay semantics, enough of them for these assertions.
+
+    Mappings merge key-wise; sequences of volume specs merge by target, which is
+    what compose does and what keeps a re-declared mount from appearing twice."""
+    out = dict(base)
+    for k, v in over.items():
+        cur = out.get(k)
+        if isinstance(v, dict) and isinstance(cur, dict):
+            out[k] = _merge(cur, v)
+        elif isinstance(v, list) and isinstance(cur, list) and k == "volumes":
+            by_target = {_volume(str(s))[1]: s for s in cur}
+            by_target.update({_volume(str(s))[1]: s for s in v})
+            out[k] = list(by_target.values())
+        else:
+            out[k] = v
+    return out
+
+
+def _compose(task_toml: Path) -> dict:
+    """The effective config: the bundle plus the overlay run_task.sh layers.
+
+    A bundle that mounts the codex login itself is left alone -- run_task.sh
+    only adds the overlay when it does not (bundle_mounts_codex_login)."""
+    base = _bundle_compose(task_toml)
+    if "CODEX_AUTH_FILE" in json.dumps(base):
+        return base
+    return _merge(base, yaml.safe_load(OVERLAY_JUDGE_SERVICE.read_text()))
 
 
 def _volume(spec: str) -> tuple[str, str, str | None]:
@@ -394,11 +452,53 @@ def test_no_other_service_gets_the_login(task_toml):
             f"{name} can read the codex login")
 
 
+@pytest_overlay_bundles
+@pytest.mark.parametrize("task_toml", OVERLAY_BUNDLES, ids=_ids(OVERLAY_BUNDLES))
+def test_the_shipped_bundle_names_no_host_credential(task_toml):
+    """The other direction: what a recipient gets must demand nothing of them.
+
+    Asserted against the bundle file alone, not the effective config. A bundle
+    that names CLAUDE_CODE_OAUTH_TOKEN puts the operator's Claude login inside
+    the container the agent has root in; one that mounts CODEX_AUTH_FILE
+    demands a codex login the recipient has no reason to own; one that names
+    JUDGE_TOKEN publishes the grading key's variable into the file the agent's
+    own compose project is built from. The mounts belong in
+    tools/judge/overlay-judge-service.yaml and the token in run_task.sh's
+    --verifier-env; neither travels.
+
+    task.toml is checked too, but only for bundles that hand off to the judge
+    container: [verifier.env] is a shipping surface as much as compose is, and
+    it is where JUDGE_TOKEN used to live. Bundles that still grade the rubric
+    in-process under a Claude model genuinely need the login named there."""
+    surfaces = {"environment/docker-compose.yaml": json.dumps(_bundle_compose(task_toml))}
+    test_sh = task_toml.parent / "tests" / "test.sh"
+    if test_sh.is_file() and "judge_client.py" in test_sh.read_text():
+        surfaces["task.toml"] = json.dumps(tomllib.loads(task_toml.read_text()).get("verifier", {}))
+    for where, text in surfaces.items():
+        for name in ("CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_FILE", "JUDGE_TOKEN"):
+            assert name not in text, (
+                f"{task_toml.parent.name}/{where} names {name}; the recipient "
+                "must not be asked for it")
+
+
+@pytest_overlay_bundles
+@pytest.mark.parametrize("task_toml", OVERLAY_BUNDLES, ids=_ids(OVERLAY_BUNDLES))
+def test_the_agent_never_holds_the_judges_secret(task_toml):
+    """JUDGE_TOKEN reaches test.sh through harbor's --verifier-env, which it
+    applies to the test script only. Put it on `main` and the agent -- on the
+    same network as its own grader -- can read it out of its env."""
+    main = (_compose(task_toml).get("services") or {}).get("main") or {}
+    assert "JUDGE_TOKEN" not in (main.get("environment") or {}), (
+        "main.environment carries JUDGE_TOKEN; the agent can read it")
+
+
 @pytest_bundles
 @pytest.mark.parametrize("task_toml", BUNDLES, ids=_ids(BUNDLES))
 def test_the_verifier_receives_the_token_and_room_to_grade(task_toml):
     cfg = tomllib.loads(task_toml.read_text())
-    assert cfg["verifier"]["env"].get("JUDGE_TOKEN") == "${JUDGE_TOKEN}"
+    # The token is not declared here at all -- scripts/run_task.sh passes it as
+    # --verifier-env, so a recipient is never asked to produce a grading key.
+    assert "JUDGE_TOKEN" not in (cfg["verifier"].get("env") or {})
     assert cfg["verifier"].get("timeout_sec", 0) >= 1800, (
         "the grade now happens inside the verifier window; judge_client gives up at 1200s")
 
@@ -667,7 +767,10 @@ def test_a_judge_bundle_gets_a_token_the_login_and_its_overlay(tmp_path, login):
     assert re.fullmatch(r"[0-9a-f]{64}", token), token
     assert token != "from-the-caller", "a token that outlives the run is a token someone else has"
     assert Path(run.env["CODEX_AUTH_FILE"]).resolve() == login.resolve()
-    assert _overlays(run) == [str(OVERLAY), str(OVERLAY_JUDGE)]
+    # Two judge overlays, and the order matters: the service overlay supplies
+    # the login and the depends_on gate, overlay-judge.yaml then patches that
+    # service onto its own egress path.
+    assert _overlays(run) == [str(OVERLAY), str(OVERLAY_JUDGE_SERVICE), str(OVERLAY_JUDGE)]
 
 
 def test_every_invocation_gets_a_fresh_token(tmp_path, login):
@@ -677,19 +780,22 @@ def test_every_invocation_gets_a_fresh_token(tmp_path, login):
     assert a.env["JUDGE_TOKEN"] != b.env["JUDGE_TOKEN"]
 
 
-def test_an_open_run_still_gets_a_token_but_no_judge_overlay(tmp_path, login):
+def test_an_open_run_gets_the_login_but_not_the_judges_own_egress(tmp_path, login):
+    """With isolation off there is no proxy to give the judge, but it still
+    needs its credential: the service overlay is not gated on isolation."""
     run = _run_harbor_stage(tmp_path, compose=JUDGE_BUNDLE_COMPOSE,
                             CODEX_AUTH_FILE=str(login), NETWORK_ISOLATION_OFF="1")
     assert run.invoked, run.stderr[-2000:]
     assert re.fullmatch(r"[0-9a-f]{64}", run.env.get("JUDGE_TOKEN", ""))
-    assert _overlays(run) == []
+    assert _overlays(run) == [str(OVERLAY_JUDGE_SERVICE)]
 
 
 def test_glm_runs_add_the_judge_overlay_after_zbridges(tmp_path, login, fake_zbridge):
     run = _run_harbor_stage(tmp_path, compose=JUDGE_BUNDLE_COMPOSE, CODEX_AUTH_FILE=str(login),
                             CC_MODE="zbridge", **fake_zbridge)
     assert run.invoked, run.stderr[-2000:]
-    assert _overlays(run) == [str(OVERLAY), str(OVERLAY_ZBRIDGE), str(OVERLAY_JUDGE)]
+    assert _overlays(run) == [str(OVERLAY), str(OVERLAY_ZBRIDGE),
+                              str(OVERLAY_JUDGE_SERVICE), str(OVERLAY_JUDGE)]
 
 
 def test_a_missing_login_stops_before_harbor(tmp_path):
@@ -715,7 +821,8 @@ def test_grader_headroom_swaps_the_judge_image_and_sets_the_flag(tmp_path, login
     run = _run_harbor_stage(tmp_path, compose=JUDGE_BUNDLE_COMPOSE,
                             CODEX_AUTH_FILE=str(login), GRADER_HEADROOM_ENABLED="true")
     assert run.invoked, run.stderr[-2000:]
-    assert _overlays(run) == [str(OVERLAY), str(OVERLAY_JUDGE), str(OVERLAY_JUDGE_HEADROOM)]
+    assert _overlays(run) == [str(OVERLAY), str(OVERLAY_JUDGE_SERVICE),
+                              str(OVERLAY_JUDGE), str(OVERLAY_JUDGE_HEADROOM)]
 
 
 def test_grader_headroom_is_off_by_default(tmp_path, login):

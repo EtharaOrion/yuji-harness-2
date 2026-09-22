@@ -990,7 +990,7 @@ stage_preflight() {
   if [ "${AGENT_HEADROOM_ENABLED:-false}" = "true" ]; then
     ensure_image "$HEADROOM_IMAGE"
   fi
-  if [ "${GRADER_HEADROOM_ENABLED:-false}" = "true" ] && bundle_has_judge; then
+  if [ "${GRADER_HEADROOM_ENABLED:-false}" = "true" ] && bundle_grades_by_judge; then
     ensure_image "codex-judge-headroom:latest"
   fi
 }
@@ -1119,12 +1119,27 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
       args+=(--extra-docker-compose "$REPO/tools/network/egress-proxy/overlay-ccbridge.yaml")
     fi
   fi
-  # Bundles that grade the rubric in a judge container of their own: a per-run
-  # token and the login to mount, and under isolation the judge's own
-  # allowlisted way out. Called directly, not in $(...), so the exports reach
-  # harbor and compose.
-  if bundle_has_judge; then
+  # Bundles that grade the rubric in a judge container: a per-run token and the
+  # login to mount, the judge service itself, and under isolation the judge's
+  # own allowlisted way out. Called directly, not in $(...), so the exports
+  # reach harbor and compose.
+  if bundle_grades_by_judge; then
     prepare_judge
+    # judge_client.py reads JUDGE_TOKEN from the verifier's environment. From
+    # here, not the bundle, so nothing a recipient unpacks names the grading
+    # key. Harbor merges it into verifier.env (cli/trials.py:720) and applies
+    # it when test.sh runs -- after the agent has left the container they
+    # share. Not main.environment: the agent sits on the judge's network and
+    # would hold the key for the whole rollout.
+    args+=(--verifier-env "JUDGE_TOKEN=$JUDGE_TOKEN")
+    # The judge service is in the bundle; its codex login is not. This overlay
+    # supplies the mount and restores main's depends_on gate. Skipped for older
+    # bundles that still mount the login themselves, which need neither. It
+    # must come before overlay-judge.yaml, which only patches a judge service
+    # that already exists.
+    if ! bundle_mounts_codex_login; then
+      args+=(--extra-docker-compose "$REPO/tools/judge/overlay-judge-service.yaml")
+    fi
     [ -n "$_iso" ] && args+=(--extra-docker-compose "$REPO/tools/network/egress-proxy/overlay-judge.yaml")
     # Grader-path Headroom: a judge image that carries the library, and the flag
     # the grader reads. Nothing else changes -- the judge's own squid, mounts
@@ -2081,28 +2096,59 @@ egress_guard_settings() {
 }
 
 # --- judge container ----------------------------------------------------------
-# A bundle may grade every channel in a `judge` service of its own
+# A bundle may grade every channel in a `judge` service
 # (tools/judge/codexbridge.py, image codex-judge:latest): Channel A, the state
 # dump, the rubric and the ledger, none of them in `main`, the container the
 # agent had root in. The codex login is mounted there and nowhere else, and the
 # judge runs /harness/scoring/tests/evaluate.sh over the trajectory main sends
-# it. Detected per bundle, so one without a judge service grades as before.
+# it.
+#
+# The service is declared in the bundle; only its codex login is not. That
+# mount comes from tools/judge/overlay-judge-service.yaml, because a bundle
+# that demanded this host's ~/.codex/auth.json could not be handed to anyone
+# else. A bundle run without the overlay still grades -- the judge starts
+# unhealthy, judge_client.py finds no judge, the rubric comes back None, and
+# test_outputs.py drops that weight from the divisor rather than scoring it
+# zero. Detected per bundle, so a bundle that never calls the judge is
+# untouched.
 
-bundle_has_judge() {
+# Both shapes name the judge service in their own compose file, so this alone
+# does not tell them apart -- bundle_mounts_codex_login does. What it answers
+# is whether there is a judge service here for the overlay to patch at all.
+bundle_declares_judge() {
   grep -qE '^  judge:[[:space:]]*$' "$TASK/environment/docker-compose.yaml" 2>/dev/null
 }
 
-# Export what the bundle's compose file and task.toml read. Call it directly,
-# not in $(...), or the exports are lost.
+# Does grading this bundle involve a judge container at all? True for both
+# shapes -- one that still declares the service, and one that only calls
+# judge_client.py from tests/test.sh and lets the overlay supply the rest.
+# Either way prepare_judge has to run, or the codex mount has no source.
+bundle_grades_by_judge() {
+  bundle_declares_judge && return 0
+  grep -q 'judge_client\.py' "$TASK/tests/test.sh" 2>/dev/null
+}
+
+# Does the bundle mount the host's codex login itself? Older bundles do, and
+# are left alone. Newer ones declare the judge but not its credential, so
+# tools/judge/overlay-judge-service.yaml supplies it -- a bundle cannot demand
+# a ~/.codex/auth.json of whoever receives it.
+bundle_mounts_codex_login() {
+  grep -q 'CODEX_AUTH_FILE' "$TASK/environment/docker-compose.yaml" 2>/dev/null
+}
+
+# Export what the judge overlay and task.toml read. Call it directly, not in
+# $(...), or the exports are lost.
 #
 #   JUDGE_TOKEN      fresh per invocation, never taken from .env or the caller.
-#                    Compose hands it to the judge; task.toml [verifier.env] hands
-#                    it to test.sh. Harbor applies verifier env to the test script
-#                    only, so the agent -- on the same network as the judge --
-#                    never holds it.
+#                    The overlay hands it to the judge; task.toml [verifier.env]
+#                    hands it to test.sh. Harbor applies verifier env to the test
+#                    script only, so the agent -- on the same network as the
+#                    judge -- never holds it.
 #   CODEX_AUTH_FILE  the host's codex login, mounted read-only into the judge
-#                    alone. Made absolute: compose resolves a relative bind source
-#                    against the bundle's environment/ dir.
+#                    alone, by the overlay and never by the bundle. Made
+#                    absolute: compose resolves a relative bind source against
+#                    the project directory, which harbor sets to the bundle's
+#                    environment/ dir.
 prepare_judge() {
   local auth="${CODEX_AUTH_FILE:-${CODEX_HOME:-$HOME/.codex}/auth.json}"
   if [ ! -s "$auth" ]; then

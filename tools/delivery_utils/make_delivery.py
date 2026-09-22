@@ -132,21 +132,23 @@ _COMPOSE_NOTE = """\
 
 """
 
-# Shipped as environment/README.md. The compose file names three variables with
+# Shipped as environment/README.md. The compose file names variables with
 # compose's `:?` form, which aborts with a bare variable name and no hint of
 # where the value comes from. Every one of them used to be supplied by
 # scripts/run_task.sh, which does not travel with the bundle.
+#
+# Two shapes, because the judge no longer ships with every bundle: it mounts the
+# operator's codex login, so newer bundles leave the service to the harness
+# overlay (tools/judge/overlay-judge-service.yaml). Telling a recipient to set a
+# CODEX_AUTH_FILE that nothing in their copy reads is worse than saying nothing.
 _ENV_README = """\
 # Running this bundle
 
-Both images build from sources in this directory. Nothing is pulled from a
-registry.
+{images_line}
 
     docker compose up --detach --wait
 
-`light-servers` builds from `./light-servers`, `judge` from `./judge` with
-`./scoring` as a named build context. Compose skips the build when the tag is
-already on the machine; `--build` forces a rebuild.
+{build_line}
 
 The first `light-servers` build takes a few minutes. Its healthcheck allows a
 900s start period, so `--wait` is doing its job while it looks stuck.
@@ -155,22 +157,78 @@ The first `light-servers` build takes a few minutes. Its healthcheck allows a
 
 | Variable | What to set it to |
 |---|---|
-| `JUDGE_TOKEN` | any random secret, e.g. `export JUDGE_TOKEN=$(openssl rand -hex 32)`. It only has to match between the two containers of one run. |
-| `CODEX_AUTH_FILE` | absolute path to your own Codex login, normally `~/.codex/auth.json` after `codex login`. It is mounted read-only and is the only credential the judge holds. This one cannot be shipped in any form. |
-| `HOST_VERIFIER_LOGS_PATH` | absolute path to a host directory for this run's reports. Harbor sets it per trial; set it yourself for a manual run. |
+{judge_rows}| `HOST_VERIFIER_LOGS_PATH` | absolute path to a host directory for this run's reports. Harbor sets it per trial; set it yourself for a manual run. |
 | `SCORING_DIR` | optional. Defaults to `./scoring`, shipped here. Point it elsewhere to grade with a different checkout of the graders. |
 
 ## What runs where
 
-`main` is the agent's container. It mounts no answer files: `tests/` goes to
-the judge only.
-
-`judge` runs every scored channel (state dump, Channel A, rubric, ledger) and
-writes its reports to `/logs/verifier`.
-
-`light-servers` serves the task world over MCP and is the state the graders
+{where_main}
+{judge_where}`light-servers` serves the task world over MCP and is the state the graders
 read back at the end.
 """
+
+
+_JUDGE_VAR_ROWS = (
+    "| `JUDGE_TOKEN` | any random secret, e.g. `export JUDGE_TOKEN=$(openssl rand -hex 32)`."
+    " It only has to match between the two containers of one run. |\n",
+    "| `CODEX_AUTH_FILE` | absolute path to your own Codex login, normally"
+    " `~/.codex/auth.json` after `codex login`. It is mounted read-only and is the only"
+    " credential the judge holds. This one cannot be shipped in any form. |\n",
+)
+
+# The judge ships, but its credential does not -- so it starts unhealthy and the
+# rubric is simply not graded. Say so, and say how to turn it back on.
+_JUDGE_WHERE_NO_LOGIN = (
+    "\n`judge` runs every scored channel (state dump, Channel A, rubric, ledger) and\n"
+    "writes its reports to `/logs/verifier`. It needs a Codex login, which no bundle\n"
+    "can ship: without one it reports unhealthy, nothing waits on it, and the rubric\n"
+    "channel is left out of the reward rather than scored zero. To grade it, mount\n"
+    "your own `auth.json` at `/run/codex-auth/auth.json` and set `JUDGE_TOKEN`.\n\n"
+)
+
+_README_WITH_JUDGE = {
+    "images_line": (
+        "Both images build from sources in this directory. Nothing is pulled from a\n"
+        "registry."
+    ),
+    "build_line": (
+        "`light-servers` builds from `./light-servers`, `judge` from `./judge` with\n"
+        "`./scoring` as a named build context. Compose skips the build when the tag is\n"
+        "already on the machine; `--build` forces a rebuild."
+    ),
+    "where_main": (
+        "`main` is the agent's container. It mounts no answer files: `tests/` goes to\n"
+        "the judge only."
+    ),
+    "judge_where": (
+        "\n`judge` runs every scored channel (state dump, Channel A, rubric, ledger) and\n"
+        "writes its reports to `/logs/verifier`.\n\n"
+    ),
+}
+
+# No judge in this bundle. The rubric channel is simply not graded here: the
+# harness scores it from the host, and services/scoring/tests/test_outputs.py
+# drops an unscored channel's weight from the divisor rather than counting it
+# zero. Say that plainly instead of leaving a recipient hunting for a container
+# their copy never declares.
+_README_NO_JUDGE = {
+    "images_line": (
+        "The `light-servers` image builds from sources in this directory. Nothing is\n"
+        "pulled from a registry."
+    ),
+    "build_line": (
+        "`light-servers` builds from `./light-servers`. Compose skips the build when the\n"
+        "tag is already on the machine; `--build` forces a rebuild."
+    ),
+    "where_main": (
+        "`main` is the agent's container, and the only one the tests run in. It mounts\n"
+        "no answer files."
+    ),
+    "judge_where": (
+        "\nThis bundle declares no `judge` service, so the rubric channel goes unscored\n"
+        "and is left out of the reward divisor. The deterministic channels still grade.\n\n"
+    ),
+}
 
 
 def _repo_needles() -> list[tuple[str, str]]:
@@ -273,10 +331,26 @@ def _build_judge_usage(tokens: dict) -> dict:
     }
 
 
+def _bundle_declares_judge(env_dir: Path) -> bool:
+    """Does this bundle's compose file name a judge service of its own?
+
+    Newer bundles do not: the judge mounts the operator's codex login, so the
+    service lives in the harness overlay (tools/judge/overlay-judge-service.yaml)
+    and never travels. Shipping its build context to a bundle that declares no
+    judge would put a tree in the delivery that nothing references."""
+    compose = env_dir / "docker-compose.yaml"
+    if not compose.is_file():
+        return False
+    return bool(re.search(r"^  judge:[ \t]*$", compose.read_text(encoding="utf-8"), re.M))
+
+
 def _vendor_build_contexts(env_dir: Path) -> list[str]:
     """Copy every _VENDORED tree into the bundle's environment/ directory."""
+    wants_judge = _bundle_declares_judge(env_dir)
     shipped: list[str] = []
     for tree in _VENDORED:
+        if tree.name == "judge" and not wants_judge:
+            continue
         if not tree.source.is_dir():
             print(f"Warning: build context missing, not shipped: {tree.source}",
                   file=sys.stderr)
@@ -373,7 +447,18 @@ def _write_env_readme(env_dir: Path, shipped: list[str]) -> None:
     """One page on how to bring the bundle up without this repo."""
     if not shipped:
         return
-    (env_dir / "README.md").write_text(_ENV_README, encoding="utf-8")
+    filling = dict(_README_WITH_JUDGE if "judge" in shipped else _README_NO_JUDGE)
+    compose = env_dir / "docker-compose.yaml"
+    compose_text = compose.read_text(encoding="utf-8") if compose.is_file() else ""
+    # Document only the variables this compose actually reads. A bundle whose
+    # judge takes its login from the harness overlay names no CODEX_AUTH_FILE,
+    # and a row telling the recipient to set one sends them hunting for a mount
+    # that is not there.
+    filling["judge_rows"] = "".join(
+        row for row in _JUDGE_VAR_ROWS if row.split("`")[1] in compose_text)
+    if "judge" in shipped and "CODEX_AUTH_FILE" not in compose_text:
+        filling["judge_where"] = _JUDGE_WHERE_NO_LOGIN
+    (env_dir / "README.md").write_text(_ENV_README.format(**filling), encoding="utf-8")
 
 
 def make_delivery(

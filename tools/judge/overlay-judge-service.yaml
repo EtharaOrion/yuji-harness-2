@@ -1,0 +1,45 @@
+# The judge's codex login, kept out of the bundle.
+#
+# Passed to harbor as `--extra-docker-compose` by scripts/run_task.sh, so it
+# lands after the bundle's own environment/docker-compose.yaml in the ordered
+# -f list (harbor/environments/docker/docker.py:368-407).
+#
+# The judge service itself IS in the bundle -- grading in a container the agent
+# never had root in is the point of it, and that belongs with the task. Only
+# the credential is local: mounting the operator's ~/.codex/auth.json is a
+# demand no bundle can make of whoever receives it.
+#
+# Three things go in, and they belong together:
+#
+#   the mount   codexbridge.py reads /run/codex-auth/auth.json and copies it
+#               into CODEX_HOME. Without it /healthz never returns 200.
+#   the token   the judge's half of the shared secret that stops the agent --
+#               same container as the verifier, same network as the judge --
+#               from grading itself. prepare_judge() mints a fresh one per run;
+#               task.toml [verifier.env] hands the same value to test.sh, after
+#               the agent has exited. Declared here rather than in the bundle so
+#               a task names no secret at all, not even as a variable.
+#   the gate    main's depends_on. The bundle deliberately does not wait on the
+#               judge, so that a recipient without a codex login still gets a
+#               running trial. Here, where the login exists, the judge IS
+#               expected to come up -- and a grader that silently failed to
+#               start should stop the run, not quietly cost the rubric.
+#
+# `:?` on both, unlike the bundle's old `:-`: this file is only ever passed by
+# scripts/run_task.sh, which exports both before harbor is invoked, so an unset
+# one is a bug worth aborting for rather than a recipient without a login.
+#
+# Compose merges volumes by target, so the mount joins the judge's existing
+# four rather than replacing them.
+
+services:
+  main:
+    depends_on:
+      judge:
+        condition: service_healthy
+
+  judge:
+    environment:
+      JUDGE_TOKEN: '${JUDGE_TOKEN:?set per run by scripts/run_task.sh}'
+    volumes:
+      - '${CODEX_AUTH_FILE:?set by scripts/run_task.sh to the host codex login}:/run/codex-auth/auth.json:ro'

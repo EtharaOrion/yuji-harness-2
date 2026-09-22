@@ -413,3 +413,78 @@ def test_a_colon_in_the_path_is_refused_before_anything_runs(env, tmp_path):
     assert r.returncode != 0, r.stdout
     assert "colon" in r.stderr, r.stderr[-1500:]
     assert not env.harbor_argv() or env.harbor_argv() == [""], "harbor was invoked anyway"
+
+
+# --- the judge overlay -------------------------------------------------------
+# The judge service moved out of the bundle (it mounts the operator's codex
+# login, so it cannot ship) into tools/judge/overlay-judge-service.yaml, which
+# run_task.sh layers with --extra-docker-compose. These pin the routing: a
+# bundle that grades by judge but declares none gets the overlay; a bundle that
+# still declares its own is left exactly as it was; a bundle that never calls
+# the judge gets neither. Stage `harbor` only, so no image work and no
+# containers -- the stub harbor just records its argv.
+
+_COMPOSE_NO_JUDGE = """\
+services:
+  main:
+    command: ['sleep', 'infinity']
+  light-servers:
+    image: light-servers:latest
+"""
+
+# Declares the judge but not its credential: the shape the overlay exists for.
+_COMPOSE_JUDGE_NO_LOGIN = _COMPOSE_NO_JUDGE + """\
+  judge:
+    image: codex-judge:latest
+"""
+
+# Older shape: mounts the host's codex login itself, so it needs no overlay.
+_COMPOSE_JUDGE_WITH_LOGIN = _COMPOSE_NO_JUDGE + """\
+  judge:
+    image: codex-judge:latest
+    volumes:
+      - '${CODEX_AUTH_FILE:?}:/run/codex-auth/auth.json:ro'
+"""
+
+_TEST_SH_CALLS_JUDGE = "#!/bin/sh\npython3 /harness/scoring/judge_client.py --trajectory t\n"
+_TEST_SH_NO_JUDGE = "#!/bin/sh\npython3 -m pytest /tests\n"
+
+_OVERLAY = "tools/judge/overlay-judge-service.yaml"
+
+
+def _shape_bundle(env, compose: str, test_sh: str) -> None:
+    """Give the fixture's task dir the two files the judge routing reads."""
+    # No `image =` key: that one is read by stage_preflight, which these tests
+    # do not run, and a bogus tag there would only ever confuse a failure.
+    (env.task_dir / "task.toml").write_text('name = "acme/alpha"\n')
+    (env.task_dir / "environment").mkdir(exist_ok=True)
+    (env.task_dir / "environment" / "docker-compose.yaml").write_text(compose)
+    (env.task_dir / "tests").mkdir(exist_ok=True)
+    (env.task_dir / "tests" / "test.sh").write_text(test_sh)
+
+
+@requires_docker
+def test_a_judge_without_a_login_gets_one_from_the_overlay(env):
+    _shape_bundle(env, _COMPOSE_JUDGE_NO_LOGIN, _TEST_SH_CALLS_JUDGE)
+    env.run("harbor", AGENT="claude-code", N=1, NETWORK_ISOLATION_OFF="1")
+    argv = env.harbor_argv()
+    assert any(_OVERLAY in a for a in argv), (
+        f"no judge overlay in harbor argv; the judge would never go healthy: {argv}")
+
+
+@requires_docker
+def test_a_bundle_that_mounts_its_own_login_is_left_alone(env):
+    _shape_bundle(env, _COMPOSE_JUDGE_WITH_LOGIN, _TEST_SH_CALLS_JUDGE)
+    env.run("harbor", AGENT="claude-code", N=1, NETWORK_ISOLATION_OFF="1")
+    argv = env.harbor_argv()
+    assert not any(_OVERLAY in a for a in argv), (
+        "the overlay was layered onto a bundle that mounts the login itself; "
+        f"the mount would be declared twice: {argv}")
+
+
+@requires_docker
+def test_a_bundle_that_never_calls_the_judge_gets_no_overlay(env):
+    _shape_bundle(env, _COMPOSE_NO_JUDGE, _TEST_SH_NO_JUDGE)
+    env.run("harbor", AGENT="claude-code", N=1, NETWORK_ISOLATION_OFF="1")
+    argv = env.harbor_argv()
+    assert not any(_OVERLAY in a for a in argv), argv
