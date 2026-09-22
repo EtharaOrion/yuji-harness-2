@@ -24,5 +24,5 @@
 	url = https://github.com/Atamyrat2005/snake-game.git
 [submodule "trinity"]
 	path = trinity
-	url = org-302118749@github.com:EtharaOrion/trinity.git
+	url = https://github.com/EtharaOrion/trinity.git
 	branch = main
