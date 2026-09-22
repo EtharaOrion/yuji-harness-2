@@ -6,5 +6,13 @@
 
 services:
   egress-proxy:
+    extra_hosts:
+      # squid resolves the bridge's host name itself. Docker Desktop and
+      # OrbStack answer host.docker.internal from any container; plain Linux
+      # docker needs it spelled out. Without this the name does not resolve at
+      # all and squid answers every model call with an error page, which
+      # litellm re-wraps as a 503. Same line, same reason, as
+      # overlay-ccbridge.yaml.
+      - "host.docker.internal:host-gateway"
     volumes:
       - "${EGRESS_SQUID_CONF:?set by scripts/run_task.sh for GLM runs}:/etc/squid/squid.conf:ro"

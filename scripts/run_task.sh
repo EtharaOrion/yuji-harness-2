@@ -1425,16 +1425,59 @@ ensure_cc_bridge() {
   echo "[run_task] WARNING: cbridge did not come up in 20s; check $bridge_dir/logs/cbridge.log" >&2
 }
 
+# Which address zbridge binds, and which address this script probes it on.
+#
+# Not loopback. zbridge lives on the host, but the caller that matters is squid
+# inside the egress-proxy container, which reaches it through
+# host.docker.internal -- the docker gateway, not 127.0.0.1. A loopback bind is
+# refused there, squid answers with its "URL could not be retrieved" HTML page,
+# and litellm inside the OpenHands SDK re-wraps that page as
+# `ServiceUnavailableError: AnthropicException - <!DOCTYPE html ...>`. Every
+# turn of the run fails that way while /healthz on 127.0.0.1 stays green.
+#
+# ccbridge_host() answers the same question for the ccbridge and picks 0.0.0.0
+# on Linux. This one prefers the gateway address, because zbridge runs
+# deliberately unauthenticated (ZB_BRIDGE_SECRET is left empty below, since the
+# containerised agent sends no x-zbridge-secret header) and 0.0.0.0 would put an
+# unmetered z.ai spend endpoint on every interface of the box. 0.0.0.0 remains
+# the fallback for hosts with no docker bridge to read, and ZB_HOST overrides.
+zbridge_host() {
+  if [ -n "${ZB_HOST:-}" ]; then echo "$ZB_HOST"; return; fi
+  case "$(uname -s)" in Darwin) echo "127.0.0.1"; return ;; esac
+  local gw
+  gw="$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)"
+  case "$gw" in
+    ''|*[!0-9.]*) echo "0.0.0.0" ;;
+    *) echo "$gw" ;;
+  esac
+}
+
+# A 0.0.0.0 bind is not a connectable address; everything else is its own probe.
+zbridge_probe_host() {
+  case "$(zbridge_host)" in 0.0.0.0) echo "127.0.0.1" ;; *) zbridge_host ;; esac
+}
+
 ensure_zbridge() {
-  local port="${ZB_PORT:-8766}"
+  local port="${ZB_PORT:-8766}" host probe
+  host="$(zbridge_host)"; probe="$(zbridge_probe_host)"
   # zbridge serves /healthz (bridge.py), NOT /health -- the adapter on :4001 and
   # cc-bridge on :4000 are the ones with /health. Probing /health here 404s on a
   # perfectly healthy bridge, so this guard never fired: every run fell through
   # to the start branch and spawned a second uvicorn, which could not bind the
   # port but did truncate the live bridge's log on its way out (the redirect
   # below is `>`), destroying its startup warnings.
-  if curl -sf -m 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
-    echo "[run_task] zbridge already running on :$port"
+  if curl -sf -m 2 "http://$probe:$port/healthz" >/dev/null 2>&1; then
+    echo "[run_task] zbridge already running on $probe:$port"
+  elif [ "$probe" != "127.0.0.1" ] && curl -sf -m 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
+    # A bridge IS up, on loopback only -- the pre-fix bind, or start_zbridge.sh
+    # with its 127.0.0.1 default. Starting a second one cannot help: the port is
+    # taken, the new uvicorn dies, and the run proceeds against a bridge no
+    # container can reach. Say which process to kill instead.
+    echo "[run_task] ERROR: a zbridge is listening on 127.0.0.1:$port but not on $probe:$port." >&2
+    echo "[run_task]   squid reaches it via host.docker.internal ($probe), so every agent" >&2
+    echo "[run_task]   turn would come back as a squid error page wrapped in a 503." >&2
+    echo "[run_task]   Fix: kill that process and re-run, or start it with ZB_HOST=$probe." >&2
+    exit 3
   else
     local zbridge_dir="$REPO/tools/bridges/zbridge"
     if [ ! -f "$zbridge_dir/pyproject.toml" ]; then
@@ -1447,11 +1490,11 @@ ensure_zbridge() {
     (cd "$zbridge_dir" && \
       ZB_ZAI_API_KEY="$ZB_ZAI_API_KEY" \
       ZB_BRIDGE_SECRET="" \
-      ZB_PORT="$port" ZB_HOST="127.0.0.1" \
+      ZB_PORT="$port" ZB_HOST="$host" \
       ZB_THINKING_SIG_KEY="${ZB_THINKING_SIG_KEY:-yuji-harness-zbridge-v1}" \
       ZB_MODEL_ALIAS_JSON='{"claude-opus-5":"glm-5.3","claude-sonnet-5":"glm-5.3","claude-sonnet-4-6":"glm-5.3","claude-sonnet-4-5":"glm-5.3","claude-opus-4-8":"glm-5.3","claude-opus-4-7":"glm-5.3","claude-haiku-4-5-20251001":"glm-5.3","claude-haiku-4-5":"glm-5.3","claude-3-5-sonnet-latest":"glm-5.3","claude-3-opus-latest":"glm-5.3"}' \
       ZB_UPSTREAM_URL="${ZB_UPSTREAM_URL:-https://api.z.ai/api/coding/paas/v4/chat/completions}" \
-      nohup uv run python -m zbridge --port "$port" --host 127.0.0.1 \
+      nohup uv run python -m zbridge --port "$port" --host "$host" \
         >"$log_dir/zbridge.log" 2>&1 &)
     # Generous, because the first `uv run` on a machine resolves and builds the
     # bridge's venv before anything listens -- minutes, not seconds. The old 15s
@@ -1459,14 +1502,14 @@ ensure_zbridge() {
     local i=0 wait_s="${ZB_START_TIMEOUT_SEC:-180}"
     while [ $i -lt "$wait_s" ]; do
       sleep 1; i=$((i+1))
-      curl -sf -m 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && {
-        echo "[run_task] zbridge ready on :$port"; break
+      curl -sf -m 1 "http://$probe:$port/healthz" >/dev/null 2>&1 && {
+        echo "[run_task] zbridge ready on $probe:$port"; break
       }
     done
     # Pointing the agent at a port nothing listens on spends the whole trial on
     # connection errors, so this refuses instead of warning.
-    curl -sf -m 1 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 || {
-      echo "[run_task] ERROR: zbridge did not come up in ${wait_s}s on :$port" >&2
+    curl -sf -m 1 "http://$probe:$port/healthz" >/dev/null 2>&1 || {
+      echo "[run_task] ERROR: zbridge did not come up in ${wait_s}s on $probe:$port" >&2
       echo "[run_task]   The agent would fail every turn. See $log_dir/zbridge.log" >&2
       echo "[run_task]   Raise ZB_START_TIMEOUT_SEC if this machine is just slow." >&2
       exit 3
@@ -1481,12 +1524,13 @@ ensure_zbridge() {
 # GLM login from a dead one. One minimal request does. Only an upstream 401/403
 # refuses the run; anything else warns, because it may not be the credential.
 zbridge_live_check() {
-  local port="${ZB_PORT:-8766}" verdict
-  verdict="$(python3 - "$port" <<'PYEOF' 2>/dev/null || true
+  local port="${ZB_PORT:-8766}" verdict probe
+  probe="$(zbridge_probe_host)"
+  verdict="$(python3 - "$probe" "$port" <<'PYEOF' 2>/dev/null || true
 import json, sys, urllib.error, urllib.request
 body = json.dumps({"model": "claude-opus-5", "max_tokens": 1,
                    "messages": [{"role": "user", "content": "ping"}]}).encode()
-req = urllib.request.Request(f"http://127.0.0.1:{sys.argv[1]}/v1/messages",
+req = urllib.request.Request(f"http://{sys.argv[1]}:{sys.argv[2]}/v1/messages",
                              data=body, headers={"content-type": "application/json"})
 try:
     with urllib.request.urlopen(req, timeout=60) as r:
