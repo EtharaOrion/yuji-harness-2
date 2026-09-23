@@ -22,7 +22,7 @@
 [submodule "services/agent-environment/data/repos/snake-game"]
 	path = services/agent-environment/data/repos/snake-game
 	url = https://github.com/Atamyrat2005/snake-game.git
-[submodule "trinity"]
-	path = trinity
-	url = https://github.com/EtharaOrion/trinity.git
-	branch = main
+# [submodule "trinity"]
+# 	path = trinity
+# 	url = https://github.com/EtharaOrion/trinity.git
+# 	branch = main
