@@ -41,59 +41,22 @@ _TEXT_SUFFIXES = {".json", ".jsonl", ".txt", ".md", ".xml", ".yaml", ".yml",
                   ".log", ".toml", ".py", ".csv", ".html", ".cfg", ".ini"}
 
 # ---------------------------------------------------------------------------
-# Build contexts shipped with the bundle.
+# Trees shipped with the bundle.
 #
-# A delivered bundle names two images, light-servers:latest and
-# codex-judge:latest, and neither is on a registry. Docker reads a bare name as
-# Docker Hub, so a recipient who has never built them gets "pull access denied"
-# and the trial dies before the agent starts. That was the first finding of the
-# last quality review: "MCP server is missing ... no source and cannot be
-# pulled".
-#
-# So ship what builds them, ship the graders they mount, and point the compose
-# file at those copies. `image:` stays on both services, so a host that already
-# holds a tag (this one) reuses it and never rebuilds.
+# Both images come from the private registry the compose file's `image:` tags
+# name, so no build context travels. The graders do: both containers bind-mount
+# them at /harness/scoring, and a delivered tree cannot reach the repo copy.
 
 
 class _Vendored(NamedTuple):
-    """A repo tree copied into the bundle's environment/ directory.
-
-    `image` is the compose tag this tree builds, or None when the tree is not an
-    image at all. Scoring is the None case: it ships because two other things
-    need it, the judge's `COPY --from=scoring` at build time and the
-    /harness/scoring bind both containers read at grading time.
-    """
+    """A repo tree copied into the bundle's environment/ directory."""
 
     name: str
     source: Path
-    image: str | None = None
-    extra_contexts: tuple[tuple[str, str], ...] = ()
-
-    @property
-    def anchor(self) -> str:
-        """The compose line a build block attaches to."""
-        return f"    image: {self.image}\n"
-
-    def build_block(self) -> str:
-        """That line with the build block this bundle needs under it."""
-        out = [self.anchor, "    build:\n", f"      context: ./{self.name}\n"]
-        if self.extra_contexts:
-            out.append("      additional_contexts:\n")
-            out += [f"        {k}: {v}\n" for k, v in self.extra_contexts]
-        return "".join(out)
 
 
 _VENDORED = (
-    # the MCP fleet the task world is served from
-    _Vendored("light-servers", REPO_ROOT / "services" / "light-servers",
-              image="light-servers:latest"),
-    # the rubric judge. tools/judge/Dockerfile does `COPY --from=scoring`, which
-    # compose supplies as a named context -- the same thing `make
-    # build-codex-judge` passes as --build-context scoring=services/scoring.
-    _Vendored("judge", REPO_ROOT / "tools" / "judge",
-              image="codex-judge:latest",
-              extra_contexts=(("scoring", "./scoring"),)),
-    # the shared graders, mounted at /harness/scoring by both containers
+    # the shared graders, mounted at /harness/scoring by main and the judge
     _Vendored("scoring", REPO_ROOT / "services" / "scoring"),
 )
 
@@ -118,40 +81,31 @@ _SCORING_SRCS = (_SCORING_SRC_LANE, _SCORING_SRC)
 _SCORING_DST = "./scoring"
 
 _COMPOSE_NOTE = """\
-# Delivered bundle: tools/delivery/make_delivery.py rewrote three paths here so
-# this directory stands alone.
+# Delivered bundle: tools/delivery_utils/make_delivery.py rewrote one path here
+# so this directory stands alone:
 #
-#   light-servers    gained  build: ./light-servers
-#   judge            gained  build: ./judge, with ./scoring as a named context
-#   /harness/scoring binds   ./scoring, not <repo>/services/scoring
+#   /harness/scoring binds ./scoring, not <repo>/services/scoring
 #
-# Both services keep their `image:` tag. Compose builds only when the tag is
-# absent locally, so a host that already has the images reuses them untouched.
-# Any comment below that discusses ../../../services describes the in-repo
-# original, not this file.
+# Both images are pulled from the registry their `image:` tag names. Any comment
+# below that discusses ../../../services describes the in-repo original, not
+# this file.
 
 """
 
 # Shipped as environment/README.md. The compose file names variables with
 # compose's `:?` form, which aborts with a bare variable name and no hint of
-# where the value comes from. Every one of them used to be supplied by
-# scripts/run_task.sh, which does not travel with the bundle.
-#
-# Two shapes, because the judge no longer ships with every bundle: it mounts the
-# operator's codex login, so newer bundles leave the service to the harness
-# overlay (tools/judge/overlay-judge-service.yaml). Telling a recipient to set a
-# CODEX_AUTH_FILE that nothing in their copy reads is worse than saying nothing.
+# where the value comes from, and scripts/run_task.sh supplied every one of them
+# without travelling with the bundle.
 _ENV_README = """\
 # Running this bundle
 
-{images_line}
+Both images are pulled from the private registry the compose file names. Log in
+to it first, then:
 
     docker compose up --detach --wait
 
-{build_line}
-
-The first `light-servers` build takes a few minutes. Its healthcheck allows a
-900s start period, so `--wait` is doing its job while it looks stuck.
+`light-servers` allows a 900s healthcheck start period, so `--wait` is doing its
+job while it looks stuck.
 
 ## Variables the compose file requires
 
@@ -187,15 +141,6 @@ _JUDGE_WHERE_NO_LOGIN = (
 )
 
 _README_WITH_JUDGE = {
-    "images_line": (
-        "Both images build from sources in this directory. Nothing is pulled from a\n"
-        "registry."
-    ),
-    "build_line": (
-        "`light-servers` builds from `./light-servers`, `judge` from `./judge` with\n"
-        "`./scoring` as a named build context. Compose skips the build when the tag is\n"
-        "already on the machine; `--build` forces a rebuild."
-    ),
     "where_main": (
         "`main` is the agent's container. It mounts no answer files: `tests/` goes to\n"
         "the judge only."
@@ -212,14 +157,6 @@ _README_WITH_JUDGE = {
 # zero. Say that plainly instead of leaving a recipient hunting for a container
 # their copy never declares.
 _README_NO_JUDGE = {
-    "images_line": (
-        "The `light-servers` image builds from sources in this directory. Nothing is\n"
-        "pulled from a registry."
-    ),
-    "build_line": (
-        "`light-servers` builds from `./light-servers`. Compose skips the build when the\n"
-        "tag is already on the machine; `--build` forces a rebuild."
-    ),
     "where_main": (
         "`main` is the agent's container, and the only one the tests run in. It mounts\n"
         "no answer files."
@@ -336,23 +273,19 @@ def _bundle_declares_judge(env_dir: Path) -> bool:
 
     Newer bundles do not: the judge mounts the operator's codex login, so the
     service lives in the harness overlay (tools/judge/overlay-judge-service.yaml)
-    and never travels. Shipping its build context to a bundle that declares no
-    judge would put a tree in the delivery that nothing references."""
+    and never travels. The README says something different in each case."""
     compose = env_dir / "docker-compose.yaml"
     if not compose.is_file():
         return False
     return bool(re.search(r"^  judge:[ \t]*$", compose.read_text(encoding="utf-8"), re.M))
 
 
-def _vendor_build_contexts(env_dir: Path) -> list[str]:
+def _vendor_trees(env_dir: Path) -> list[str]:
     """Copy every _VENDORED tree into the bundle's environment/ directory."""
-    wants_judge = _bundle_declares_judge(env_dir)
     shipped: list[str] = []
     for tree in _VENDORED:
-        if tree.name == "judge" and not wants_judge:
-            continue
         if not tree.source.is_dir():
-            print(f"Warning: build context missing, not shipped: {tree.source}",
+            print(f"Warning: tree missing, not shipped: {tree.source}",
                   file=sys.stderr)
             continue
         # Replace rather than merge. make_delivery clears the bundle before it
@@ -367,13 +300,10 @@ def _vendor_build_contexts(env_dir: Path) -> list[str]:
 
     # `main` builds from this directory and its Dockerfile COPYs nothing, so
     # without this the trees above are uploaded to the daemon on every main
-    # build for no reason. A .dockerignore is read from the root of the context
-    # using it, so the light-servers and judge builds, whose contexts are those
-    # subdirectories, are unaffected.
+    # build for no reason.
     (env_dir / ".dockerignore").write_text(
         "\n".join([
             "# main builds from this directory and COPYs nothing from it.",
-            "# The trees below are build contexts for the other two services.",
             *(f"{name}/" for name in shipped),
             "",
         ]),
@@ -383,27 +313,13 @@ def _vendor_build_contexts(env_dir: Path) -> list[str]:
 
 
 def _rewrite_compose(compose: Path, shipped: list[str]) -> None:
-    """Point the delivered compose at the trees _vendor_build_contexts copied."""
+    """Point the delivered compose at the trees _vendor_trees copied."""
     if not compose.is_file():
         print(f"Warning: no docker-compose.yaml in {compose.parent}",
               file=sys.stderr)
         return
 
     text = compose.read_text(encoding="utf-8")
-    for tree in _VENDORED:
-        if tree.image is None or tree.name not in shipped:
-            continue
-        if f"context: ./{tree.name}" in text:
-            continue  # already rewritten; a second pass must not stack blocks
-        if tree.anchor not in text:
-            # Reported, never guessed at: a silently un-rewritten compose ships
-            # looking correct and fails on the recipient's machine, which is the
-            # exact failure this is here to end.
-            print(f"Warning: {compose} has no `{tree.anchor.strip()}` line; "
-                  f"{tree.name} ships without a build context", file=sys.stderr)
-            continue
-        text = text.replace(tree.anchor, tree.build_block(), 1)
-
     if "scoring" in shipped:
         # Comment lines are left alone. Several bundles carry a paragraph
         # explaining why the depth is exactly three levels, and rewriting the
@@ -447,7 +363,8 @@ def _write_env_readme(env_dir: Path, shipped: list[str]) -> None:
     """One page on how to bring the bundle up without this repo."""
     if not shipped:
         return
-    filling = dict(_README_WITH_JUDGE if "judge" in shipped else _README_NO_JUDGE)
+    declares_judge = _bundle_declares_judge(env_dir)
+    filling = dict(_README_WITH_JUDGE if declares_judge else _README_NO_JUDGE)
     compose = env_dir / "docker-compose.yaml"
     compose_text = compose.read_text(encoding="utf-8") if compose.is_file() else ""
     # Document only the variables this compose actually reads. A bundle whose
@@ -456,7 +373,7 @@ def _write_env_readme(env_dir: Path, shipped: list[str]) -> None:
     # that is not there.
     filling["judge_rows"] = "".join(
         row for row in _JUDGE_VAR_ROWS if row.split("`")[1] in compose_text)
-    if "judge" in shipped and "CODEX_AUTH_FILE" not in compose_text:
+    if declares_judge and "CODEX_AUTH_FILE" not in compose_text:
         filling["judge_where"] = _JUDGE_WHERE_NO_LOGIN
     (env_dir / "README.md").write_text(_ENV_README.format(**filling), encoding="utf-8")
 
@@ -505,18 +422,17 @@ def make_delivery(
         print(f"Warning: task dir not found: {task_src}", file=sys.stderr)
         (dst / "data").mkdir()
 
-    # Make the bundle buildable away from this repo: ship the sources for the
-    # two images it names, ship the graders it mounts, and repoint the compose
-    # file at all three.
+    # Make the bundle gradeable away from this repo: ship the graders it mounts
+    # and repoint the compose file at that copy.
     env_dir = dst / "data" / "environment"
     if env_dir.is_dir():
-        shipped = _vendor_build_contexts(env_dir)
+        shipped = _vendor_trees(env_dir)
         _rewrite_compose(env_dir / "docker-compose.yaml", shipped)
         _write_env_readme(env_dir, shipped)
-        print(f"[delivery] build contexts shipped: {', '.join(shipped) or 'none'}")
+        print(f"[delivery] trees shipped: {', '.join(shipped) or 'none'}")
     else:
         print(f"Warning: no environment/ under {task_src}; the bundle ships "
-              f"without build contexts and cannot start elsewhere",
+              f"without the graders and cannot grade elsewhere",
               file=sys.stderr)
 
     traj_src = src / "trajectory"
