@@ -2451,7 +2451,7 @@ stage_reshape() {
   # Restore stash BEFORE reshape so harbor_to_output.py reads the accumulated
   # summary.json and prior Run_N dirs. Harbor may have cleared the job dir,
   # which wipes summary.json; without it the reshaper sees n=1 on every run
-  # and keeps overwriting pass@1.json instead of emitting pass@2.json, pass@3.json, ...
+  # and the pass@k counts never grow past the latest run.
   local stash; stash="$(state_get stash_dir)"
   [ -n "$stash" ] || stash="$STASH_DIR"
   if [ -d "$stash" ]; then

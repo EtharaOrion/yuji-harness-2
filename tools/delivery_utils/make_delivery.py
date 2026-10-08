@@ -448,11 +448,6 @@ def make_delivery(
     delivery_pass["per_run"] = per_run_clean
     _dump(traj_dst / "pass_summary.json", delivery_pass)
 
-    # pass@N.json (pass@k rollup, N = run count) ships under its dynamic name
-    # so the delivery filename itself says how many runs it covers.
-    for passk_src in sorted(src.glob("pass@*.json")):
-        _copy_masked(passk_src, traj_dst / passk_src.name)
-
     model_name: str = pass_sum.get("model", "")
 
     for run_dir in sorted(traj_src.glob("run_*")):

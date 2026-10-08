@@ -300,24 +300,13 @@ def test_result_json_keeps_harbors_pass_at_k_schema(tmp_path):
             assert int(key) >= 1, f"harbor cannot parse pass_at_k key {key!r} as an int"
 
     # ...and the labelled "k=<k>" form still reaches the .raw summary, which is
-    # now its only home -- per_task must not carry it, since a probability
-    # keyed 1..N sitting in a per-task block reads as a per-run score.
-    passk = json.loads(next(task.glob("pass@*.json")).read_text())
-    entry = passk["per_task"][0]
-    assert "pass@k" not in entry
+    # its only home.
     raw_summary = json.loads((task / ".raw").glob("trials_*/summary.json").__next__().read_text())
     assert all(k.startswith("k=") for k in raw_summary["metrics"]["pass@k"])
 
-    # The per-attempt scores ride in both places the layout calls for -- top
-    # level and inside the per_task entry -- keyed "pass@<n>", and the two
-    # copies are the same dict, so they cannot drift. These are per-trial
-    # REWARDS despite the label; the pass@k probabilities that share the name
-    # live in the .raw summary keyed "k=<k>", which is what keeps the two
-    # metrics from ever appearing identically keyed in one file.
-    per_trial = passk["per_trial_rewards"]
-    assert entry["per_trial_rewards"] == per_trial
-    assert list(per_trial) == [f"pass@{i}" for i in range(1, len(per_trial) + 1)]
-    assert list(per_trial.values()) == [e["reward"] for e in raw_summary["attempts"]]
+    # pass@N.json was a copy of summary.json's numbers and is no longer written.
+    assert not list(task.glob("pass@*.json"))
+    assert not list((task / ".raw").glob("trials_*/passk_summary.json"))
 
 
 def test_cost_fields_are_truncated_to_the_trees_precision(tmp_path):

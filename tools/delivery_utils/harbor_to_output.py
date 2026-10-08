@@ -5,7 +5,7 @@ and complex-mcp task runs land in one consistent shape:
 
     output/<task-slug>/
     ├── config.json  lock.json  result.json          (Harbor job files, verbatim)
-    ├── summary.json  pass_summary.json  pass@N.json (N = run count)
+    ├── summary.json  pass_summary.json
     ├── trajectory/Run_N/                            (one per trial, Harbor-shaped)
     │   ├── agent/{claude-code.jsonl | openhands.jsonl, trajectory.json}
     │   ├── logs/{agent-stream.jsonl, verifier-ctrf.json, verifier-reward.txt, verifier-stdout.txt}
@@ -1220,8 +1220,8 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     # exactly the confusion that guard exists to prevent: on one measured task
     # four graded trials scored 50/50/48/50 and a fifth died on an OAuth error,
     # and the mean reported 39.6 instead of 49.5 -- infrastructure trouble read
-    # as agent failure. Mark the trial unscored so it stays in n, c,
-    # per_trial_rewards and the failure histogram (a crashed attempt is still a
+    # as agent failure. Mark the trial unscored so it stays in n, c
+    # and the failure histogram (a crashed attempt is still a
     # failed attempt for pass@k) but out of the reward MEAN.
     #
     # The flag rides in reward.json as "unscored_reason", NOT as a "scored" key:
@@ -1648,12 +1648,6 @@ def pass_at_k(n: int, c: int, k: int) -> float:
     return 1.0 - _comb(n - c, k) / _comb(n, k)
 
 
-def pass_hat_k(n: int, c: int, k: int) -> float:
-    if n == 0 or k > n:
-        return 0.0
-    return _comb(c, k) / _comb(n, k) if c >= k else 0.0
-
-
 def wilson_ci(c: int, n: int, z: float = 1.96):
     if n == 0:
         return [0.0, 0.0]
@@ -1827,12 +1821,11 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
             all_eps = eps
         n = len(all_eps)
         c = sum(1 for e in all_eps if e["passed"])
-        rewards = [e["judge"]["reward"] for e in all_eps]
         # The aggregates below belong to the attempts they cover, not to the
         # harbor job that happened to run last. `model` above is read from this
         # job's config, and run_batch.py dispatches one job per run, so on an
         # append it is only run N's. Publishing it as the tree's label is what
-        # made summary.json, pass_summary.json, pass@N.json and the raw summary
+        # made summary.json, pass_summary.json and the raw summary
         # declare nine glm-5.3 attempts over a tree whose runs 1-8 were
         # claude-opus-5 -- while report.json and the per-run config.json beside
         # them, written by reshape_trial at their own job's time, said otherwise.
@@ -1847,7 +1840,7 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
                   file=sys.stderr)
         # Episodes carried forward from an older summary.json predate the
         # "scored" flag; default them to True so a re-run does not retroactively
-        # drop them from the average. n/c and per_trial_rewards stay over all attempts
+        # drop them from the average. n/c stay over all attempts
         # -- a crashed attempt is still an attempt -- but the reward AVERAGE is
         # a scored component and only averages trials that were actually scored.
         scored_rewards = [e["judge"]["reward"] for e in all_eps if e.get("scored", True)]
@@ -1989,7 +1982,7 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         }
         _dump(out_task / "pass_summary.json", pass_summary)
 
-        # passk_summary.json
+        # pass@k (.raw summary + result.json)
         # n/c from the summary-episode merge can undercount: the merge only
         # sees episodes summary.json carried forward, so a task with five
         # Run_N dirs on disk can still report n=1. The Run_N dirs are the
@@ -2025,7 +2018,6 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
             # Threshold is always 0-1, so scale it to match the reward range.
             _thr_scaled = _thr * 100 if any(r > 1 for r in _disk_scored) else _thr
             c = sum(1 for r in _disk_scored if r >= _thr_scaled)
-            rewards = _disk_rewards
             scored_rewards = _disk_scored
             n_unscored = len(_disk_rewards) - len(_disk_scored)
         # Empty ks means "auto": scale k to however many runs this task has
@@ -2035,50 +2027,21 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         # Keys are "k=<k>", not a bare "<k>", because a bare k reads exactly
         # like a trial number: "3": 0.5 in pass@k means "drawing 3 of the n
         # runs clears the threshold half the time", not "trial 3 scored 0.5".
-        # That collision is why pass@k no longer sits inside per_task at all --
-        # per_task now reports only the task name, and the pass@k map lives on
-        # the .raw summary, where nothing per-trial sits beside it to be
-        # confused with. The redundant "pass@1" that sat next to "task" is gone
-        # too; it was always pass@k's own k=1 entry printed twice.
+        # The map's only home is the .raw summary below.
         pass_at_k_map = {f"k={k}": norm_reward(pass_at_k(n, c, k)) for k in ks_eff}
-        # The score each individual attempt earned, keyed "pass@<n>": "pass@3"
-        # is "trial 3 scored this". Published in BOTH places the layout asks
-        # for -- once at top level for a reader skimming the whole file, once
-        # inside the per_task entry so a task's scores travel with its slug
-        # when entries are pulled out for a multi-task rollup. The two are the
-        # same dict; they cannot drift.
-        #
-        # NOTE the label collision this leaves standing: "pass@3" HERE is a
-        # per-trial reward, while "pass@3" in .raw/summary.json's metrics block
-        # is the pass@k statistic ("3 drawn attempts contain a pass this
-        # often"). Same label, different metric. The probabilities are keyed
-        # "k=<k>" over there precisely so the two never appear identically
-        # keyed in the same file; do not read one as the other.
-        per_trial_rewards = {f"pass@{i + 1}": norm_reward(r) for i, r in enumerate(rewards)}
-        per_task = [{"task": task_name, "per_trial_rewards": per_trial_rewards}]
-        passk = {
-            "model": agg_model, "models": _models,
-            "tasks": 1, "passed": c, "accuracy": norm_reward(c / n) if n else 0.0,
-            "mean_reward": _mean_or_none(scored_rewards),
-            "runs_unscored": n_unscored,
-            "per_trial_rewards": per_trial_rewards,
-            "failure_mode_histogram": hist, "per_task": per_task,
-            "attempts_per_task": n, "at": ks_eff,
-        }
-        # The pass@k file is named after the accumulated run count
-        # (pass@1.json, pass@2.json, ...) so the filename itself says how many
-        # runs it covers. Drop any stale copy from a previous run count.
-        passk_name = f"pass@{n}.json"
-        for _old in list(out_task.glob("pass@*.json")) + [out_task / "passk_summary.json"]:
-            if _old.name != passk_name and _old.exists():
+        # pass@N.json / passk_summary.json are no longer written: every field
+        # they carried was a copy of summary.json's metrics/episodes. Drop any
+        # left behind by an earlier conversion so a re-run does not keep
+        # shipping a stale one.
+        for _old in [*out_task.glob("pass@*.json"), out_task / "passk_summary.json",
+                     raw_trials / "passk_summary.json"]:
+            if _old.exists():
                 _old.unlink()
-        _dump(out_task / passk_name, passk)
-        _dump(raw_trials / "passk_summary.json", passk)
         if _top_res:
             # result.json is Harbor's file, not ours: Harbor re-reads and
             # validates it on every startup (harbor/job.py:80) against
             # AgentDatasetStats.pass_at_k, which is typed dict[int, float].
-            # The "k=<k>" keys above label OUR pass@N.json report; writing them
+            # The "k=<k>" keys above label OUR .raw summary; writing them
             # here meant the first run left behind a job dir that no later run
             # could open -- harbor died in pydantic before a trial could start.
             # Hand Harbor back the shape it declared; the labelled keys stay in
@@ -2138,10 +2101,9 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "metrics": {"n": n, "c": c, "pass@1": norm_reward(pass_at_k(n, c, 1)),
                         "p_hat": norm_reward(c / n) if n else 0.0, "ci95": wilson_ci(c, n),
-                        # The full "k=<k>" map, which pass@N.json no longer
-                        # carries -- this is now its only home. The "pass@1"
-                        # above is a named headline metric, not a second copy
-                        # of an entry sitting beside it.
+                        # The full "k=<k>" map -- this is its only home. The
+                        # "pass@1" above is a named headline metric, not a
+                        # second copy of an entry sitting beside it.
                         "pass@k": pass_at_k_map,
                         "failure_breakdown": hist},
             # all_eps, not eps: the metrics block above is computed over every

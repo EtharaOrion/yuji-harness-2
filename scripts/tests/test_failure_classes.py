@@ -1,6 +1,6 @@
 """FAILURE_CLASSES must name exactly what classify_failure can return.
 
-The histogram in pass@N.json is seeded from FAILURE_CLASSES, so the tuple is
+The failure histogram in the .raw summary is seeded from FAILURE_CLASSES, so the tuple is
 the published shape of that document. Nothing at runtime compares it against
 classify_failure -- a class added to the function and not to the tuple would
 still be counted (the increment uses .get), it would just never appear at 0,
