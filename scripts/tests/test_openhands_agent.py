@@ -582,6 +582,9 @@ exit 0
 """
 
 SECRET = "ccb-test-secret"
+# A stand-in for a `claude setup-token` value. The bridge treats the token as
+# opaque, so it stays short enough that no secret scanner reads it as a key.
+OAUTH_TOKEN = "sk-ant-oat01-test"
 
 
 class _FakeBridge(BaseHTTPRequestHandler):
@@ -797,7 +800,7 @@ def test_each_run_starts_and_stops_its_own_bridge(tmp_path, fake_anthropic):
     with the machine's token, and nothing left running afterwards."""
     run = _dispatch(tmp_path, 0, NETWORK_ISOLATION_OFF="1", CCBRIDGE_SHARED="0",
                     CCBRIDGE_PORT=None, CCBRIDGE_SECRET=None,
-                    CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-per-run-test",
+                    CLAUDE_CODE_OAUTH_TOKEN=OAUTH_TOKEN,
                     CCBRIDGE_UPSTREAM=f"http://127.0.0.1:{fake_anthropic}")
     assert run.returncode == 0, run.stderr[-3000:]
     base = run.env["OPENHANDS_LLM_BASE_URL"]
@@ -807,7 +810,7 @@ def test_each_run_starts_and_stops_its_own_bridge(tmp_path, fake_anthropic):
     assert secret.startswith("ccb-run-")
     shared = REPO / "tools" / "bridges" / "ccbridge" / ".bridge_secret"
     assert not shared.exists() or shared.read_text().strip() != secret
-    assert any(r["path"] == "/v1/messages" and r["auth"] == "Bearer sk-ant-oat01-per-run-test"
+    assert any(r["path"] == "/v1/messages" and r["auth"] == f"Bearer {OAUTH_TOKEN}"
                for r in _FakeAnthropic.seen), _FakeAnthropic.seen
     assert "ccbridge for this run stopped" in run.stderr
     assert not _listening(port), "the run's bridge outlived the run"
