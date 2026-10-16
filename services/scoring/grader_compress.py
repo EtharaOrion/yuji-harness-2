@@ -3,8 +3,10 @@
 
     GRADER_HEADROOM_ENABLED=true      # default false -- opt in explicitly
 
-Applies to the *grader* only: the rubric judge (`rubric_judge_cli`,
-`rubric_judge`) and the failure diagnostician (`single_model_diagnostic`).
+Used by the failure diagnostician (`single_model_diagnostic`) and by the
+agent-path Headroom proxy (tools/headroom/compress_proxy.py), which turns it on
+inside its own container. The harness carries no rubric judge of its own; a
+bundle's judge lives in that bundle's tests/.
 Two things are deliberately NOT wired up, and both exclusions are load-bearing
 rather than oversights -- see the two sections below.
 

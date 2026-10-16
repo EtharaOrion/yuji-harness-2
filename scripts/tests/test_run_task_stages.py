@@ -200,104 +200,6 @@ def test_reshape_is_handed_only_this_invocations_trial(env):
 
 
 @requires_docker
-def test_host_rubric_does_not_grade_a_stale_trial(env):
-    """stage_harbor names the stale dirs "NOT part of this run" and stage_reshape
-    honours that, but the rubric pass globbed every *__* dir and graded one
-    anyway -- `find | sort` is alphabetical, so which one won was arbitrary. A
-    real run spent a full judge pass (60 criteria, ~1M chars) on a trial from an
-    earlier invocation and published it as this run's."""
-    _stale_trial(env)
-    assert env.run("harbor", RUN_OFFSET=0, N=1, STUB_TRIAL="alpha__fresh").returncode == 0
-    # stage_host_rubric is not independently selectable; stage_reshape calls it
-    # first, so reshape is the driver.
-    r = env.run("reshape", RUN_OFFSET=0)
-    blob = r.stdout + r.stderr
-    # Guard against a vacuous pass: if the stage never ran, absence proves nothing.
-    assert "unknown stage" not in blob, blob[-800:]
-    assert "alpha__stale" not in blob, (
-        f"the rubric pass reached a trial from an earlier invocation: {blob[-1500:]}")
-
-
-def _select_trials(tmp_path, state, names=("task__AAA", "task__BBB", "task__STALE")):
-    """Drive stage_host_rubric's trial selector directly.
-
-    The loop names a trial only on its "already graded" / "failed" branches, so
-    asserting on stage output cannot distinguish "selected and skipped" from
-    "never selected". This calls the selector itself.
-    `state` is None for an absent `trials` key, else the stored comma string.
-    """
-    job = tmp_path / "job"
-    for n in names:
-        (job / n).mkdir(parents=True)
-    has = "return 1" if state is None else "return 0"
-    get = "" if state is None else state
-    script = f"""
-        set -uo pipefail
-        OUTPUT_DIR={tmp_path}; JOB=job
-        state_has() {{ {has}; }}
-        state_get() {{ printf '%s' '{get}'; }}
-        {_selector_source()}
-        this_invocations_trials
-    """
-    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
-    assert out.returncode == 0, out.stderr
-    return [Path(p).name for p in out.stdout.split() if p.strip()]
-
-
-def _selector_source():
-    body, keep = [], False
-    for line in RUN_TASK.read_text().splitlines():
-        if line.startswith("this_invocations_trials() {"):
-            keep = True
-        if keep:
-            body.append(line)
-            if line == "}":
-                break
-    assert body, "this_invocations_trials() not found in run_task.sh"
-    return "\n".join(body)
-
-
-def test_selector_absent_key_grades_every_trial(tmp_path):
-    """Hand-driven stage over a job dir with no state: grade what is there."""
-    assert sorted(_select_trials(tmp_path, None)) == ["task__AAA", "task__BBB", "task__STALE"]
-
-
-def test_selector_empty_value_grades_nothing(tmp_path):
-    """"harbor made nothing" must not collapse into "grade everything" -- that
-    is the same distinction stage_reshape draws, and the bug this pass had."""
-    assert _select_trials(tmp_path, "") == []
-
-
-def test_selector_keeps_every_trial_of_a_multi_attempt_run(tmp_path):
-    """Regression: an early version read the comma list with `printf '%s' | read`,
-    which dropped the last field because it was unterminated -- silently
-    narrowing an N=2 run to one trial."""
-    assert sorted(_select_trials(tmp_path, "task__AAA,task__BBB")) == ["task__AAA", "task__BBB"]
-
-
-def test_selector_skips_a_name_whose_dir_was_removed(tmp_path):
-    """A dir deleted by hand must not fail the whole stage."""
-    assert _select_trials(tmp_path, "task__AAA,task__GONE") == ["task__AAA"]
-
-
-def test_selector_never_returns_a_stale_dir(tmp_path):
-    """The bug: `find | sort` returned task__STALE and the judge graded it."""
-    assert "task__STALE" not in _select_trials(tmp_path, "task__AAA")
-
-
-@requires_docker
-def test_host_rubric_says_so_when_this_invocation_made_no_trial(env):
-    """"harbor made nothing" must not read as "the job dir is empty" -- a
-    state-tracking bug that grades nothing would otherwise look benign."""
-    _stale_trial(env)
-    assert env.run("harbor", RUN_OFFSET=0, N=1, STUB_TRIAL="").returncode == 0
-    r = env.run("reshape", RUN_OFFSET=0)
-    blob = r.stdout + r.stderr
-    assert "unknown stage" not in blob, blob[-800:]
-    assert "no trial dir of its own" in blob, blob[-2000:]
-
-
-@requires_docker
 def test_stale_trial_dirs_are_named_not_silently_dropped(env):
     _stale_trial(env)
     r = env.run("harbor", RUN_OFFSET=0, N=1, STUB_TRIAL="alpha__fresh")
@@ -373,34 +275,6 @@ def test_one_invocation_writes_exactly_one_run(env, tmp_path):
     assert runs == ["run_1"], runs
 
 
-def test_host_rubric_pass_looks_only_at_this_invocations_trials(env):
-    """The host pass globbed every *__* dir in the job, so a leftover trial from
-    an earlier invocation was graded again -- judge quota spent on a run this
-    invocation never made. It now takes the trial list stage_harbor recorded."""
-    (env.output / "alpha").mkdir(parents=True)
-    old = _trial(env, "alpha__old1")
-    (env.output / "alpha" / "config.json").write_text(
-        '{"agents": [{"name": "claude-code", "model_name": "m1"}]}')
-    (env.output / "alpha" / "result.json").write_text('{"id": "job-1"}')
-    assert env.run("harbor", RUN_OFFSET=0, N=1, STUB_TRIAL="alpha__fresh").returncode == 0
-    fresh = _trial(env, "alpha__fresh")
-    for d in (old, fresh):
-        (d / "verifier").mkdir(exist_ok=True)
-        (d / "verifier" / "reward.json").write_text('{"reward": 0.5}')
-        (d / "verifier" / "reward_producer.json").write_text('{"producer": "judge_container"}')
-    r = env.run("reshape", RUN_OFFSET=0)
-    out = r.stdout + r.stderr
-    assert "judge container for alpha__fresh" in out, out[-3000:]
-    graded = [l for l in out.splitlines() if "judge container for" in l]
-    assert not any("alpha__old1" in l for l in graded), graded
-    # harbor validates the container's reward.json as numbers only, so the label
-    # is added on the host -- to this invocation's trial alone.
-    assert "producer" not in json.loads((old / "verifier" / "reward.json").read_text())
-    published = json.loads(
-        (env.output / "alpha" / "trajectory" / "run_1" / "verifier" / "reward.json").read_text())
-    assert published.get("producer") == "judge_container", published
-
-
 def test_a_colon_in_the_path_is_refused_before_anything_runs(env, tmp_path):
     """Docker bind mounts are colon-delimited, so a checkout or jobs dir with a
     ":" in its name cannot be mounted -- compose says "too many colons" and the
@@ -415,76 +289,29 @@ def test_a_colon_in_the_path_is_refused_before_anything_runs(env, tmp_path):
     assert not env.harbor_argv() or env.harbor_argv() == [""], "harbor was invoked anyway"
 
 
-# --- the judge overlay -------------------------------------------------------
-# The judge service moved out of the bundle (it mounts the operator's codex
-# login, so it cannot ship) into tools/judge/overlay-judge-service.yaml, which
-# run_task.sh layers with --extra-docker-compose. These pin the routing: a
-# bundle that grades by judge but declares none gets the overlay; a bundle that
-# still declares its own is left exactly as it was; a bundle that never calls
-# the judge gets neither. Stage `harbor` only, so no image work and no
-# containers -- the stub harbor just records its argv.
+# --- no harness grader -------------------------------------------------------
+# Scoring is the bundle's own tests/, run by harbor in the verifier environment
+# the bundle declares. The harbor stage adds no judge service, no judge token,
+# and no compose overlay that reaches the verifier.
 
-_COMPOSE_NO_JUDGE = """\
+_COMPOSE_WITH_A_JUDGE_SERVICE = """\
 services:
   main:
-    command: ['sleep', 'infinity']
-  light-servers:
-    image: light-servers:latest
-"""
-
-# Declares the judge but not its credential: the shape the overlay exists for.
-_COMPOSE_JUDGE_NO_LOGIN = _COMPOSE_NO_JUDGE + """\
+    build: .
   judge:
-    image: codex-judge:latest
+    image: example/judge:1
 """
 
-# Older shape: mounts the host's codex login itself, so it needs no overlay.
-_COMPOSE_JUDGE_WITH_LOGIN = _COMPOSE_NO_JUDGE + """\
-  judge:
-    image: codex-judge:latest
-    volumes:
-      - '${CODEX_AUTH_FILE:?}:/run/codex-auth/auth.json:ro'
-"""
 
-_TEST_SH_CALLS_JUDGE = "#!/bin/sh\npython3 /harness/scoring/judge_client.py --trajectory t\n"
-_TEST_SH_NO_JUDGE = "#!/bin/sh\npython3 -m pytest /tests\n"
-
-_OVERLAY = "tools/judge/overlay-judge-service.yaml"
-
-
-def _shape_bundle(env, compose: str, test_sh: str) -> None:
-    """Give the fixture's task dir the two files the judge routing reads."""
-    # No `image =` key: that one is read by stage_preflight, which these tests
-    # do not run, and a bogus tag there would only ever confuse a failure.
+@requires_docker
+def test_the_harbor_stage_adds_no_grader_of_its_own(env):
     (env.task_dir / "task.toml").write_text('name = "acme/alpha"\n')
     (env.task_dir / "environment").mkdir(exist_ok=True)
-    (env.task_dir / "environment" / "docker-compose.yaml").write_text(compose)
+    (env.task_dir / "environment" / "docker-compose.yaml").write_text(_COMPOSE_WITH_A_JUDGE_SERVICE)
     (env.task_dir / "tests").mkdir(exist_ok=True)
-    (env.task_dir / "tests" / "test.sh").write_text(test_sh)
-
-
-@requires_docker
-def test_a_judge_without_a_login_gets_one_from_the_overlay(env):
-    _shape_bundle(env, _COMPOSE_JUDGE_NO_LOGIN, _TEST_SH_CALLS_JUDGE)
-    env.run("harbor", AGENT="claude-code", N=1, NETWORK_ISOLATION_OFF="1")
-    argv = env.harbor_argv()
-    assert any(_OVERLAY in a for a in argv), (
-        f"no judge overlay in harbor argv; the judge would never go healthy: {argv}")
-
-
-@requires_docker
-def test_a_bundle_that_mounts_its_own_login_is_left_alone(env):
-    _shape_bundle(env, _COMPOSE_JUDGE_WITH_LOGIN, _TEST_SH_CALLS_JUDGE)
-    env.run("harbor", AGENT="claude-code", N=1, NETWORK_ISOLATION_OFF="1")
-    argv = env.harbor_argv()
-    assert not any(_OVERLAY in a for a in argv), (
-        "the overlay was layered onto a bundle that mounts the login itself; "
-        f"the mount would be declared twice: {argv}")
-
-
-@requires_docker
-def test_a_bundle_that_never_calls_the_judge_gets_no_overlay(env):
-    _shape_bundle(env, _COMPOSE_NO_JUDGE, _TEST_SH_NO_JUDGE)
-    env.run("harbor", AGENT="claude-code", N=1, NETWORK_ISOLATION_OFF="1")
-    argv = env.harbor_argv()
-    assert not any(_OVERLAY in a for a in argv), argv
+    (env.task_dir / "tests" / "test.sh").write_text("#!/bin/sh\npython3 /tests/grade.py\n")
+    r = env.run("harbor", AGENT="claude-code", N=1)
+    assert r.returncode == 0, r.stderr
+    argv = " ".join(env.harbor_argv())
+    for forbidden in ("judge", "JUDGE_TOKEN", "--verifier-env", "egress-proxy", "scoring"):
+        assert forbidden not in argv, f"{forbidden!r} in harbor argv: {argv}"

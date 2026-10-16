@@ -48,18 +48,6 @@ def _load_delivery():
 md = _load_delivery()
 
 
-def _load_host_rubric():
-    spec = importlib.util.spec_from_file_location(
-        "host_rubric_pass", _SCRIPTS / "host_rubric_pass.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-hrp = _load_host_rubric()
-
-
 def _build_job(
     tmp_path: Path, per_trial: list[dict], trial_reward: dict | None = None,
     agent_cost: float | None = None,
@@ -202,18 +190,10 @@ def test_container_supplied_zero_reason_is_not_overwritten(tmp_path):
 
 
 def test_nonzero_reward_carries_no_zero_reason(tmp_path):
-    """Only a zero needs explaining; a scored run must not gain a spurious field.
-
-    `producer` is load-bearing and was not always required. harbor_to_output.py
-    :672-679 trusts a reward only from "host_rubric_pass" or "container_test";
-    anything else is warned about and forced to reward=0 as unscored. Without it
-    the 0.75 below is zeroed, the zero_reason guard fires correctly, and this
-    test fails while appearing to be about zero_reason rather than about a
-    reward that never survived. The sibling tests hide it by supplying 0.0.
-    """
+    """Only a zero needs explaining; a scored run must not gain a spurious field."""
     detail = _convert_with_trial_reward(
         tmp_path, {"reward": 0.75, "completion_rate": 0.9, "misbehave_rate": 0.0,
-                   "scored": True, "producer": "host_rubric_pass"}
+                   "scored": True}
     )
     assert "zero_reason" not in detail
 
@@ -592,36 +572,52 @@ def test_an_empty_only_trials_converts_nothing(tmp_path):
     assert h2o.convert_job(job, out, ks=[], run_offset=0, only_trials=set()) == []
 
 
-def test_judge_container_reward_publishes_like_the_host_ledger(tmp_path):
-    """producer=judge_container is stamped by a bundle whose own reward already
-    includes the rubric its judge container graded. It must publish exactly as a
-    host-pass ledger does -- rescaled and scored -- not be zeroed as unscored,
-    which is what any producer the reshaper does not know gets."""
+def test_the_bundles_own_reward_publishes_whatever_its_producer(tmp_path):
+    """The reward is the bundle's verifier's, published as-is and rescaled.
+
+    The reshaper used to trust only rewards stamped by a harness grader and
+    zeroed every other one as unscored, which made the bundle's own tests/
+    unable to score a run without the harness re-grading it. No producer label
+    may change the number now: a stamped one, an unknown one, and none at all
+    publish the same reward.
+    """
     published = {}
-    for producer in ("host_rubric_pass", "judge_container"):
-        root = tmp_path / producer
+    for producer in ("judge_container", "something_new", None):
+        root = tmp_path / str(producer)
         root.mkdir()
+        reward = {"reward": 0.75, "completion_rate": 0.9, "misbehave_rate": 0.0}
+        if producer:
+            reward["producer"] = producer
         job, out = _build_job(
-            root, [{"completion_rate": 0.9, "misbehave_rate": 0.0, "reward": 0.0}],
-            {"reward": 0.75, "completion_rate": 0.9, "misbehave_rate": 0.0, "producer": producer},
-        )
+            root, [{"completion_rate": 0.9, "misbehave_rate": 0.0, "reward": 0.0}], reward)
         written = h2o.convert_job(job, out, ks=[], run_offset=0)
         assert written
         published[producer] = json.loads(
             (written[0] / "trajectory" / "run_1" / "verifier" / "reward.json").read_text())
-    assert published["judge_container"]["reward"] == published["host_rubric_pass"]["reward"] == 75.0
-    assert published["judge_container"].get("producer") == "judge_container"
+    assert {p: d["reward"] for p, d in published.items()} == {
+        "judge_container": 75.0, "something_new": 75.0, None: 75.0}
+    assert published["judge_container"]["producer"] == "judge_container"
+    assert published[None]["producer"] == "bundle_verifier"
+
+
+def test_a_verifier_with_no_numeric_reward_is_unscored_not_regraded(tmp_path):
+    """No reward from the bundle means no score -- never a harness-computed one."""
+    job, out = _build_job(
+        tmp_path, [{"completion_rate": 0.9, "misbehave_rate": 0.0, "reward": 0.0}],
+        {"completion_rate": 0.9, "misbehave_rate": 0.0})
+    written = h2o.convert_job(job, out, ks=[], run_offset=0)
+    assert written
+    reward = json.loads(
+        (written[0] / "trajectory" / "run_1" / "verifier" / "reward.json").read_text())
+    assert reward["producer"] == "unscored"
+    assert reward["unscored_reason"]
 
 
 def test_the_judge_markers_do_not_ship_in_the_published_run(tmp_path):
-    """The published tree keeps the shape it had before the judge container.
+    """Marker files beside the bundle's reward are folded in, not shipped.
 
-    judge_container.json, reward_producer.json and judge-container-test.txt are
-    read while the run is still going -- the in-container check during the
-    verifier, then adopt_container_reward and host_rubric_pass in
-    stage_host_rubric, which runs before this converter. What has to outlive the
-    run is already folded in: reward.json keeps `producer`, the judge's usage
-    stays in judge_tokens.json.
+    What has to outlive the run is already carried: reward.json keeps
+    `producer`, the judge's usage stays in judge_tokens.json.
     """
     job, out = _build_job(
         tmp_path, [{"completion_rate": 0.9, "misbehave_rate": 0.0, "reward": 0.0}],

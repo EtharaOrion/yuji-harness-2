@@ -67,14 +67,20 @@ done
 # --- live-run guard ----------------------------------------------------------
 # A run_task.sh that is NOT one of the orphaned wrappers above, or a live
 # `harbor run`, means a trial is in flight and shares these bridges.
+#
+# Anchored to the program being run, not to any mention of it: an unanchored
+# `pgrep -f 'scripts/run_task.sh'` also matched an editor or agent session whose
+# argv merely quoted the path, and refused every teardown while it was open.
+LIVE_RUN_TASK_RE='^([^ ]*/)?(ba|z|da)?sh( -[^ ]+)* (.*/)?scripts/run_task\.sh( |$)|^([^ ]*/)?scripts/run_task\.sh( |$)'
+LIVE_HARBOR_RE='^([^ ]*/)?harbor run( |$)|^([^ ]*/)?python[0-9.]*( -[^ ]+)* ([^ ]*/)?harbor run( |$)'
 LIVE=()
 while read -r p; do
   [ -n "$p" ] || continue
   skip=0
   for w in "${WRAPPER_PIDS[@]:-}"; do [ "$p" = "$w" ] && skip=1; done
   [ "$skip" = 0 ] && LIVE+=("$p")
-done < <(pgrep -f 'scripts/run_task.sh' 2>/dev/null)
-while read -r p; do [ -n "$p" ] && LIVE+=("$p"); done < <(pgrep -f 'harbor run' 2>/dev/null)
+done < <(pgrep -f "$LIVE_RUN_TASK_RE" 2>/dev/null)
+while read -r p; do [ -n "$p" ] && LIVE+=("$p"); done < <(pgrep -f "$LIVE_HARBOR_RE" 2>/dev/null)
 
 if [ "${#LIVE[@]}" -gt 0 ] && [ "$FORCE" != 1 ]; then
   say "REFUSING: a run looks live. These bridges are shared machine-wide."
@@ -133,7 +139,7 @@ else
   # so containers are "<project>-<service>-1" and volumes "<project>_<name>".
   # Neither filter had matched anything for a long time, so this script was a
   # no-op on the very containers it exists to remove: a stuck light-servers held
-  # most of Docker's memory until every later run's egress-proxy was OOM-killed
+  # most of Docker's memory until later runs' containers were OOM-killed
   # (exit 137) and never started `main`, and dangling volumes leaked alongside.
   #
   # Containers are selected by COMPOSE LABEL rather than by name: harbor may
@@ -162,11 +168,9 @@ else
   # minus anything a surviving container still holds.
   #
   # The compose label alone is not enough, and this is where the rest of the
-  # leak lived. egress-proxy's base image (ubuntu/squid) declares
-  # VOLUME /var/log/squid and VOLUME /var/spool/squid, so every proxy container
-  # gets two volumes with 64-hex names and NO labels at all -- four per run,
-  # counting the judge's proxy. `docker compose down --volumes` takes them when
-  # a run ends normally. A run that is interrupted leaves them, and once their
+  # leak lived. An image that declares VOLUME gets volumes with 64-hex names and
+  # NO labels at all. `docker compose down --volumes` takes them when a run
+  # ends normally. A run that is interrupted leaves them, and once their
   # container is gone no label or name can attribute them to harbor again.
   #
   # So they are matched on shape instead: a 64-hex name is Docker's own marker

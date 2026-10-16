@@ -41,131 +41,18 @@ _TEXT_SUFFIXES = {".json", ".jsonl", ".txt", ".md", ".xml", ".yaml", ".yml",
                   ".log", ".toml", ".py", ".csv", ".html", ".cfg", ".ini"}
 
 # ---------------------------------------------------------------------------
-# Trees shipped with the bundle.
+# What of the bundle ships.
 #
-# Both images come from the private registry the compose file's `image:` tags
-# name, so no build context travels. The graders do: both containers bind-mount
-# them at /harness/scoring, and a delivered tree cannot reach the repo copy.
+# The public parts only, named explicitly: the task as a solver sees it and the
+# tests that score it. Copying the bundle directory wholesale also shipped every
+# tree the leak gate withholds, so nothing is copied that is not listed here.
+# The bundle grades itself: its tests/ run in its own verifier environment, and
+# the harness ships no grader of its own beside them.
+PUBLIC_BUNDLE_PARTS = ("task.toml", "instruction.md", "environment", "tests")
 
-
-class _Vendored(NamedTuple):
-    """A repo tree copied into the bundle's environment/ directory."""
-
-    name: str
-    source: Path
-
-
-_VENDORED = (
-    # the shared graders, mounted at /harness/scoring by main and the judge
-    _Vendored("scoring", REPO_ROOT / "services" / "scoring"),
+_BUNDLE_IGNORE = shutil.ignore_patterns(
+    "__pycache__", ".pytest_cache", "*.pyc", "*.pyo", ".DS_Store", ".env", "*.log",
 )
-
-# judge_backend.json holds the local codex-bridge API key (gitignored). It is
-# named here rather than assumed absent: shipping it once puts a live
-# credential in someone else's hands.
-_VENDOR_IGNORE = shutil.ignore_patterns(
-    "__pycache__", ".pytest_cache", "*.pyc", "*.pyo", ".DS_Store",
-    "judge_backend.json", ".env", "*.log",
-)
-
-# The graders are bound by a path relative to the compose file, three levels up,
-# which in a delivered tree is not the repo. Docker creates a missing bind
-# source silently, so the symptom is /harness/scoring existing and being empty:
-# test.sh exits 2 and no reward file is ever written.
-_SCORING_SRC = "../../../services/scoring"
-# A bundle authored in a lane root beside harness/ (staging/<uuid>/, delivery/,
-# samples/) reaches the same tree through harness/. Left unrewritten, it shipped
-# pointing outside the bundle while the compose header claimed ./scoring.
-_SCORING_SRC_LANE = "../../../harness/services/scoring"
-_SCORING_SRCS = (_SCORING_SRC_LANE, _SCORING_SRC)
-_SCORING_DST = "./scoring"
-
-_COMPOSE_NOTE = """\
-# Delivered bundle: tools/delivery_utils/make_delivery.py rewrote one path here
-# so this directory stands alone:
-#
-#   /harness/scoring binds ./scoring, not <repo>/services/scoring
-#
-# Both images are pulled from the registry their `image:` tag names. Any comment
-# below that discusses ../../../services describes the in-repo original, not
-# this file.
-
-"""
-
-# Shipped as environment/README.md. The compose file names variables with
-# compose's `:?` form, which aborts with a bare variable name and no hint of
-# where the value comes from, and scripts/run_task.sh supplied every one of them
-# without travelling with the bundle.
-_ENV_README = """\
-# Running this bundle
-
-Both images are pulled from the private registry the compose file names. Log in
-to it first, then:
-
-    docker compose up --detach --wait
-
-`light-servers` allows a 900s healthcheck start period, so `--wait` is doing its
-job while it looks stuck.
-
-## Variables the compose file requires
-
-| Variable | What to set it to |
-|---|---|
-{judge_rows}| `HOST_VERIFIER_LOGS_PATH` | absolute path to a host directory for this run's reports. Harbor sets it per trial; set it yourself for a manual run. |
-| `SCORING_DIR` | optional. Defaults to `./scoring`, shipped here. Point it elsewhere to grade with a different checkout of the graders. |
-
-## What runs where
-
-{where_main}
-{judge_where}`light-servers` serves the task world over MCP and is the state the graders
-read back at the end.
-"""
-
-
-_JUDGE_VAR_ROWS = (
-    "| `JUDGE_TOKEN` | any random secret, e.g. `export JUDGE_TOKEN=$(openssl rand -hex 32)`."
-    " It only has to match between the two containers of one run. |\n",
-    "| `CODEX_AUTH_FILE` | absolute path to your own Codex login, normally"
-    " `~/.codex/auth.json` after `codex login`. It is mounted read-only and is the only"
-    " credential the judge holds. This one cannot be shipped in any form. |\n",
-)
-
-# The judge ships, but its credential does not -- so it starts unhealthy and the
-# rubric is simply not graded. Say so, and say how to turn it back on.
-_JUDGE_WHERE_NO_LOGIN = (
-    "\n`judge` runs every scored channel (state dump, Channel A, rubric, ledger) and\n"
-    "writes its reports to `/logs/verifier`. It needs a Codex login, which no bundle\n"
-    "can ship: without one it reports unhealthy, nothing waits on it, and the rubric\n"
-    "channel is left out of the reward rather than scored zero. To grade it, mount\n"
-    "your own `auth.json` at `/run/codex-auth/auth.json` and set `JUDGE_TOKEN`.\n\n"
-)
-
-_README_WITH_JUDGE = {
-    "where_main": (
-        "`main` is the agent's container. It mounts no answer files: `tests/` goes to\n"
-        "the judge only."
-    ),
-    "judge_where": (
-        "\n`judge` runs every scored channel (state dump, Channel A, rubric, ledger) and\n"
-        "writes its reports to `/logs/verifier`.\n\n"
-    ),
-}
-
-# No judge in this bundle. The rubric channel is simply not graded here: the
-# harness scores it from the host, and services/scoring/tests/test_outputs.py
-# drops an unscored channel's weight from the divisor rather than counting it
-# zero. Say that plainly instead of leaving a recipient hunting for a container
-# their copy never declares.
-_README_NO_JUDGE = {
-    "where_main": (
-        "`main` is the agent's container, and the only one the tests run in. It mounts\n"
-        "no answer files."
-    ),
-    "judge_where": (
-        "\nThis bundle declares no `judge` service, so the rubric channel goes unscored\n"
-        "and is left out of the reward divisor. The deterministic channels still grade.\n\n"
-    ),
-}
 
 
 def _repo_needles() -> list[tuple[str, str]]:
@@ -174,7 +61,7 @@ def _repo_needles() -> list[tuple[str, str]]:
     _ANCHORED_RE only fires on a path whose tail starts at one of the five
     directories a delivered bundle points into. Everything else in the repo is
     invisible to it -- which is why `--extra-docker-compose` shipped as
-    `~/Downloads/.../harness/tools/network/egress-proxy/overlay.yaml` in every
+    `~/Downloads/.../harness/tools/openhands_agent/overlay.yaml` in every
     config.json we published. Anchoring on the repo root instead covers
     `tools/`, `services/`, `scripts/` and any directory added later.
 
@@ -268,114 +155,37 @@ def _build_judge_usage(tokens: dict) -> dict:
     }
 
 
-def _bundle_declares_judge(env_dir: Path) -> bool:
-    """Does this bundle's compose file name a judge service of its own?
-
-    Newer bundles do not: the judge mounts the operator's codex login, so the
-    service lives in the harness overlay (tools/judge/overlay-judge-service.yaml)
-    and never travels. The README says something different in each case."""
-    compose = env_dir / "docker-compose.yaml"
-    if not compose.is_file():
-        return False
-    return bool(re.search(r"^  judge:[ \t]*$", compose.read_text(encoding="utf-8"), re.M))
-
-
-def _vendor_trees(env_dir: Path) -> list[str]:
-    """Copy every _VENDORED tree into the bundle's environment/ directory."""
+def _copy_public_bundle(task_src: Path, dest: Path) -> list[str]:
+    """Copy PUBLIC_BUNDLE_PARTS of `task_src` into `dest`; return what shipped."""
+    dest.mkdir(parents=True)
     shipped: list[str] = []
-    for tree in _VENDORED:
-        if not tree.source.is_dir():
-            print(f"Warning: tree missing, not shipped: {tree.source}",
-                  file=sys.stderr)
+    for part in PUBLIC_BUNDLE_PARTS:
+        src = task_src / part
+        if src.is_dir():
+            shutil.copytree(src, dest / part, ignore=_BUNDLE_IGNORE)
+        elif src.is_file():
+            shutil.copy2(src, dest / part)
+        else:
             continue
-        # Replace rather than merge. make_delivery clears the bundle before it
-        # writes, so this only fires when the function is run again over a tree
-        # already packed, and a merge there would leave a file deleted from the
-        # repo sitting in the bundle for good.
-        dest = env_dir / tree.name
-        if dest.exists():
-            shutil.rmtree(dest)
-        shutil.copytree(tree.source, dest, ignore=_VENDOR_IGNORE)
-        shipped.append(tree.name)
-
-    # `main` builds from this directory and its Dockerfile COPYs nothing, so
-    # without this the trees above are uploaded to the daemon on every main
-    # build for no reason.
-    (env_dir / ".dockerignore").write_text(
-        "\n".join([
-            "# main builds from this directory and COPYs nothing from it.",
-            *(f"{name}/" for name in shipped),
-            "",
-        ]),
-        encoding="utf-8",
-    )
+        shipped.append(part)
     return shipped
 
 
-def _rewrite_compose(compose: Path, shipped: list[str]) -> None:
-    """Point the delivered compose at the trees _vendor_trees copied."""
+def _warn_stray_mounts(compose: Path) -> None:
+    """Name any compose line still reaching above the bundle.
+
+    Not rewritten, because only the author knows what the target held: a mount
+    of ../../../output resolves to delivery_output/ in a delivered tree and is
+    silently created empty by Docker rather than erroring. Said at pack time,
+    where it is cheap to fix.
+    """
     if not compose.is_file():
-        print(f"Warning: no docker-compose.yaml in {compose.parent}",
-              file=sys.stderr)
         return
-
-    text = compose.read_text(encoding="utf-8")
-    if "scoring" in shipped:
-        # Comment lines are left alone. Several bundles carry a paragraph
-        # explaining why the depth is exactly three levels, and rewriting the
-        # path inside that explanation turns it into nonsense. _COMPOSE_NOTE
-        # says which of the two the reader is looking at.
-        text = "".join(
-            line if line.lstrip().startswith("#")
-            else line.replace(_SCORING_SRC_LANE, _SCORING_DST).replace(_SCORING_SRC, _SCORING_DST)
-            for line in text.splitlines(keepends=True)
-        )
-        left = [ln for ln in text.splitlines()
-                if any(src in ln for src in _SCORING_SRCS) and not ln.lstrip().startswith("#")]
-        if left:
-            sys.exit(f"Error: {compose} still binds {_SCORING_SRC}: {left}")
-
-    # Anything else still reaching above the bundle. Not rewritten, because only
-    # the author knows what the target held: larkmoor mounts ../../../output on
-    # light-servers, which in a delivered tree resolves to delivery_output/ and
-    # is silently created empty by Docker rather than erroring. Say so at pack
-    # time, where it is cheap to fix.
-    stray = sorted({ln.strip() for ln in text.splitlines()
+    stray = sorted({ln.strip() for ln in compose.read_text(encoding="utf-8").splitlines()
                     if "../../../" in ln and not ln.lstrip().startswith("#")})
     for ln in stray:
         print(f"Warning: {compose} still points outside the bundle: {ln}",
               file=sys.stderr)
-
-    # The note goes under the canary header, not above it: the canary is the
-    # first thing a training-corpus scan looks for and it stays on line 2.
-    if _COMPOSE_NOTE.strip() in text:
-        compose.write_text(text, encoding="utf-8")
-        return
-    lines = text.splitlines(keepends=True)
-    cut = 0
-    while cut < len(lines) and (lines[cut].startswith("#") or not lines[cut].strip()):
-        cut += 1
-    compose.write_text("".join(lines[:cut]) + _COMPOSE_NOTE + "".join(lines[cut:]),
-                       encoding="utf-8")
-
-
-def _write_env_readme(env_dir: Path, shipped: list[str]) -> None:
-    """One page on how to bring the bundle up without this repo."""
-    if not shipped:
-        return
-    declares_judge = _bundle_declares_judge(env_dir)
-    filling = dict(_README_WITH_JUDGE if declares_judge else _README_NO_JUDGE)
-    compose = env_dir / "docker-compose.yaml"
-    compose_text = compose.read_text(encoding="utf-8") if compose.is_file() else ""
-    # Document only the variables this compose actually reads. A bundle whose
-    # judge takes its login from the harness overlay names no CODEX_AUTH_FILE,
-    # and a row telling the recipient to set one sends them hunting for a mount
-    # that is not there.
-    filling["judge_rows"] = "".join(
-        row for row in _JUDGE_VAR_ROWS if row.split("`")[1] in compose_text)
-    if declares_judge and "CODEX_AUTH_FILE" not in compose_text:
-        filling["judge_where"] = _JUDGE_WHERE_NO_LOGIN
-    (env_dir / "README.md").write_text(_ENV_README.format(**filling), encoding="utf-8")
 
 
 def make_delivery(
@@ -413,27 +223,12 @@ def make_delivery(
                 task_src = hit
                 break
     if task_src.exists():
-        shutil.copytree(
-            task_src,
-            dst / "data",
-            ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc", "*.pyo"),
-        )
+        shipped = _copy_public_bundle(task_src, dst / "data")
+        print(f"[delivery] bundle parts shipped: {', '.join(shipped) or 'none'}")
+        _warn_stray_mounts(dst / "data" / "environment" / "docker-compose.yaml")
     else:
         print(f"Warning: task dir not found: {task_src}", file=sys.stderr)
         (dst / "data").mkdir()
-
-    # Make the bundle gradeable away from this repo: ship the graders it mounts
-    # and repoint the compose file at that copy.
-    env_dir = dst / "data" / "environment"
-    if env_dir.is_dir():
-        shipped = _vendor_trees(env_dir)
-        _rewrite_compose(env_dir / "docker-compose.yaml", shipped)
-        _write_env_readme(env_dir, shipped)
-        print(f"[delivery] trees shipped: {', '.join(shipped) or 'none'}")
-    else:
-        print(f"Warning: no environment/ under {task_src}; the bundle ships "
-              f"without the graders and cannot grade elsewhere",
-              file=sys.stderr)
 
     traj_src = src / "trajectory"
     traj_dst = dst / "trajectory"
@@ -471,8 +266,8 @@ def make_delivery(
         if (run_dir / "config.json").exists():
             _copy_masked(run_dir / "config.json", dst_run / "config.json")
         judge_tokens = _load(run_dir / "verifier" / "judge_tokens.json", {})
-        # rubric_judge_cli writes judge_tokens.json as a LIST of per-call
-        # entries (one per codex exec); older judges wrote one dict. Merge a
+        # A bundle's judge may write judge_tokens.json as a LIST of per-call
+        # entries; older judges wrote one dict. Merge a
         # list into the dict shape _build_judge_usage expects: token counts
         # and cost sum across calls, model comes from the first entry.
         if isinstance(judge_tokens, list):

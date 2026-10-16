@@ -38,7 +38,6 @@ AGENT_DIR = REPO / "tools" / "openhands_agent"
 RUNNER = AGENT_DIR / "runner.py"
 RUN_TASK = REPO / "scripts" / "run_task.sh"
 RESHAPER = REPO / "tools" / "delivery_utils" / "harbor_to_output.py"
-PROXY_DIR = REPO / "tools" / "network" / "egress-proxy"
 
 
 def _load(name: str, path: Path):
@@ -637,8 +636,9 @@ def _dispatch(tmp_path: Path, port: int, **overrides) -> SimpleNamespace:
     (bin_dir / "harbor").chmod(0o755)
     args_file, env_file = tmp_path / "argv.txt", tmp_path / "env.txt"
     env = dict(os.environ)
-    for key in ("NETWORK_ISOLATION_OFF", "CC_MODE", "ANTHROPIC_BASE_URL", "AGENT",
-                "OPENHANDS_LLM_BASE_URL", "OPENHANDS_LLM_API_KEY"):
+    for key in ("NETWORK_ISOLATION_OFF", "GRADER_HEADROOM_ENABLED", "CC_MODE",
+                "ANTHROPIC_BASE_URL", "AGENT", "OPENHANDS_LLM_BASE_URL",
+                "OPENHANDS_LLM_API_KEY"):
         env.pop(key, None)
     env.update({
         "PATH": f"{bin_dir}:{env['PATH']}",
@@ -650,7 +650,7 @@ def _dispatch(tmp_path: Path, port: int, **overrides) -> SimpleNamespace:
         # has its own test below, against a real bridge and a fake upstream.
         "CCBRIDGE_SHARED": "1",
         "CCBRIDGE_PORT": str(port), "CCBRIDGE_SECRET": SECRET,
-        "AGENT_HEADROOM_ENABLED": "false", "GRADER_HEADROOM_ENABLED": "false",
+        "AGENT_HEADROOM_ENABLED": "false",
         "SKIP_IMAGE_REFRESH": "1",
     })
     for key, value in overrides.items():
@@ -676,13 +676,15 @@ def _overlays(run) -> list[str]:
 
 
 def test_openhands_is_the_default_and_goes_through_the_bridge(tmp_path, fake_bridge):
-    run = _dispatch(tmp_path, fake_bridge, NETWORK_ISOLATION_OFF="1")
+    run = _dispatch(tmp_path, fake_bridge)
     assert run.returncode == 0, run.stderr[-3000:]
     assert run.argv[run.argv.index("--agent") + 1] == "tools.openhands_agent.agent:OpenHandsAgent"
     assert run.argv[run.argv.index("--model") + 1] == "claude-opus-5"
     assert str(AGENT_DIR / "overlay.yaml") in _overlays(run)
-    # Open network: squid is not in the path, so its ccbridge config is not either.
-    assert not any("overlay-ccbridge" in o for o in _overlays(run))
+    # The bridge is on the host; harbor merges it into a closed agent allowlist.
+    allowed = [run.argv[i + 1] for i, a in enumerate(run.argv) if a == "--allow-agent-host"]
+    assert allowed == ["host.docker.internal"], run.argv
+    assert not any("egress" in o for o in _overlays(run)), _overlays(run)
     assert run.env["OPENHANDS_LLM_BASE_URL"] == f"http://host.docker.internal:{fake_bridge}"
     assert run.env["OPENHANDS_LLM_API_KEY"] == SECRET
     assert run.env["PYTHONPATH"].split(":")[0] == str(REPO)
@@ -692,23 +694,8 @@ def test_openhands_is_the_default_and_goes_through_the_bridge(tmp_path, fake_bri
     assert SECRET not in run.stdout + run.stderr, "the bridge secret was printed"
 
 
-@pytest.mark.skipif(not docker_is_usable(), reason="needs docker (egress-proxy image)")
-def test_isolation_adds_the_ccbridge_squid_config(tmp_path, fake_bridge):
-    run = _dispatch(tmp_path, fake_bridge)
-    assert run.returncode == 0, run.stderr[-3000:]
-    overlays = _overlays(run)
-    assert overlays.index(str(PROXY_DIR / "overlay.yaml")) < overlays.index(
-        str(PROXY_DIR / "overlay-ccbridge.yaml"))
-    assert f"squid also allows the ccbridge at host.docker.internal:{fake_bridge}" in run.stderr
-    # One config per invocation (concurrent runs have different bridge ports),
-    # removed when the invocation exits.
-    conf = Path(run.env["EGRESS_SQUID_CONF"])
-    assert conf.name.startswith("squid-") and not conf.exists()
-
-
 def test_agent_kwargs_come_from_the_openhands_env(tmp_path, fake_bridge):
-    run = _dispatch(tmp_path, fake_bridge, NETWORK_ISOLATION_OFF="1",
-                    OPENHANDS_MAX_ITERATIONS="42", OPENHANDS_REASONING_EFFORT="medium",
+    run = _dispatch(tmp_path, fake_bridge, OPENHANDS_MAX_ITERATIONS="42", OPENHANDS_REASONING_EFFORT="medium",
                     OPENHANDS_THINKING_DISPLAY="summarized", OPENHANDS_NUM_RETRIES="8")
     assert run.returncode == 0, run.stderr[-3000:]
     aks = [run.argv[i + 1] for i, a in enumerate(run.argv) if a == "--ak"]
@@ -717,7 +704,7 @@ def test_agent_kwargs_come_from_the_openhands_env(tmp_path, fake_bridge):
 
 
 def test_a_bridge_holding_another_secret_is_refused(tmp_path, fake_bridge):
-    run = _dispatch(tmp_path, fake_bridge, NETWORK_ISOLATION_OFF="1", CCBRIDGE_SECRET="wrong")
+    run = _dispatch(tmp_path, fake_bridge, CCBRIDGE_SECRET="wrong")
     assert run.returncode != 0
     assert "does not accept this harness's secret" in run.stderr
     assert not run.argv, "harbor ran against a bridge that would refuse every turn"
@@ -738,8 +725,7 @@ def test_a_machine_with_no_usable_login_fails_fast_with_the_reason(tmp_path):
     import time
     port = _free_port()
     started = time.monotonic()
-    run = _dispatch(tmp_path, port, NETWORK_ISOLATION_OFF="1",
-                    CLAUDE_CODE_CREDENTIALS="not-json", CCBRIDGE_START_TIMEOUT_SEC="120")
+    run = _dispatch(tmp_path, port, CLAUDE_CODE_CREDENTIALS="not-json", CCBRIDGE_START_TIMEOUT_SEC="120")
     assert run.returncode == 4, run.stderr[-3000:]
     assert "cannot load a Claude login" in run.stderr
     assert "not valid JSON" in run.stderr
@@ -798,7 +784,7 @@ def test_each_run_starts_and_stops_its_own_bridge(tmp_path, fake_anthropic):
     """The default lifecycle, end to end with the real bridge: a free port and a
     fresh secret for this run only, the live check routed through the bridge
     with the machine's token, and nothing left running afterwards."""
-    run = _dispatch(tmp_path, 0, NETWORK_ISOLATION_OFF="1", CCBRIDGE_SHARED="0",
+    run = _dispatch(tmp_path, 0, CCBRIDGE_SHARED="0",
                     CCBRIDGE_PORT=None, CCBRIDGE_SECRET=None,
                     CLAUDE_CODE_OAUTH_TOKEN=OAUTH_TOKEN,
                     CCBRIDGE_UPSTREAM=f"http://127.0.0.1:{fake_anthropic}")
@@ -822,7 +808,7 @@ def test_glm_runs_the_same_agent_through_zbridge(tmp_path, fake_anthropic):
     Anthropic protocol as the ccbridge, so only where the agent points changes;
     no ccbridge is started and the model defaults to glm-5.3."""
     # zbridge runs without auth (ensure_zbridge), so its stand-in answers anyone.
-    run = _dispatch(tmp_path, 1, NETWORK_ISOLATION_OFF="1", CC_MODE="zbridge",
+    run = _dispatch(tmp_path, 1, CC_MODE="zbridge",
                     ZB_PORT=str(fake_anthropic), ZB_ZAI_API_KEY="zai-test", MODEL=None,
                     CCBRIDGE_SHARED=None)
     assert run.returncode == 0, run.stderr[-3000:]
@@ -832,15 +818,12 @@ def test_glm_runs_the_same_agent_through_zbridge(tmp_path, fake_anthropic):
     assert "ccbridge" not in run.stdout.replace("zbridge", "")
 
 
-@pytest.mark.skipif(not docker_is_usable(), reason="needs docker (egress-proxy image)")
-def test_glm_under_isolation_opens_zbridge_not_the_ccbridge(tmp_path, fake_anthropic):
+def test_glm_allows_zbridge_on_the_host(tmp_path, fake_anthropic):
     run = _dispatch(tmp_path, 1, CC_MODE="zbridge", ZB_PORT=str(fake_anthropic),
                     ZB_ZAI_API_KEY="zai-test", MODEL=None, CCBRIDGE_SHARED=None)
     assert run.returncode == 0, run.stderr[-3000:]
-    overlays = _overlays(run)
-    assert str(PROXY_DIR / "overlay-zbridge.yaml") in overlays
-    assert str(PROXY_DIR / "overlay-ccbridge.yaml") not in overlays
-    assert f"acl zbridge_port port {fake_anthropic}" in Path(run.env["EGRESS_SQUID_CONF"]).read_text()
+    allowed = [run.argv[i + 1] for i, a in enumerate(run.argv) if a == "--allow-agent-host"]
+    assert allowed == ["host.docker.internal"], run.argv
 
 
 def test_a_job_with_claude_code_runs_warns_before_mixing_agents(tmp_path, fake_bridge):
@@ -848,13 +831,13 @@ def test_a_job_with_claude_code_runs_warns_before_mixing_agents(tmp_path, fake_b
     job.mkdir(parents=True)
     (job / "config.json").write_text(json.dumps(
         {"agents": [{"name": "claude-code", "model_name": "claude-opus-5"}]}))
-    run = _dispatch(tmp_path, fake_bridge, NETWORK_ISOLATION_OFF="1")
+    run = _dispatch(tmp_path, fake_bridge)
     assert run.returncode == 0, run.stderr[-3000:]
     assert "holds runs from agent 'claude-code'" in run.stderr
 
 
 def test_claude_code_is_still_dispatched_as_before(tmp_path, fake_bridge):
-    run = _dispatch(tmp_path, fake_bridge, NETWORK_ISOLATION_OFF="1", AGENT="claude-code")
+    run = _dispatch(tmp_path, fake_bridge, AGENT="claude-code")
     assert run.returncode == 0, run.stderr[-3000:]
     assert run.argv[run.argv.index("--agent") + 1] == "claude-code"
     assert not any("openhands_agent" in o for o in _overlays(run))
@@ -874,3 +857,12 @@ def test_overlay_mounts_the_runtime_read_only_and_withholds_the_token():
     sidecar = doc["services"]["openhands-runtime"]
     assert sidecar["network_mode"] == "none"
     assert "build" not in sidecar
+    # Harbor's egress sidecar runs main as `network_mode: service:<sidecar>`, and
+    # docker refuses extra_hosts on such a container, so the overlay applied to
+    # every openhands run must not carry it.
+    assert "extra_hosts" not in main
+
+
+def test_the_host_gateway_mapping_lives_in_its_own_overlay():
+    doc = yaml.safe_load((AGENT_DIR / "overlay-host-gateway.yaml").read_text())
+    assert doc["services"]["main"]["extra_hosts"] == ["host.docker.internal:host-gateway"]

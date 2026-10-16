@@ -244,7 +244,7 @@ def test_missing_trajectory_does_not_block(tmp_path):
 #
 # The command line says the model reached for an index; the response says
 # whether it got there. Both block, but only the second is a breach, and the
-# response is the only witness that survives a run with no proxy log.
+# response is the only witness that survives every run, whatever its policy.
 
 def bash_out(cmd, out):
     return {"tool": "Bash", "arguments": {"command": cmd}, "response": out}
@@ -281,7 +281,7 @@ def test_successful_install_is_a_breach(out, tmp_path):
 
 
 def test_denied_install_is_an_attempt_not_a_breach(tmp_path):
-    """The proxy refusing pip is the block WORKING. It still blocks the run --
+    """The network refusing pip is the block WORKING. It still blocks the run --
     reaching for an index is disqualifying here -- but calling it a breach
     sends an operator hunting a leak that never happened."""
     audit = tmp_path / "audit.json"
@@ -392,32 +392,9 @@ def test_a_run_with_no_findings_is_clean_not_unverified(tmp_path):
     assert json.loads(out.read_text())["verdict"] == "no_attempt"
 
 
-def test_proxy_findings_without_a_trajectory_are_setup_not_the_model(tmp_path):
-    """An aborted trial leaves a proxy log and no trajectory. The requests in it
-    were made by harbor's setup before the agent ran, so naming the model sends
-    an operator to a transcript that does not exist."""
-    alog = tmp_path / "egress-access.log"
-    alog.write_text(
-        "1788890425.161 0 192.168.158.4 TCP_DENIED/403 3490 GET "
-        "http://deb.debian.org/debian/dists/trixie/InRelease - HIER_NONE/- text/html\n")
-    out = tmp_path / "audit.json"
-    r = subprocess.run(
-        [sys.executable, str(DETECT), str(tmp_path / "absent.json"),
-         "--access-log", str(alog), "--json", str(out)],
-        capture_output=True, text=True)
-    # Denied setup traffic is not the model's doing and no longer withholds
-    # delivery on its own -- the trial that produced it has no trajectory, so it
-    # already failed for other reasons. It is still reported, and --strict still
-    # blocks on it.
-    assert r.returncode == 0, r.stdout
-    data = json.loads(out.read_text())
-    assert data["verdict"] == "setup_traffic", data
-    assert data["tool_calls"] == 0
-
-
 def test_unverified_still_means_unverified_with_a_trajectory(tmp_path):
     """The new words must not swallow the old one: a real tool call with no
-    proxy log is still the claim we cannot make."""
+    enforced closed policy is still the claim we cannot make."""
     out = tmp_path / "audit.json"
     run([bash("curl https://evil.test")], "--json", str(out), tmp_path=tmp_path)
     assert json.loads(out.read_text())["verdict"] == "attempt_unverified"
@@ -507,7 +484,7 @@ def test_the_evidence_line_is_not_empty(tmp_path):
     assert "added 102 packages in 38s" in finding["evidence"], finding
 
 
-def test_suppressed_output_is_a_breach_with_no_proxy(tmp_path):
+def test_suppressed_output_is_a_breach_with_no_enforced_policy(tmp_path):
     """No marker is not the same as no install.
 
     With nothing in the path to refuse it and the only other witness piped away
@@ -522,20 +499,15 @@ def test_suppressed_output_is_a_breach_with_no_proxy(tmp_path):
     assert data["verdict"] == "reached_internet", data
 
 
-def test_suppressed_output_is_only_denied_when_the_proxy_says_so(tmp_path):
-    """A proxy log outranks the inference: squid saw everything, and it refused."""
-    alog = tmp_path / "egress-access.log"
-    alog.write_text(
-        "1757500000.000 100 172.20.0.3 TCP_DENIED/403 400 CONNECT pypi.org:443 - HIER_NONE/- text/html\n"
-        "1757500001.000 200 172.20.0.3 TCP_TUNNEL/200 900 CONNECT api.anthropic.com:443 - ORIGINAL_DST/- -\n"
-    )
+def test_suppressed_output_is_blocked_under_an_enforced_closed_policy(tmp_path):
+    """Harbor refused the connection, so the piped-away install had nowhere to go."""
     audit = tmp_path / "audit.json"
     traj = tmp_path / "t.json"
     traj.write_text(json.dumps(
         {"steps": [bash_out("pip install --quiet pandas 2>&1 | tail -2", "")]}))
     subprocess.run(
         [sys.executable, str(DETECT), str(traj),
-         "--access-log", str(alog), "--json", str(audit)],
+         "--enforced-policy", "allowlist", "--json", str(audit)],
         capture_output=True, text=True,
     )
     assert json.loads(audit.read_text())["verdict"] == "attempt_blocked"
@@ -576,8 +548,8 @@ def test_a_real_run_with_tool_calls_is_still_clean(tmp_path):
 # did it not try -- plus the two that describe a run that did not happen. The
 # old vocabulary spent three words (denied / unverified / setup) on the middle
 # state and had none for the one that now happens most: the PreToolUse hook
-# refused the command, so it never ran and the proxy never saw it. The report
-# said "the egress proxy refused every attempt", naming a component that was
+# refused the command, so it never ran and the network never saw it. The report
+# said that the network refused every attempt, naming a component that was
 # not involved.
 
 HOOK_REFUSAL = (
@@ -606,8 +578,8 @@ def test_hook_refusal_is_a_warning_and_still_delivers(tmp_path):
     assert data["attempted_internet"] is True and data["reached_internet"] is False
     assert r.returncode == 0, r.stdout
     assert "egress guard" in data["summary"], data["summary"]
-    # And the proxy must not be credited with work it did not do.
-    assert "proxy" not in data["summary"], data["summary"]
+    # And the network must not be credited with work it did not do.
+    assert "policy" not in data["summary"], data["summary"]
 
 
 def test_hook_refusal_never_reads_as_an_install(tmp_path):
@@ -621,8 +593,8 @@ def test_hook_refusal_never_reads_as_an_install(tmp_path):
 def test_attempt_with_no_witness_is_not_called_blocked(tmp_path):
     """"Nothing left the sandbox" is a claim and it needs a witness.
 
-    No hook refusal and no proxy log means there was no egress proxy in the path
-    at all -- the run was not isolated. That is the shape of the run that
+    No hook refusal and no enforced closed policy means nothing bounded the run.
+    That is the shape of the run that
     started all of this: it audited as "unverified", shipped, and had in fact
     installed Pillow, puppeteer and chromium from the open web.
     """
@@ -630,18 +602,24 @@ def test_attempt_with_no_witness_is_not_called_blocked(tmp_path):
     assert data["verdict"] == "attempt_unverified", data
     assert data["severity"] == "fail", data
     assert r.returncode == 2, r.stdout
-    assert "not isolated" in data["summary"], data["summary"]
+    assert "no enforced closed policy" in data["summary"], data["summary"]
 
 
-def test_proxy_log_is_witness_enough(tmp_path):
-    """squid saw every packet and let nothing out, so "blocked" is provable."""
-    alog = tmp_path / "egress-access.log"
-    alog.write_text(
-        "1757500000.000 100 172.20.0.3 TCP_DENIED/403 400 CONNECT pypi.org:443 - HIER_NONE/- text/html\n")
+@pytest.mark.parametrize("policy", ["allowlist", "no-network"])
+def test_an_enforced_closed_policy_is_witness_enough(policy, tmp_path):
+    """Harbor refuses a trial whose policy it cannot enforce, so a run that
+    happened under a closed agent policy was bounded by it: "blocked" is provable."""
     data, r = verdict_of([bash("pip install pandas")],
-                         "--access-log", str(alog), tmp_path=tmp_path)
+                         "--enforced-policy", policy, tmp_path=tmp_path)
     assert data["verdict"] == "attempt_blocked", data
     assert r.returncode == 0, r.stdout
+
+
+def test_a_public_policy_is_no_witness(tmp_path):
+    data, r = verdict_of([bash("pip install pandas")],
+                         "--enforced-policy", "public", tmp_path=tmp_path)
+    assert data["verdict"] == "attempt_unverified", data
+    assert r.returncode == 2, r.stdout
 
 
 def test_strict_restores_the_old_policy(tmp_path):
@@ -650,32 +628,11 @@ def test_strict_restores_the_old_policy(tmp_path):
     assert r.returncode == 2, r.stdout
 
 
-def test_the_proxy_line_names_its_hosts(tmp_path):
-    """"28 requests, 0 denied" reads the same whether the proxy allowed only
-    api.anthropic.com or allowed everything. The hosts settle it."""
-    alog = tmp_path / "egress-access.log"
-    alog.write_text(
-        "1757500001.000 200 172.20.0.3 TCP_TUNNEL/200 900 CONNECT api.anthropic.com:443 - ORIGINAL_DST/- -\n")
-    data, r = verdict_of([bash("ls /workspace")], "--access-log", str(alog),
+def test_the_policy_line_names_the_enforced_mode(tmp_path):
+    data, r = verdict_of([bash("ls /workspace")], "--enforced-policy", "allowlist",
                          tmp_path=tmp_path)
-    assert data["proxy"]["hosts"] == ["api.anthropic.com"], data
-    assert "api.anthropic.com" in r.stdout, r.stdout
-
-
-def test_zbridge_through_squid_is_allowed_only_with_proxy_allow(tmp_path):
-    """GLM runs reach zbridge on the host through squid. run_task.sh passes
-    --proxy-allow for them; without it the same line is a breach."""
-    alog = tmp_path / "egress-access.log"
-    alog.write_text(
-        "1757500002.000 900 172.20.0.3 TCP_MISS/200 1200 POST "
-        "http://host.docker.internal:8766/v1/messages - HIER_DIRECT/0.250.250.254 text/event-stream\n")
-    data, _ = verdict_of([bash("ls /workspace")], "--access-log", str(alog), tmp_path=tmp_path)
-    assert "allowlist-breach" in [f["kind"] for f in data["findings"]], data
-
-    data, r = verdict_of([bash("ls /workspace")], "--access-log", str(alog),
-                         "--proxy-allow", "host.docker.internal", tmp_path=tmp_path)
-    assert data["findings"] == [], data
-    assert r.returncode == 0, r.stdout
+    assert data["enforced_policy"] == "allowlist", data
+    assert "agent phase: allowlist" in r.stdout, r.stdout
 
 
 def test_a_reached_run_still_fails(tmp_path):

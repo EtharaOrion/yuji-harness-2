@@ -31,7 +31,7 @@ harbor's own upload without a single escaping question.
 WHY THE MATCHER LISTS THE WEB TOOLS TOO
 
 They are usually already gone -- run_task.sh passes --disallowedTools
-WebSearch,WebFetch under isolation, so they never reach the tool list. The
+WebSearch,WebFetch when the task closes the agent phase, so they never reach the tool list. The
 matcher names them anyway so that a run configured without that flag (a hand
 `harbor run`, DISALLOWED_TOOLS set empty) still refuses them rather than
 silently allowing what the other layer was carrying.

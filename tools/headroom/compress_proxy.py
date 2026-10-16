@@ -206,7 +206,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "agent-compress"
 
-    def log_message(self, *args):  # the access log is squid's job
+    def log_message(self, *args):  # no per-request access log
         pass
 
     def do_GET(self):

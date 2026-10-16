@@ -1,8 +1,7 @@
 """Credentials: does the harness know a login WORKS, or only that a file exists?
 
 Every check here used to answer the second question. A token string that had
-expired, a codex login that had lapsed, a z.ai key that was rejected -- all three
-printed "OK" at second zero and failed twenty minutes later, inside a paid trial,
+expired, a z.ai key that was rejected -- both printed "OK" at second zero and failed twenty minutes later, inside a paid trial,
 looking like a bad agent rather than a bad credential.
 
 The rule these pin: a refusal needs a POSITIVE fact. Expired is a fact. "Not
@@ -76,32 +75,6 @@ def test_an_unreadable_expiry_is_no_opinion(value):
     Treating "I cannot tell" as "expired" would refuse working credentials."""
     r = _expiry_probe(value)
     assert "ALLOW" in r.stdout, r.stdout + r.stderr
-
-
-# ---------------------------------------------------------------- codex login
-
-def _codex_probe(**env) -> subprocess.CompletedProcess:
-    return _bash(_fn("check_codex_login")
-                 + '\nif check_codex_login; then echo ALLOW; else echo REFUSE; fi', **env)
-
-
-@pytest.mark.skipif(not __import__("shutil").which("codex"), reason="codex not installed")
-def test_a_logged_out_codex_is_refused(tmp_path):
-    """`codex login status` is the only thing that knows. auth.json being
-    non-empty was what the harness checked, and an expired login passes that."""
-    r = _codex_probe(CODEX_HOME=str(tmp_path))
-    assert "REFUSE" in r.stdout, r.stdout + r.stderr
-    assert "not logged in" in r.stderr.lower()
-
-
-def test_a_codex_that_cannot_be_asked_does_not_block(tmp_path):
-    """A CLI that is missing, slow or shouting about something else is unknown,
-    not logged out. Refusing here would block every machine with an odd PATH."""
-    r = _bash(_fn("check_codex_login")
-              + '\nif check_codex_login; then echo ALLOW; else echo REFUSE; fi',
-              PATH="/usr/bin:/bin")
-    assert "ALLOW" in r.stdout, r.stdout + r.stderr
-    assert "could not confirm" in r.stderr
 
 
 # ------------------------------------------------------------------- zbridge
@@ -206,56 +179,3 @@ def test_no_credentials_at_all_warns_rather_than_crashing(tmp_path):
                        env=env, timeout=60)
     assert "RC=0" in r.stdout, r.stdout + r.stderr
     assert "no CLAUDE_CODE_OAUTH_TOKEN" in r.stderr
-
-
-# ------------------------------------------------- what `codex login status` misses
-#
-# Measured on codex-cli in the judge image and on the host:
-#
-#   no auth.json          rc=1  "Not logged in"
-#   {"tokens": null}      rc=0  "Logged in using ChatGPT"     <- wrong
-#   {}                    rc=0  "Logged in using ChatGPT"     <- wrong
-#   malformed id_token    rc=1  "Error checking login status: invalid ID token"
-#
-# So the CLI only really detects a MISSING file. codex_auth_is_empty reads the
-# one fact it misses, from the file, with no network call.
-
-def _empty_probe(text: str, tmp_path) -> bool:
-    f = tmp_path / "auth.json"
-    f.write_text(text)
-    r = _bash(_fn("codex_auth_is_empty")
-              + f'\nif codex_auth_is_empty "{f}"; then echo EMPTY; else echo HAS; fi')
-    return "EMPTY" in r.stdout
-
-
-@pytest.mark.parametrize("text", ['{}', '{"tokens": null}',
-                                  '{"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": null}'])
-def test_a_credential_file_with_no_credential_is_caught(text, tmp_path):
-    assert _empty_probe(text, tmp_path)
-
-
-@pytest.mark.parametrize("text", [
-    '{"tokens": {"access_token": "x"}}',
-    '{"OPENAI_API_KEY": "sk-x", "tokens": null}',
-])
-def test_a_real_credential_is_not_called_empty(text, tmp_path):
-    assert not _empty_probe(text, tmp_path)
-
-
-@pytest.mark.parametrize("text", ['not json at all', '[]', '{"tokens": "a string"}'])
-def test_a_shape_it_does_not_recognise_says_nothing(text, tmp_path):
-    """Silence, not refusal. Guessing at an unfamiliar credential format would
-    block runs whose login is perfectly good."""
-    assert not _empty_probe(text, tmp_path)
-
-
-def test_the_real_host_credential_passes():
-    """The check has to agree with the machine it runs on, or it is useless."""
-    import json
-    auth = Path(os.environ.get("CODEX_AUTH_FILE",
-                               Path.home() / ".codex" / "auth.json"))
-    if not auth.is_file():
-        pytest.skip("no codex login on this machine")
-    r = _bash(_fn("codex_auth_is_empty")
-              + f'\nif codex_auth_is_empty "{auth}"; then echo EMPTY; else echo HAS; fi')
-    assert "HAS" in r.stdout, r.stdout + r.stderr

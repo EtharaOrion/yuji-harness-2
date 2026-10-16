@@ -760,7 +760,7 @@ def main(argv: list[str] | None = None) -> int:
 
     os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
     # LiteLLM fetches its price map and Anthropic beta-header table from
-    # raw.githubusercontent.com when imported. Under isolation squid denies
+    # raw.githubusercontent.com when imported. A closed agent phase denies
     # that host, and the internet audit (tools/network/detect_internet_use.py)
     # rightly reports raw.githubusercontent.com as a content host the run tried
     # to reach. The bundled copies are what the pinned runtime was built with.

@@ -17,6 +17,7 @@ The docker-backed tests prove the behaviour end to end. The rest are structural,
 and cheap enough to catch a revert.
 """
 import os
+import re
 import signal
 import subprocess
 import time
@@ -233,3 +234,42 @@ echo REACHED_THE_END
     assert "REACHED_THE_END" not in text, "walked on past the interrupt"
     assert CONTAINER not in _names(), text
     assert VOLUME not in _volumes(), text
+
+
+# --- what counts as a live run -------------------------------------------------
+# pgrep -f matched any process whose argv merely MENTIONED scripts/run_task.sh --
+# an editor, or an agent session whose prompt quoted the path -- and refused
+# every teardown while it was open. The patterns are lifted out of the script
+# and matched against command lines, so the test needs no live processes.
+
+def _live_patterns() -> tuple[str, str]:
+    body = STOP_HARNESS.read_text()
+    run_task = re.search(r"^LIVE_RUN_TASK_RE='([^']+)'", body, re.M)
+    harbor = re.search(r"^LIVE_HARBOR_RE='([^']+)'", body, re.M)
+    assert run_task and harbor, "live-run patterns not found in stop_harness.sh"
+    return run_task.group(1), harbor.group(1)
+
+
+def _matches(pattern: str, cmdline: str) -> bool:
+    return subprocess.run(["grep", "-Eq", pattern], input=cmdline, text=True).returncode == 0
+
+
+@pytest.mark.parametrize("cmdline,live", [
+    ("bash scripts/run_task.sh tasks/x", True),
+    ("/bin/bash /Users/a/yuji copy/harness/scripts/run_task.sh tasks/x", True),
+    ("/x/harness/scripts/run_task.sh tasks/y", True),
+    ("opencode run --auto please run scripts/run_task.sh", False),
+    ("vim scripts/run_task.sh", False),
+])
+def test_only_a_running_run_task_is_live(cmdline, live):
+    assert _matches(_live_patterns()[0], cmdline) is live, cmdline
+
+
+@pytest.mark.parametrize("cmdline,live", [
+    ("/u/.local/bin/harbor run -y --path t", True),
+    ("/u/venv/bin/python3 /u/venv/bin/harbor run -y", True),
+    ("an agent prompt that says harbor run x", False),
+    ("harbor runs", False),
+])
+def test_only_a_running_harbor_is_live(cmdline, live):
+    assert _matches(_live_patterns()[1], cmdline) is live, cmdline

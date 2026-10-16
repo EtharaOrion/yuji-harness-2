@@ -46,10 +46,6 @@ services:
         condition: service_started
     volumes:
       - openhands_runtime:/opt/openhands-runtime:ro
-    extra_hosts:
-      # The ccbridge listens on the host. Most bundles already declare this;
-      # restated so one that does not still reaches the model.
-      - "host.docker.internal:host-gateway"
     environment:
       # Several bundles hand main the host's Claude OAuth token because the
       # claude-code agent authenticates with it. OpenHands never does -- its

@@ -447,16 +447,11 @@ PRUNE_FROM_OUTPUT = ("trial.log", "lock.json")
 
 # junit.xml is read during reshaping (legacy jobs whose CTRF has no other
 # source, see _junit_to_ctrf) and dropped afterwards. Tasks now emit
-# verifier/ctrf.json directly via services/scoring/ctrf_pytest_plugin.py, so no
-# new run produces this file at all — the prune only catches older job dirs.
-# The judge container's own markers. Every reader of these has already run by
-# the time a trial is published: the in-container check (tests/test.sh step 3)
-# reads them during the verifier, and run_task.sh's adopt_container_reward and
-# host_rubric_pass read them from the trial dir in stage_host_rubric, which runs
-# before this converter. What they carry that outlives the run is already
-# folded in -- reward.json keeps `producer`, and the judge's usage stays in
-# judge_tokens.json -- so dropping them keeps the published tree the shape it
-# had before the judge container existed.
+# verifier/ctrf.json directly from their own tests/, so a newer job may never
+# produce this file -- the prune only catches older job dirs.
+# Marker files a bundle's verifier may write beside its reward. reshape_trial
+# folds the producer into the published reward.json, and the judge's usage
+# stays in judge_tokens.json, so the markers themselves are not published.
 JUDGE_MARKERS = ("judge_container.json", "reward_producer.json",
                  "judge-container-test.txt")
 
@@ -536,8 +531,8 @@ def _norm_ledger(doc: dict) -> dict:
     """Round a detail.json ledger's numbers to the published precision.
 
     detail.json has two writers. _build_detail (below) makes one here and
-    already rounds; weighted_judge.write_verifier_artifacts makes the other
-    inside the task container, straight off the scoring floats, and that copy
+    already rounds; a bundle's own tests may write the other inside the
+    verifier, straight off the scoring floats, and that copy
     is published verbatim when it exists. Normalising at the publish point
     covers both without touching the numbers the container grades with.
     """
@@ -848,8 +843,8 @@ def classify_failure(passed: bool, traj_rows: list[dict], rubric_rows: list[dict
     if rubric_expected and not rubric_rows:
         detail = f"; trajectory tests also missed: {', '.join(missed)}" if missed else ""
         return "grader_incomplete", (
-            "rubric judge produced no verdicts (check verifier stdout for a missing "
-            "/harness/scoring mount or a judge error); answer quality is UNKNOWN" + detail)
+            "rubric judge produced no verdicts (check the bundle's verifier stdout "
+            "for a judge error); answer quality is UNKNOWN" + detail)
     if missed and not rub_miss:
         return "tool_discipline", f"answer correct but required tool step(s) missing: {', '.join(missed)}"
     if rub_miss and not missed:
@@ -1142,45 +1137,24 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     except Exception:
         _orig_rew = {}
 
-    _producer = _orig_rew.get("producer")
-    if _producer not in ("host_rubric_pass", "judge_container", "container_test"):
+    # The reward is the bundle's own: Harbor ran the bundle's tests/ in its
+    # verifier and recorded what they wrote. It is published as-is, scaled to a
+    # percentage, and NEVER recomputed or substituted here -- the harness carries
+    # no grading logic. A trial whose verifier wrote no numeric reward is
+    # unscored, not zero and not an average of channels.
+    _marker = _load(ver / "reward_producer.json", {}) if (ver / "reward_producer.json").exists() else {}
+    _producer = _orig_rew.get("producer") or (_marker.get("producer") if isinstance(_marker, dict) else None) \
+        or "bundle_verifier"
+    _ledger_reward = _orig_rew.get("reward")
+    if isinstance(_ledger_reward, (int, float)) and not isinstance(_ledger_reward, bool):
+        final_reward = reward_pct(_ledger_reward)
+    else:
         print(
-            f"[harbor_to_output] WARNING: reward.json producer={_producer!r}; "
-            "no rubric-inclusive reward from the judge container or the host rubric pass "
-            "-- treating trial as unscored (reward=0)",
+            "[harbor_to_output] WARNING: the bundle's verifier wrote no numeric reward "
+            "-- treating trial as unscored",
             file=sys.stderr,
         )
         _producer = "unscored"
-
-    # The reward is the weighted ledger the verifier already computed, scaled to
-    # a percentage. It is NOT recomputed here.
-    #
-    # This used to be `mean(test_pct, rubric_pct)`, which disagreed with the
-    # graded reward in two ways at once: it dropped the per-component weights
-    # from tests/test_weights.json (5 for traj_tests vs 3 for the rubric, so the
-    # two channels are not equal halves), and it omitted state_completion and
-    # state_misbehave entirely. On one measured trial -- channel_a 0.8485,
-    # rubric 0.9595, state_completion 0.0 -- the ledger scored 0.5478 while this
-    # line reported 90.4, because it averaged the two channels the agent did
-    # well on and ignored the one it did not. Anything reading pass_summary.json
-    # as the headline number got the flattering figure.
-    if _producer in ("host_rubric_pass", "judge_container"):
-        # weighted ledger path -- computed on the host, or by the bundle itself
-        # after its judge container graded the rubric: rescale to percentage
-        _ledger_reward = _orig_rew.get("reward")
-        if isinstance(_ledger_reward, (int, float)):
-            final_reward = reward_pct(_ledger_reward)
-        else:
-            # No reward.json (a trial that died before the verifier wrote one).
-            # Fall back to the old average rather than reporting nothing, but it is
-            # a strictly worse number -- see above.
-            parts = [p for p in (test_pct, rubric_pct) if p is not None]
-            final_reward = norm_reward(sum(parts) / len(parts)) if parts else None
-    elif _producer == "container_test":
-        # binary gate path; scored key holds 0 or 1; no x100 rescale
-        _ledger_reward = _orig_rew.get("scored", _orig_rew.get("reward", 0))
-        final_reward = norm_reward(_ledger_reward)
-    else:
         final_reward = 0.0
     reward_pct_doc = {
         **_orig_rew,
@@ -1196,7 +1170,7 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
         **{_k: norm_reward(_orig_rew[_k])
            for _k in ("completion_rate", "misbehave_rate", "rubric", "rubric_score")
            if _k in _orig_rew},
-        **({"producer": "unscored"} if _producer == "unscored" else {}),
+        "producer": _producer,
     }
     # combine_channels.py's full block (quadrant, ledger, formulas) cannot ride in
     # the container's reward.json: harbor accepts only numbers there and fails the
@@ -1214,9 +1188,9 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
 
     # An attempt that died inside the harness -- agent process crash, auth/OAuth
     # failure, container error -- is not a measurement of the agent's answer. The
-    # host rubric pass still runs against the empty trajectory and returns a
-    # perfectly well-formed 0, so `producer` stays "host_rubric_pass" and the
-    # `producer == "unscored"` guard below never fires. Averaging that 0 in is
+    # bundle's verifier still runs against the empty trajectory and returns a
+    # perfectly well-formed 0, so the `producer == "unscored"` guard alone never
+    # fires. Averaging that 0 in is
     # exactly the confusion that guard exists to prevent: on one measured task
     # four graded trials scored 50/50/48/50 and a fifth died on an OAuth error,
     # and the mean reported 39.6 instead of 49.5 -- infrastructure trouble read
@@ -1224,15 +1198,13 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     # and the failure histogram (a crashed attempt is still a
     # failed attempt for pass@k) but out of the reward MEAN.
     #
-    # The flag rides in reward.json as "unscored_reason", NOT as a "scored" key:
-    # container_test reward.json already uses "scored" for its binary 0/1 score
-    # (see the _ledger_reward read above), and reusing the name would make one
-    # key mean two things in the same file.
+    # The flag rides in reward.json as "unscored_reason", NOT as a "scored" key,
+    # which a bundle's own reward.json is free to use.
     _scored = _producer != "unscored" and failure_class != "infrastructure"
     if not _scored:
         reward_pct_doc["unscored_reason"] = (
             failure_reason if failure_class == "infrastructure"
-            else "no rubric-inclusive reward was published (judge container or host pass)")
+            else "the bundle's verifier published no numeric reward")
 
     # Not fmt_reward: reward.txt ships bare repr ("90.4"), not padded ("90.40").
     reward_txt_val = str(norm_reward(final_reward)) if final_reward is not None else "0.0"
@@ -1297,17 +1269,6 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     _flatten_artifacts(run_dir)
     if _copy(stream_path, run_dir / "logs" / "agent-stream.jsonl"):
         (run_dir / "logs" / "agent-stream.txt").unlink(missing_ok=True)
-    # Squid's access log for this attempt: what the agent actually tried to
-    # reach and what the proxy actually refused. tools/network/egress-proxy/
-    # entrypoint.sh tees it into the trial's own agent-log dir, which is why it
-    # is read from `ag` here rather than collected with `docker logs` -- by the
-    # time anything downstream runs, the proxy container is gone.
-    #
-    # Absent for runs made with NETWORK_ISOLATION_OFF=1, and for trees reshaped
-    # from before the capture landed. Both are legitimate, so this is a plain
-    # _copy whose False return is not an error; stage_netaudit degrades to the
-    # trajectory-only audit when the file does not arrive.
-    _copy(ag / "egress-access.log", run_dir / "logs" / "egress-access.log")
     _copy(ver / "ctrf.json", run_dir / "logs" / "verifier-ctrf.json")
     _copy(ver / "reward.txt", run_dir / "logs" / "verifier-reward.txt")
     _copy(ver / "test-stdout.txt", run_dir / "logs" / "verifier-stdout.txt")
@@ -1324,11 +1285,8 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
           run_dir / "logs" / "light-servers-health.log")
     _copy(ver / "light-servers-tool_calls.log",
           run_dir / "logs" / "light-servers-tool-calls.log")
-    # reward_channel_a.json is here because the published run dir has to be
-    # re-gradable: host_rubric_pass reads channel A from it, and without it a
-    # re-run of that pass drops traj_tests from the ledger and scores the run on
-    # the rubric alone. Leaving it behind made the published tree look complete
-    # while quietly not being enough to reproduce its own reward.
+    # The bundle's own verifier outputs, published as written so a reader can
+    # check the reward against the channels the bundle's tests computed.
     for f in ("ctrf.json", "reward.json", "reward_channel_a.json",
               "reward_channel_c.json",
               "detail.json",
@@ -1507,9 +1465,8 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     # verbatim copy, keeps the mirror worth mirroring.
     #
     # total_cost_usd is raw float arithmetic from the agent SDK; judge_cost_usd
-    # comes from rubric_judge_cli's pricing; verifier/reward.json carries the
-    # rates when a container graded the trial rather than host_rubric_pass,
-    # which normalises its own writes. finance_reporter reads its cost from the
+    # comes from the bundle's own judge; verifier/reward.json carries the rates
+    # the bundle's tests wrote. finance_reporter reads its cost from the
     # PUBLISHED trajectory.json, so what it posts is cut too.
     norm_metrics_file(run_dir / "agent" / "trajectory.json")
     for _f in ("judge_tokens.json", "reward.json"):
@@ -2014,7 +1971,7 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
             _tw = (_load(task_dir / "tests" / "test_weights.json", {}) if task_dir else {}) or {}
             _thr = _tw.get("threshold", PASS_THRESHOLD_DEFAULT)
             n = len(_disk_rewards)
-            # host_rubric_pass stores rewards as 0-100 percentages; container_test uses 0-1.
+            # Published rewards are 0-100 percentages; older trees may hold 0-1.
             # Threshold is always 0-1, so scale it to match the reward range.
             _thr_scaled = _thr * 100 if any(r > 1 for r in _disk_scored) else _thr
             c = sum(1 for r in _disk_scored if r >= _thr_scaled)

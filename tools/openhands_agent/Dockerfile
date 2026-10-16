@@ -18,9 +18,9 @@
 # Base: bookworm, the glibc the task images here are built on (python:3.12-slim).
 # Wheels are resolved for this libc, so a main image with an OLDER glibc than
 # bookworm's, or a musl (alpine) one, cannot load them.
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
-COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 /uv /usr/local/bin/uv
 
 ENV UV_PYTHON_INSTALL_DIR=/opt/openhands-runtime/python \
     UV_PYTHON_PREFERENCE=only-managed \

@@ -1,56 +1,139 @@
 #!/usr/bin/env python3
+"""Patch the installed harbor for this harness, or refuse loudly.
+
+    python3 scripts/patch_harbor.py           apply, exit 1 on any drift
+    python3 scripts/patch_harbor.py --audit   report only, write nothing,
+                                              still exit 1 on any drift
+
+Every patch is anchored on the exact source of the harbor release pinned in
+scripts/lib/harbor.sh (HARBOR_VERSION). Each one either applies, is already
+applied (idempotent: the marker is checked first), or is reported as a MISS --
+there is no third outcome where a patch is skipped and the run carries on.
+A harbor whose version is not the pin is refused before any anchor is read,
+because an anchor that happens to match on another release proves nothing.
+
+Patches dropped when the pin moved to 0.24.0, and why:
+
+  failure classification   NATIVE. 0.24.0's ClaudeCode._classify_exec_error
+                           classifies a stream-json launch from the terminal
+                           `result`/`error` events only (filter_jsonl_events),
+                           so `rate_limit_event` telemetry no longer reads as
+                           ApiRateLimitError. The old override also sat ABOVE the
+                           native method in the class body, so the native one won
+                           and the patch was dead code -- and its detail string
+                           bypassed 0.24.0's command redaction.
+  pre-baked CLI guard      NATIVE. install() returns early through
+                           _installed_claude_satisfies_version.
+  builtin collect hook     DUPLICATE. It copied /workspace minus data/ into the
+                           artifact dir; task.toml `artifacts` does that natively
+                           and the bundle owns that declaration.
+  JUDGE_MODEL inject       GRADING. The judge model is the bundle's
+                           [verifier.env] (tests/judge.toml under trinity); the
+                           harness carries no grading configuration.
+  score-table suppression  GRADING. The tables were "stale" only because a host
+                           rubric pass rewrote the reward afterwards. That pass is
+                           gone, so harbor's tables are the bundle's own reward.
+
+NATIVE_REQUIRED below asserts the native behaviour the dropped patches now rely
+on, so a harbor that lost it fails here rather than mid-trial.
+"""
+
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
+import re
+import shutil
+import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parents[1]
+HARBOR_LIB = REPO / "scripts" / "lib" / "harbor.sh"
 
-ANCHOR = '            format="--permission-mode={value}",\n        ),'
-PATCH = """
-        CliFlag(
-            "thinking",
-            cli="--thinking",
-            type="str",
-        ),
-        CliFlag(
-            "thinking_display",
-            cli="--thinking-display",
-            type="str",
-        ),"""
-ALREADY_PATCHED_MARKER = '"thinking_display"'
 
-# harbor 0.23.0 moved agent flags off CLI_FLAGS lists onto pydantic fields of
-# ClaudeCodeOptions, so ANCHOR above can never match there. It also set
-# extra="forbid" (agents/options.py), which turns an unknown --ak key from
-# "ignored" into a hard validation error, so run_task.sh:1027's
-# `--ak thinking=adaptive` fails the run up front unless this field exists.
-# thinking_display became NATIVE in 0.23.0 and is deliberately not re-added.
-ANCHOR_THINKING_PYD = '''    thinking_display: Annotated[
+def pinned_version() -> str:
+    """HARBOR_VERSION from scripts/lib/harbor.sh, the one place the pin lives."""
+    m = re.search(r'^HARBOR_VERSION="([^"]+)"', HARBOR_LIB.read_text(), re.M)
+    if not m:
+        raise RuntimeError(f"no HARBOR_VERSION=\"...\" line in {HARBOR_LIB}")
+    return m.group(1)
+
+
+@dataclass(frozen=True)
+class Patch:
+    """One source edit: every (anchor, replacement) pair applies, or none does."""
+
+    name: str
+    module: str
+    marker: str
+    edits: tuple[tuple[str, str], ...]
+    # For a removal: the needle whose total absence means the goal already
+    # holds (an earlier patcher removed it without leaving this marker).
+    absent: str | None = None
+    # A data file beside `module` (a package) instead of the module's own source.
+    file: str | None = None
+
+
+# --- thinking flag -------------------------------------------------------------
+# ClaudeCodeOptions is extra="forbid", so `--ak thinking=adaptive` (run_task.sh)
+# is a validation error unless the field exists. thinking_display is native and
+# is the anchor; `thinking` is still absent in 0.24.0.
+_THINKING_ANCHOR = '''    thinking_display: Annotated[
         Literal["summarized", "omitted"] | None,
         Cli("--thinking-display"),
     ] = Field(default=None, description="How thinking is displayed.")'''
 
-REPLACEMENT_THINKING_PYD = ANCHOR_THINKING_PYD + '''
+THINKING = Patch(
+    name="thinking flag",
+    module="harbor.agents.installed.claude_code",
+    marker="# harbor-patch: thinking flag",
+    edits=((
+        _THINKING_ANCHOR,
+        _THINKING_ANCHOR + '''
     # harbor-patch: thinking flag
     thinking: Annotated[str | None, Cli("--thinking")] = Field(
         default=None, description="Thinking mode."
-    )'''
+    )''',
+    ),),
+)
 
-ALREADY_PATCHED_MARKER_THINKING_PYD = "# harbor-patch: thinking flag"
+# --- fallback model removal ----------------------------------------------------
+# A fallback model swaps the model mid-run, so the reward would be attributed to
+# --model while some turns came from another. Removing the field makes it
+# unrepresentable (extra="forbid" turns it into a validation error). The
+# declaration is the only reference to it in the 0.24.0 package.
+FALLBACK = Patch(
+    name="fallback_model removal",
+    module="harbor.agents.installed.claude_code",
+    marker="# harbor-patch: fallback_model removed",
+    edits=((
+        '''    fallback_model: Annotated[str | None, Cli("--fallback-model")] = Field(
+        default=None, description="Fallback model name."
+    )
+''',
+        "    # harbor-patch: fallback_model removed\n",
+    ),),
+    absent="fallback_model",
+)
 
-
-# Indentation is load-bearing. All three anchors sit inside a `try:` inside an
-# `async def`, at 12 and 20 spaces; they used to be written 4 short. Anchor 1 is
-# one line, so it still matched as a SUBSTRING (the missing spaces sit to its
-# left) and the patch reported "applied", but the replacement's remaining lines
-# landed a level out, and anchors 2 and 3 never matched at all. On a freshly
-# installed harbor that compiled to
-#   SyntaxError: expected 'except' or 'finally' block
-# i.e. an unimportable claude_code.py. Verified against pristine 0.22.0 AND
-# 0.23.0, so this also repairs the downgrade path. Re-measure after an upgrade.
-ANCHOR_ARGMAX_1 = "            run_env = {**env, instruction_env_var: instruction}"
-REPLACEMENT_ARGMAX_1 = """            import base64 as _base64
+# --- ARG_MAX ---------------------------------------------------------------------
+# 0.24.0 hands the instruction to `claude` through an env var, and the docker
+# provider passes every env var as one host-side argv string (`-e KEY=VAL`,
+# environments/docker/docker.py). Linux caps a single argv string at 128 KiB
+# (MAX_ARG_STRLEN), so a long instruction fails with "Argument list too long".
+# The patch writes it to a file inside the container in 4000-byte base64 chunks
+# instead. Indentation is load-bearing: the anchors sit in a `try:` inside an
+# `async def`, at 12 and 20 spaces.
+ARGMAX = Patch(
+    name="ARG_MAX instruction file",
+    module="harbor.agents.installed.claude_code",
+    marker="_instr_file",
+    edits=(
+        (
+            "            run_env = {**env, instruction_env_var: instruction}",
+            """            import base64 as _base64
             _instr_id = uuid.uuid4().hex
             _instr_file = f"/tmp/harbor_instruction_{_instr_id}"
             _instr_b64 = _base64.b64encode(instruction.encode("utf-8")).decode("ascii")
@@ -66,675 +149,230 @@ REPLACEMENT_ARGMAX_1 = """            import base64 as _base64
                 env=env,
             )
 
-            run_env = {**env}"""
-
-ANCHOR_ARGMAX_2 = """\
+            run_env = {**env}""",
+        ),
+        (
+            """\
                     f'{instruction_shell_var}="${instruction_env_var}"; '
                     f"unset {instruction_env_var}; "
-                    f'printf "%s" "${instruction_shell_var}" | '"""
-REPLACEMENT_ARGMAX_2 = "                    f'cat {_instr_file} | '"
-
-# Harbor builds the log path from environment_logs_dir; the old anchor expected
-# a literal /logs/agent/claude-code.txt that no longer appears here.
-ANCHOR_ARGMAX_3 = (
-    "                    f\"{(self.environment_logs_dir / 'claude-code.txt').as_posix()}\"\n"
-    "                ),\n"
-    "                env=run_env,"
-)
-REPLACEMENT_ARGMAX_3 = (
-    "                    f\"{(self.environment_logs_dir / 'claude-code.txt').as_posix()}\"\n"
-    '                    f"; rm -f {_instr_file}"\n'
-    "                ),\n"
-    "                env=run_env,"
+                    f'printf "%s" "${instruction_shell_var}" | '""",
+            "                    f'cat {_instr_file} | '",
+        ),
+        (
+            "                    f\"{(self.environment_logs_dir / 'claude-code.txt').as_posix()}\"\n"
+            "                ),\n"
+            "                env=run_env,",
+            "                    f\"{(self.environment_logs_dir / 'claude-code.txt').as_posix()}\"\n"
+            '                    f"; rm -f {_instr_file}"\n'
+            "                ),\n"
+            "                env=run_env,",
+        ),
+    ),
 )
 
-ALREADY_PATCHED_MARKER_ARGMAX = "_instr_file"
-
-
-ANCHOR_COLLECT = """\
-        if step_cfg is not None:
-            hooks.extend(step_cfg.verifier.collect)
-        return hooks"""
-
-# v1's own output, so an already-patched harbor upgrades in place. Without it
-# the anchor search misses (v1 consumed it), and the run dies: run_task.sh:1510
-# calls this script under `set -e`.
-ANCHOR_COLLECT_V1 = """\
-        # harbor-patch: builtin collect
-        _BUILTIN_CMD = "python3 /harness/scoring/collect_artifacts.py"
-        if not any(_BUILTIN_CMD in h.command for h in hooks):
-            from harbor.models.task.config import VerifierCollectConfig as _VCC
-            hooks.append(_VCC(command=_BUILTIN_CMD))
-        return hooks"""
-
-# Plain shell, not `sh -c '...'`: harbor already wraps it (docker.py,
-# `exec_command.extend(["sh", "-c", cmd])`), so a second shell buys only nested
-# quoting. Guarded because this failure is otherwise invisible -- harbor treats
-# a failed collect hook as non-fatal and collect_artifacts.py exits 0 by
-# contract, so an unmounted /harness/scoring loses every artifact in silence.
-#
-# Dedup by equality, not containment: a task hook that merely MENTIONED the path
-# suppressed the builtin and lost the artifacts with it. Collecting twice is
-# harmless (copy2 overwrites, exit 0 always), so that is the safe side.
-_COLLECT_BLOCK = """\
-        # harbor-patch: builtin collect v2
-        _BUILTIN_CMD = (
-            'if [ -f /harness/scoring/collect_artifacts.py ]; then '
-            'python3 /harness/scoring/collect_artifacts.py; else '
-            'echo "[artifacts] FATAL: /harness/scoring is not mounted -- '
-            'check the ../ depth in environment/docker-compose.yaml; '
-            'NO agent artifacts were collected" >&2; fi'
-        )
-        _BUILTIN_PRIOR = "python3 /harness/scoring/collect_artifacts.py"
-        if not any(h.command.strip() in (_BUILTIN_CMD, _BUILTIN_PRIOR) for h in hooks):
-            from harbor.models.task.config import VerifierCollectConfig as _VCC
-            hooks.append(_VCC(command=_BUILTIN_CMD))
-        return hooks"""
-
-REPLACEMENT_COLLECT = """\
-        if step_cfg is not None:
-            hooks.extend(step_cfg.verifier.collect)
-""" + _COLLECT_BLOCK
-REPLACEMENT_COLLECT_V1 = _COLLECT_BLOCK
-ALREADY_PATCHED_MARKER_COLLECT = "harbor-patch: builtin collect v2"
-
-
-# --- Agent failure classification ---------------------------------------------
-# harbor names the cause of a failed agent run by regex-searching the WHOLE run
-# output for r"rate.?limit" (base.py:174) and never looks at the exit code, which
-# it formats into a string and then discards. Claude Code emits
-#   {"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}
-# as ordinary telemetry after successful calls, and ".?" matches the underscore,
-# so that pattern hits on essentially every run: measured 55, 45 and 2 times
-# across three runs of one task -- including the run that exited 0. The upshot is
-# that ApiRateLimitError is harbor's de facto name for ANY non-zero agent exit.
-#
-# Measured here: an OOM kill (exit 137, mid-OCR) and a genuine Anthropic session
-# limit (exit 1) came back with the identical label. The OOM's real cause
-# survived nowhere -- SIGKILL writes no result event, the container is deleted
-# before State.OOMKilled can be read, and the exit code is the only evidence
-# left, which is precisely what the classifier ignores.
-#
-# The override below does two things harbor's does not:
-#   1. Triages on HOW the process died before reading what its log mentions.
-#      A signal death is a fact; a substring in 12 MB of output is a guess.
-#   2. Requires a real rate-limit signal rather than the telemetry line.
-#      Verified discriminator: '"error":"rate_limit"' appears once in the
-#      genuinely rate-limited run and zero times in the OOM run, while
-#      "rate_limit_event" appears in both.
-#
-# Retry semantics are unchanged except for the misfiled cases: ApiRateLimitError
-# keeps meaning "waiting may help", which is exactly what an OOM does not.
-ANCHOR_CLASSIFY = '''    @override
-    def get_version_command(self) -> str | None:'''
-
-REPLACEMENT_CLASSIFY = r'''    # harbor-patch: classify agent failures by how the process died
-    _FATAL_SIGNALS = {
-        137: "killed by SIGKILL (128+9) -- in a container this is normally the "
-             "OOM killer; compare the task's memory_mb with what docker has",
-        139: "killed by SIGSEGV (128+11) -- agent process crashed",
-        143: "killed by SIGTERM (128+15) -- stopped by an external signal",
-        124: "exit 124 -- command timed out (coreutils timeout)",
-    }
-
-    # A real provider rate limit, not Claude Code's "status: allowed" telemetry.
-    _REAL_RATE_LIMIT = _re.compile(
-        r'"error"\s*:\s*"rate_limit"'
-        r'|"type"\s*:\s*"rate_limit_error"'
-        r'|too many requests'
-        r'|\b(?:session|usage|weekly|monthly)\s+limit\b'
-        r'|Limit Exhausted',
-        _re.IGNORECASE,
-    )
-
-    @override
-    def _classify_exec_error(self, command, result):
-        detail = (
-            f"Command failed (exit {result.return_code}): {command}\n"
-            f"stdout: {self._truncate_output(result.stdout)}\n"
-            f"stderr: {self._truncate_output(result.stderr)}"
-        )
-        note = self._FATAL_SIGNALS.get(getattr(result, "return_code", None))
-        if note:
-            # How it died outranks what the log happens to mention.
-            return NonZeroAgentExitCodeError(note + "\n" + detail)
-        output = f"{result.stdout or ''}\n{result.stderr or ''}"
-        if self._REAL_RATE_LIMIT.search(output):
-            return ApiRateLimitError(detail)
-        return NonZeroAgentExitCodeError(detail)
-
-    @override
-    def get_version_command(self) -> str | None:'''
-
-ALREADY_PATCHED_MARKER_CLASSIFY = "harbor-patch: classify agent failures by how the process died"
-
-# The override needs three names claude_code.py does not import today.
-ANCHOR_CLASSIFY_IMPORT = '''from harbor.agents.installed.base import (
-    BaseInstalledAgent,'''
-
-REPLACEMENT_CLASSIFY_IMPORT = '''import re as _re  # harbor-patch: agent failure classification
-
-from harbor.agents.installed.base import (
-    ApiRateLimitError,
-    BaseInstalledAgent,
-    NonZeroAgentExitCodeError,'''
-
-ALREADY_PATCHED_MARKER_CLASSIFY_IMPORT = "import re as _re  # harbor-patch"
-
-
-ANCHOR_JUDGE_MODEL_1 = """\
-        with self.agent_environment.with_default_user(user):
-            verifier = VerifierFactory.create_verifier_from_config(
-                self.config.verifier,
-                task=self.task,
-                trial_paths=self.paths,
-                environment=self.agent_environment,
-                override_env=self.config.verifier.env or None,"""
-REPLACEMENT_JUDGE_MODEL_1 = """\
-        with self.agent_environment.with_default_user(user):
-            _ov_env = dict(self.config.verifier.env or {})
-            _ov_env.setdefault("JUDGE_MODEL", "gpt-5.6-sol")
-            verifier = VerifierFactory.create_verifier_from_config(
-                self.config.verifier,
-                task=self.task,
-                trial_paths=self.paths,
-                environment=self.agent_environment,
-                override_env=_ov_env or None,"""
-
-ANCHOR_JUDGE_MODEL_2 = """\
-                verifier = VerifierFactory.create_verifier_from_config(
-                    self.config.verifier,
-                    task=self.task,
-                    trial_paths=self.paths,
-                    environment=target_env,
-                    override_env=self.config.verifier.env or None,"""
-REPLACEMENT_JUDGE_MODEL_2 = """\
-                _ov_env = dict(self.config.verifier.env or {})
-                _ov_env.setdefault("JUDGE_MODEL", "gpt-5.6-sol")
-                verifier = VerifierFactory.create_verifier_from_config(
-                    self.config.verifier,
-                    task=self.task,
-                    trial_paths=self.paths,
-                    environment=target_env,
-                    override_env=_ov_env or None,"""
-ALREADY_PATCHED_MARKER_JUDGE_MODEL = '_ov_env.setdefault("JUDGE_MODEL"'
-
-
-# --- Pre-baked Claude Code CLI ------------------------------------------------
-# ClaudeCode.install() reaches the network twice inside the container: apt-get
-# for curl/procps, then a bootstrap.sh download from downloads.claude.ai. Both
-# run BEFORE the agent phase, and both die once the container's default network
-# is `internal: true` (tools/network/egress-proxy/overlay.yaml).
-#
-# The bundles pre-bake the CLI at build time instead, where the network is still
-# open, so these two commands have nothing left to do. They are made no-ops
-# rather than deleted: an image WITHOUT a baked CLI still installs normally, so
-# a bundle that forgets the Dockerfile line degrades to the old behaviour rather
-# than failing to start an agent.
-#
-# The guard is plain shell on purpose. Probing from Python would mean parsing an
-# exec result whose shape is not part of harbor's contract.
-_Q = chr(34)
-
-ANCHOR_PREBAKE_ROOT = (
-    '                ' + _Q + 'if command -v apk &> /dev/null; then' + _Q + '\n'
-    '                ' + _Q + '  apk add --no-cache curl bash nodejs npm procps;' + _Q
+# --- egress sidecar read timeout -------------------------------------------------
+# Under an allowlist agent phase every agent connection, the ccbridge included,
+# goes through the sidecar's gost `red` handler with HTTP sniffing on. That path
+# drops a request whose response has not started within gost's short default
+# read timeout (measured: a 90s host call is cut at ~16s, the same call direct
+# succeeds), and a long model turn sends nothing until it is done, so the agent
+# sees "Server disconnected without sending a response" and dies after five
+# retries. 1800s matches the agent's LLM_TIMEOUT and what squid allowed. Harbor
+# names the sidecar image by a hash of this directory, so the edit rebuilds it.
+SIDECAR_TIMEOUT = Patch(
+    name="egress sidecar read timeout",
+    module="harbor.environments.docker",
+    file="harbor-docker-egress-control-sidecar/gost.yaml",
+    marker="# harbor-patch: sidecar read timeout",
+    edits=((
+        "        sniffing.fallback: true\n",
+        "        sniffing.fallback: true\n"
+        "        # harbor-patch: sidecar read timeout\n"
+        "        readTimeout: 1800s\n",
+    ),),
 )
 
-REPLACEMENT_PREBAKE_ROOT = (
-    '                ' + _Q + 'if command -v claude &> /dev/null; then' + _Q + '\n'
-    "                '  echo " + _Q + "harbor-patch: claude pre-baked; skipping apt" + _Q + ";'\n"
-    '                ' + _Q + ' elif command -v apk &> /dev/null; then' + _Q + '\n'
-    '                ' + _Q + '  apk add --no-cache curl bash nodejs npm procps;' + _Q
+# --- egress sidecar service-name aliases ----------------------------------------
+# With egress control on, harbor moves every compose service that declares no
+# networking of its own into the sidecar's network namespace. They share it, so
+# they reach each other on 127.0.0.1, but their compose service names stop
+# resolving, and a task whose MCP URLs name a service (http://<service>:<port>)
+# loses every tool (measured: all 22 MCP servers "MCP Connection Failure" while
+# localhost:<port> answered). Containers that join a namespace share its owner's
+# /etc/hosts, so aliasing each moved service to 127.0.0.1 on the sidecar restores
+# name resolution for all of them. Built from the task's own compose; no names
+# are hardcoded.
+SIDECAR_ALIASES = Patch(
+    name="egress sidecar service-name aliases",
+    module="harbor.environments.docker.docker",
+    marker="# harbor-patch: sidecar service-name aliases",
+    edits=((
+        """            for service_name in self._egress_controlled_service_names()
+        }
+        if not services:
+            return None
+""",
+        """            for service_name in self._egress_controlled_service_names()
+        }
+        if not services:
+            return None
+        # harbor-patch: sidecar service-name aliases
+        services[self._EGRESS_CONTROL_SERVICE_NAME] = {
+            "extra_hosts": [f"{name}:127.0.0.1" for name in sorted(services)]
+        }
+""",
+    ),),
 )
 
-ANCHOR_PREBAKE_AGENT = (
-    '                ' + _Q + 'set -euo pipefail; ' + _Q + '\n'
-    '                ' + _Q + 'if command -v apk &> /dev/null; then' + _Q
-)
+PATCHES = (THINKING, FALLBACK, ARGMAX, SIDECAR_TIMEOUT, SIDECAR_ALIASES)
 
-REPLACEMENT_PREBAKE_AGENT = (
-    '                ' + _Q + 'set -euo pipefail; ' + _Q + '\n'
-    '                ' + _Q + 'if command -v claude &> /dev/null; then' + _Q + '\n'
-    "                '  echo " + _Q + "harbor-patch: claude pre-baked; skipping bootstrap" + _Q + ";'\n"
-    '                ' + _Q + ' elif command -v apk &> /dev/null; then' + _Q
-)
-
-ALREADY_PATCHED_MARKER_PREBAKE = "harbor-patch: claude pre-baked"
-
-# Harbor has its own early return at the top of install():
-#
-#     if await self._installed_claude_satisfies_version(environment):
-#         return
-#
-# CORRECTION: that method does NOT exist in 0.13.2, the version this harness
-# actually runs. Checked the whole installed package: the only match is
-# `_installed_codex_satisfies_version` (agents/installed/codex.py:85), which is
-# Codex's own, on Codex's class. `ClaudeCode.install()` has no version-satisfies
-# early return at all. The earlier "verified present in 0.13.2" was almost
-# certainly the codex method read as the claude one; 0.20.0 and 0.21.0 are
-# UNVERIFIED here, so treat the snippet above as a possibility, not a fact.
-#
-# This patch is therefore not merely belt-and-braces on 0.13.2 -- it is the only
-# protection there is. (Independently, harbor's probe would run through
-# environment.exec rather than exec_as_agent, so a claude pre-baked for one user
-# can be invisible to the other even where the method does exist.)
-#
-# The constant is used only as a FALLBACK: consulted when the anchors are gone,
-# to tell "harbor restructured but still has some protection" from "no
-# protection at all". Where the anchors still match, the patch is applied as
-# before, so on 0.13.2 this is never reached. Order matters -- see the prebake
-# block in main().
-#
-# Matched as a tuple because the name is version-dependent and, on 0.13.2
-# evidence, harbor's convention is `_installed_<agent>_satisfies_version`. A
-# rename that follows that convention should land on the fallback rather than on
-# the hard failure below, which would otherwise block every run after a harbor
-# upgrade for no reason. Kept as exact names, not a loose "satisfies_version"
-# substring: a false positive here lets a doomed run start and fail during agent
-# setup, whereas the hard failure refuses it up front with a clear message.
-#
-# What changed in 0.21.0: the inline `apk add --no-cache curl bash nodejs npm
-# procps` root block that ANCHOR_PREBAKE_ROOT targets was replaced by a call to
-# ensure_system_dependencies(), so that anchor can never match again there.
-NATIVE_PREBAKE_GUARD = (
-    "_installed_claude_satisfies_version",
-    "_installed_claude_code_satisfies_version",
+# Native behaviour the dropped patches now rely on: (module, needle, what).
+NATIVE_REQUIRED = (
+    ("harbor.agents.installed.claude_code", "def _classify_exec_error(",
+     "ClaudeCode classifies failures from terminal stream events"),
+    ("harbor.agents.installed.claude_code", "filter_jsonl_events(result.stdout",
+     "rate_limit_event telemetry is filtered out of classification"),
+    ("harbor.agents.installed.claude_code",
+     "if await self._installed_claude_satisfies_version(environment):",
+     "install() skips the network when claude is pre-baked"),
 )
 
 
-# --- Suppress harbor's own score tables ---------------------------------------
-# print_job_results_tables() is the single choke point for every score table
-# harbor prints -- five call sites across cli/jobs.py and cli/exec.py. Those
-# tables are rendered from the in-container verifier result, which is produced
-# BEFORE the host rubric pass, so their numbers are always stale. Reading them
-# as the run's result is the easiest way to be misled about a trial; the real
-# reward is printed afterwards by this harness.
-#
-# Exceptions are still printed. Suppressing a table must not also swallow the
-# fact that a trial errored -- that is the one number in it that is not stale.
-# HARBOR_SHOW_SCORES=1 restores the tables verbatim.
-#
-# Anchored on the def line plus the loop that follows it: both are unique in
-# jobs.py, and in an unpatched file they are adjacent.
-ANCHOR_SUPPRESS_SCORES = (
-    "def print_job_results_tables(job_result) -> None:\n"
-    "    for evals_key, dataset_stats in job_result.stats.evals.items():"
-)
-REPLACEMENT_SUPPRESS_SCORES = (
-    "def print_job_results_tables(job_result) -> None:\n"
-    "    # harbor-patch: suppress pre-rubric scores\n"
-    "    import os as _os\n"
-    '    if _os.getenv("HARBOR_SHOW_SCORES") != "1":\n'
-    "        for _key, _stats in job_result.stats.evals.items():\n"
-    "            if _stats.n_errors:\n"
-    "                console.print(\n"
-    '                    f"[yellow]{_key}: {_stats.n_errors} exception(s)[/yellow]"\n'
-    "                )\n"
-    "        console.print(\n"
-    '            "[dim]harbor\'s score tables are suppressed: they are printed before "\n'
-    '            "the host rubric pass and are always stale. The published reward "\n'
-    '            "follows below. HARBOR_SHOW_SCORES=1 restores them.[/dim]"\n'
-    "        )\n"
-    "        return\n"
-    "    for evals_key, dataset_stats in job_result.stats.evals.items():"
-)
-ALREADY_PATCHED_MARKER_SUPPRESS_SCORES = "harbor-patch: suppress pre-rubric scores"
-
-
-# --- Fallback model removal ---------------------------------------------------
-# A fallback model silently swaps the model mid-run, which is exactly what a
-# pinned-model trial must not do: the reward would be attributed to the model in
-# --model while some of the turns came from another one. Removing the option is
-# what makes that unrepresentable rather than merely unset.
-#
-# 0.23.0 moved the declaration from a quoted CliFlag entry to a pydantic field,
-# so the old `'"fallback_model"' not in text` probe stopped matching and passed
-# VACUOUSLY: the patch reported "already done" on a harbor that still carried the
-# option. Both shapes are handled below, and the presence probe is now the
-# unquoted name so it cannot go quietly true again.
-#
-# Deleting the field is safe here: the declaration is the only reference to it in
-# the whole 0.23.0 package (verified), so nothing reads the attribute. It is also
-# strictly stronger than on 0.22.0 -- with extra="forbid" the option is now a
-# hard validation error rather than a silently ignored kwarg.
-ANCHOR_FALLBACK = """\
-        CliFlag(
-            "fallback_model",
-            cli="--fallback-model",
-            type="str",
-        ),"""
-
-ANCHOR_FALLBACK_PYD = """\
-    fallback_model: Annotated[str | None, Cli("--fallback-model")] = Field(
-        default=None, description="Fallback model name."
-    )
-"""
-
-
-def find_harbor_claude_code() -> Path:
-    import shutil
-    import subprocess
-
+def installed_version() -> str | None:
     try:
-        spec = importlib.util.find_spec("harbor.agents.installed.claude_code")
+        return importlib.metadata.version("harbor")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def module_path(module: str) -> Path:
+    """Where the harbor module lives: this interpreter, else harbor's own venv."""
+    try:
+        spec = importlib.util.find_spec(module)
     except (ModuleNotFoundError, ValueError):
         spec = None
     if spec and spec.origin:
         return Path(spec.origin)
-
     harbor_bin = shutil.which("harbor")
     if not harbor_bin:
-        raise RuntimeError(
-            "harbor not found in PATH. Install it first: pipx install harbor"
-        )
-
+        raise RuntimeError("harbor not found in PATH or this interpreter; "
+                           "install it with scripts/lib/harbor.sh harbor_install")
     venv_bin = Path(harbor_bin).resolve().parent
-    venv_root = venv_bin.parent
-    candidates = sorted(venv_root.glob("lib/python*/site-packages/harbor/agents/installed/claude_code.py"))
-    if candidates:
-        return candidates[0]
-
-    # Last resort: ask harbor's own interpreter where the module lives. Both
-    # candidates can be absent -- a `harbor` shim on PATH that is not inside a
-    # venv at all, which is exactly what a test stub looks like. Calling
-    # subprocess.run on a path that does not exist raises FileNotFoundError from
-    # deep inside subprocess, burying the RuntimeError below that actually says
-    # what to do about it. Check first, and let that message be the one the
-    # operator sees.
-    venv_python = venv_bin / "python3"
-    if not venv_python.exists():
-        venv_python = venv_bin / "python"
-    if venv_python.exists():
-        result = subprocess.run(
-            [str(venv_python), "-c",
-             "import harbor.agents.installed.claude_code as m; print(m.__file__)"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return Path(result.stdout.strip())
-
-    raise RuntimeError(
-        f"Could not locate harbor/agents/installed/claude_code.py in pipx venv at {venv_root}"
+    rel = Path(*module.split(".")).with_suffix(".py")
+    found = sorted(venv_bin.parent.glob(f"lib/python*/site-packages/{rel.as_posix()}"))
+    if found:
+        return found[0]
+    python = next((p for p in (venv_bin / "python3", venv_bin / "python") if p.exists()), None)
+    if python is None:
+        raise RuntimeError(f"no python beside {harbor_bin}; cannot locate {module}")
+    result = subprocess.run(
+        [str(python), "-c", f"import {module} as m; print(m.__file__)"],
+        capture_output=True, text=True,
     )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"harbor's interpreter cannot import {module}")
+    return Path(result.stdout.strip())
 
 
-def find_harbor_trial() -> Path:
-    claude_code = find_harbor_claude_code()
-    harbor_pkg_dir = claude_code.parent.parent.parent
-    trial = harbor_pkg_dir / "trial" / "trial.py"
-    if trial.exists():
-        return trial
-    raise RuntimeError(f"Could not locate harbor/trial/trial.py (tried {trial})")
+def harbor_version_via(path: Path) -> str | None:
+    """The version of the harbor that owns `path`, read from its own dist-info."""
+    site = path
+    while site.name != "harbor" and site != site.parent:
+        site = site.parent
+    for dist in site.parent.glob("harbor-*.dist-info"):
+        meta = dist / "METADATA"
+        if meta.is_file():
+            m = re.search(r"^Version: (\S+)", meta.read_text(), re.M)
+            if m:
+                return m.group(1)
+    return None
 
 
-def find_harbor_jobs() -> Path:
-    claude_code = find_harbor_claude_code()
-    harbor_pkg_dir = claude_code.parent.parent.parent
-    jobs = harbor_pkg_dir / "cli" / "jobs.py"
-    if jobs.exists():
-        return jobs
-    raise RuntimeError(f"Could not locate harbor/cli/jobs.py (tried {jobs})")
+def apply(patch: Patch, text: str) -> tuple[str, str]:
+    """(new text, status). status is 'already', 'applied' or 'MISS: ...'."""
+    if patch.marker in text:
+        return text, "already"
+    if patch.absent is not None and patch.absent not in text:
+        return text, f"already ({patch.absent!r} is absent from the module)"
+    missing = [i + 1 for i, (anchor, _) in enumerate(patch.edits) if text.count(anchor) != 1]
+    if missing:
+        return text, f"MISS: anchor(s) {missing} of {len(patch.edits)} not found exactly once"
+    for anchor, replacement in patch.edits:
+        text = text.replace(anchor, replacement, 1)
+    if patch.marker not in text:
+        return text, "MISS: applied but its marker is absent, so it would re-apply"
+    return text, "applied"
 
 
-def main() -> None:
-    # --audit reports every patch's status without writing anything, and always
-    # exits 0. Use it after a harbor upgrade: a normal run stops at the first
-    # unapplicable patch, so drift is discovered one patch at a time.
-    audit = "--audit" in sys.argv or "--check" in sys.argv
-
-    # Anchors that could not be applied. Collected rather than exited on, so one
-    # invocation reports all of them. Same reasoning as the ARG_MAX warning
-    # below, extended to the rest: run_task.sh calls this unconditionally under
-    # `set -e`, so an early sys.exit(1) blocks every stage of every run AND
-    # hides whatever else drifted.
+def main(argv: list[str]) -> int:
+    audit = "--audit" in argv or "--check" in argv
     failures: list[str] = []
+    pin = pinned_version()
 
-    # Harbor absent is a setup fact, not a drifted anchor. Uncaught it surfaced
-    # as a bare traceback with the one useful line buried inside it.
     try:
-        target = find_harbor_claude_code()
+        paths = {m: module_path(m) for m in {p.module for p in PATCHES}
+                 | {m for m, _, _ in NATIVE_REQUIRED}}
     except RuntimeError as exc:
         print(f"[patch_harbor] {exc}", file=sys.stderr)
-        sys.exit(0 if audit else 1)
-    text = target.read_text(encoding="utf-8")
-    changed = False
+        return 1
+    # A file patch targets a data file in the module's package directory.
+    targets = {p.name: (paths[p.module].parent / p.file if p.file else paths[p.module])
+               for p in PATCHES}
+    for name, target in targets.items():
+        if not target.is_file():
+            print(f"[patch_harbor] {name}: MISS: {target} does not exist", file=sys.stderr)
+            return 1
 
-    if ALREADY_PATCHED_MARKER_THINKING_PYD in text or ALREADY_PATCHED_MARKER in text:
-        print(f"[patch_harbor] Thinking flags: already patched")
-    elif ANCHOR_THINKING_PYD in text:
-        text = text.replace(ANCHOR_THINKING_PYD, REPLACEMENT_THINKING_PYD, 1)
-        changed = True
-        print(f"[patch_harbor] Thinking flags: patched (pydantic options, harbor >= 0.23.0)")
-    elif ANCHOR in text:
-        text = text.replace(ANCHOR, ANCHOR + PATCH, 1)
-        changed = True
-        print(f"[patch_harbor] Thinking flags: patched (CliFlag list, harbor < 0.23.0)")
-    else:
-        print(
-            f"[patch_harbor] Thinking flags: NOT applied -- anchor not found in {target}",
-            file=sys.stderr,
-        )
-        failures.append(f"thinking flags  ({target.name})")
+    found = harbor_version_via(next(iter(paths.values()))) or installed_version()
+    if found != pin:
+        print(f"[patch_harbor] REFUSING: installed harbor is {found or 'unknown'}, "
+              f"the harness pins {pin} (scripts/lib/harbor.sh). Every anchor here "
+              f"is measured against {pin}; reinstall the pin.", file=sys.stderr)
+        return 1
 
-    if ALREADY_PATCHED_MARKER_ARGMAX in text:
-        print(f"[patch_harbor] ARG_MAX fix: already applied")
-    elif ANCHOR_ARGMAX_1 not in text:
-        # A drifted anchor is not a reason to take the whole harness down.
-        #
-        # This used to sys.exit(1), which meant a patch that no longer applies
-        # blocked every stage of every run -- run_task.sh calls this script
-        # unconditionally at dispatch, under `set -e`. Harbor 0.13.2 passes the
-        # instruction inline as shlex.quote(instruction) (claude_code.py:1258,
-        # :1414), while these anchors target an instruction_env_var form from a
-        # different harbor release, so on this install the patch cannot apply at
-        # all and the harness could not run anything.
-        #
-        # What is lost by continuing: the instruction goes on the command line,
-        # so a bundle whose instruction.md approaches ARG_MAX (1 MiB on Linux)
-        # would fail with "Argument list too long". Bundles here are ~1.5 KB, so
-        # the warning is the proportionate response -- but it is printed loudly
-        # rather than swallowed, because the day a bundle does get large this is
-        # the only notice anyone gets.
-        print(
-            f"[patch_harbor] WARNING: ARG_MAX fix NOT applied -- anchor not found in {target}\n"
-            "  This harbor passes the instruction on the command line. Fine for the\n"
-            "  bundles in this repo (~1.5 KB); a bundle approaching ARG_MAX (1 MiB)\n"
-            "  would fail with 'Argument list too long'. Re-anchor this patch if that\n"
-            "  ever happens.",
-            file=sys.stderr,
-        )
-    else:
-        text = text.replace(ANCHOR_ARGMAX_1, REPLACEMENT_ARGMAX_1, 1)
-        text = text.replace(ANCHOR_ARGMAX_2, REPLACEMENT_ARGMAX_2, 1)
-        text = text.replace(ANCHOR_ARGMAX_3, REPLACEMENT_ARGMAX_3, 1)
-        changed = True
-        print(f"[patch_harbor] ARG_MAX fix: applied")
+    texts = {path: path.read_text(encoding="utf-8")
+             for path in set(paths.values()) | set(targets.values())}
+    original = dict(texts)
 
-    if "fallback_model" not in text:
-        print(f"[patch_harbor] Fallback model removal: already done")
-    elif ANCHOR_FALLBACK_PYD in text:
-        text = text.replace(ANCHOR_FALLBACK_PYD, "", 1)
-        changed = True
-        print(f"[patch_harbor] Fallback model removal: applied (pydantic field, harbor >= 0.23.0)")
-    elif ANCHOR_FALLBACK in text:
-        text = text.replace(ANCHOR_FALLBACK, "", 1)
-        changed = True
-        print(f"[patch_harbor] Fallback model removal: applied (CliFlag list, harbor < 0.23.0)")
-    else:
-        print(
-            f"[patch_harbor] Fallback model removal: NOT applied -- anchor not found in {target}",
-            file=sys.stderr,
-        )
-        failures.append(f"fallback_model removal  ({target.name})")
+    for patch in PATCHES:
+        path = targets[patch.name]
+        texts[path], status = apply(patch, texts[path])
+        line = f"[patch_harbor] {patch.name}: {status}"
+        if status.startswith("MISS"):
+            print(line, file=sys.stderr)
+            failures.append(f"{patch.name}  ({path.name})")
+        else:
+            print(line)
 
-    if ALREADY_PATCHED_MARKER_PREBAKE in text:
-        print(f"[patch_harbor] Pre-baked CLI guard: already applied")
-    elif ANCHOR_PREBAKE_ROOT in text and ANCHOR_PREBAKE_AGENT in text:
-        text = text.replace(ANCHOR_PREBAKE_ROOT, REPLACEMENT_PREBAKE_ROOT, 1)
-        text = text.replace(ANCHOR_PREBAKE_AGENT, REPLACEMENT_PREBAKE_AGENT, 1)
-        changed = True
-        print(f"[patch_harbor] Pre-baked CLI guard: applied")
-    elif (_native := next((g for g in NATIVE_PREBAKE_GUARD if g in text), None)):
-        # Anchors gone (harbor >= 0.21.0 restructured install()), but harbor has
-        # a version-satisfies early return of its own. Non-fatal: blocking every
-        # run over a patch that has no place left to apply is worse than
-        # proceeding on harbor's own protection. Loud because that protection is
-        # not identical -- harbor probes via environment.exec, so if a run now
-        # fails during agent setup trying to reach the network, this line is the
-        # first place to look. The guard is NAMED in the message: on 0.13.2 no
-        # such method existed at all, so which one matched is the fact worth
-        # having when this fires.
-        print(
-            f"[patch_harbor] Pre-baked CLI guard: NOT applied -- anchors gone from {target.name};\n"
-            f"  relying on harbor's own {_native} early return.\n"
-            "  If agent setup starts failing on network access, re-anchor this patch.",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"[patch_harbor] Pre-baked CLI guard: NOT applied -- anchor not found in {target}",
-            file=sys.stderr,
-        )
-        failures.append(f"pre-baked CLI guard  ({target.name})")
+    for module, needle, what in NATIVE_REQUIRED:
+        if needle in original[paths[module]]:
+            print(f"[patch_harbor] native: {what}")
+        else:
+            print(f"[patch_harbor] native: MISSING -- {what}", file=sys.stderr)
+            failures.append(f"native: {what}")
 
-    if ALREADY_PATCHED_MARKER_CLASSIFY in text:
-        print(f"[patch_harbor] Failure classification: already applied")
-    elif ANCHOR_CLASSIFY not in text or ANCHOR_CLASSIFY_IMPORT not in text:
-        # Non-fatal. Without it, a crashed or OOM-killed run is still recorded --
-        # just under harbor's default name, ApiRateLimitError. That is a wrong
-        # label on a real result, not a lost result, so it must not block a run.
-        print(
-            f"[patch_harbor] Failure classification: NOT applied -- anchor not found in {target.name}\n"
-            "  Agent failures will keep being labelled ApiRateLimitError regardless of\n"
-            "  what actually killed them (harbor base.py:174 greps the whole log for\n"
-            "  r'rate.?limit', which Claude Code's own telemetry always matches).\n"
-            "  Re-anchor against ClaudeCode.get_version_command if this matters.",
-            file=sys.stderr,
-        )
-    else:
-        if ALREADY_PATCHED_MARKER_CLASSIFY_IMPORT not in text:
-            text = text.replace(ANCHOR_CLASSIFY_IMPORT, REPLACEMENT_CLASSIFY_IMPORT, 1)
-        text = text.replace(ANCHOR_CLASSIFY, REPLACEMENT_CLASSIFY, 1)
-        changed = True
-        print(f"[patch_harbor] Failure classification: applied")
+    if failures:
+        print(f"\n[patch_harbor] ---- {len(failures)} check(s) failed on harbor {found} ----",
+              file=sys.stderr)
+        for name in failures:
+            print(f"  MISS  {name}", file=sys.stderr)
+        print("  Nothing was written. Re-anchor against the pinned source, or confirm the\n"
+              "  behaviour is native and move the patch to NATIVE_REQUIRED.", file=sys.stderr)
+        return 1
 
-    if changed and not audit:
-        target.write_text(text, encoding="utf-8")
-        print(f"[patch_harbor] Written: {target}")
-    elif changed:
-        print(f"[patch_harbor] Would write (audit): {target}")
-    else:
-        print(f"[patch_harbor] Nothing to do: {target}")
-
-    # A missing trial.py is itself drift worth reporting, not a traceback.
-    try:
-        trial = find_harbor_trial()
-    except RuntimeError as exc:
-        print(f"[patch_harbor] trial.py: NOT found -- {exc}", file=sys.stderr)
-        failures.append("trial.py not found (collect hook + JUDGE_MODEL inject unapplied)")
-        _report(failures, audit)
-        return
-    trial_text = trial.read_text(encoding="utf-8")
-    trial_changed = False
-
-    if ALREADY_PATCHED_MARKER_COLLECT in trial_text:
-        print(f"[patch_harbor] Collect hook: already applied")
-    elif ANCHOR_COLLECT_V1 in trial_text:
-        trial_text = trial_text.replace(ANCHOR_COLLECT_V1, REPLACEMENT_COLLECT_V1, 1)
-        trial_changed = True
-        print(f"[patch_harbor] Collect hook: upgraded from v1")
-    elif ANCHOR_COLLECT not in trial_text:
-        print(
-            f"[patch_harbor] Collect hook: NOT applied -- anchor not found in {trial}",
-            file=sys.stderr,
-        )
-        failures.append(f"collect hook  ({trial.name})")
-    else:
-        trial_text = trial_text.replace(ANCHOR_COLLECT, REPLACEMENT_COLLECT, 1)
-        trial_changed = True
-        print(f"[patch_harbor] Collect hook: applied")
-
-    if ALREADY_PATCHED_MARKER_JUDGE_MODEL in trial_text:
-        print(f"[patch_harbor] JUDGE_MODEL inject: already applied")
-    elif ANCHOR_JUDGE_MODEL_1 not in trial_text:
-        print(
-            f"[patch_harbor] JUDGE_MODEL inject: NOT applied -- anchor not found in {trial}",
-            file=sys.stderr,
-        )
-        failures.append(f"JUDGE_MODEL inject  ({trial.name})")
-    else:
-        trial_text = trial_text.replace(ANCHOR_JUDGE_MODEL_1, REPLACEMENT_JUDGE_MODEL_1, 1)
-        trial_text = trial_text.replace(ANCHOR_JUDGE_MODEL_2, REPLACEMENT_JUDGE_MODEL_2, 1)
-        trial_changed = True
-        print(f"[patch_harbor] JUDGE_MODEL inject: applied")
-
-    if trial_changed and not audit:
-        trial.write_text(trial_text, encoding="utf-8")
-        print(f"[patch_harbor] Written: {trial}")
-    elif trial_changed:
-        print(f"[patch_harbor] Would write (audit): {trial}")
-
-    # A missing jobs.py is itself drift worth reporting, not a traceback.
-    try:
-        jobs = find_harbor_jobs()
-    except RuntimeError as exc:
-        print(f"[patch_harbor] jobs.py: NOT found -- {exc}", file=sys.stderr)
-        failures.append("jobs.py not found (score-table suppression unapplied)")
-        _report(failures, audit)
-        return
-    jobs_text = jobs.read_text(encoding="utf-8")
-    jobs_changed = False
-
-    if ALREADY_PATCHED_MARKER_SUPPRESS_SCORES in jobs_text:
-        print(f"[patch_harbor] Score-table suppression: already applied")
-    elif ANCHOR_SUPPRESS_SCORES not in jobs_text:
-        print(
-            f"[patch_harbor] Score-table suppression: NOT applied -- anchor not found in {jobs}",
-            file=sys.stderr,
-        )
-        failures.append(f"score-table suppression  ({jobs.name})")
-    else:
-        jobs_text = jobs_text.replace(
-            ANCHOR_SUPPRESS_SCORES, REPLACEMENT_SUPPRESS_SCORES, 1
-        )
-        jobs_changed = True
-        print(f"[patch_harbor] Score-table suppression: applied")
-
-    if jobs_changed and not audit:
-        jobs.write_text(jobs_text, encoding="utf-8")
-        print(f"[patch_harbor] Written: {jobs}")
-    elif jobs_changed:
-        print(f"[patch_harbor] Would write (audit): {jobs}")
-
-    _report(failures, audit)
-
-
-def _report(failures: list[str], audit: bool) -> None:
-    """Print one consolidated verdict and set the exit code.
-
-    Every patch is attempted before this runs, so a harbor upgrade yields the
-    full list of drifted anchors in one go instead of one per invocation.
-    """
-    if not failures:
-        print("[patch_harbor] All patches accounted for.")
-        return
-
-    print(f"\n[patch_harbor] ---- {len(failures)} patch(es) could not be applied ----",
-          file=sys.stderr)
-    for name in failures:
-        print(f"  MISS  {name}", file=sys.stderr)
-    print(
-        "\n  Harbor's source has drifted from these anchors -- most likely it was\n"
-        "  upgraded. For each one, either re-anchor it against the new source, or\n"
-        "  confirm harbor now provides the behaviour natively and detect that\n"
-        "  instead (see NATIVE_PREBAKE_GUARD for the worked example).\n"
-        "  Re-run with --audit to re-check without writing.",
-        file=sys.stderr,
-    )
-    if not audit:
-        sys.exit(1)
+    for path, text in texts.items():
+        if text == original[path]:
+            continue
+        if audit:
+            print(f"[patch_harbor] would write (audit): {path}")
+            continue
+        if path.suffix == ".py":
+            compile(text, str(path), "exec")
+        path.write_text(text, encoding="utf-8")
+        print(f"[patch_harbor] written: {path}")
+    print(f"[patch_harbor] harbor {found}: all patches accounted for.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv[1:]))

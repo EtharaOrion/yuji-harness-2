@@ -24,8 +24,8 @@ WHY THIS SHAPE
     only the bridge's shared secret, which can do one thing: ask the bridge for
     a completion. Harbor's claude-code agent needs the OAuth token itself inside
     the container the agent has root in.
-  * Nothing is installed at trial time. The agent phase runs with the network
-    closed (tools/network/egress-proxy/overlay.yaml), so the SDK comes from the
+  * Nothing is installed at trial time. The agent phase may run with the network
+    closed (the task's [agent] network_mode), so the SDK comes from the
     openhands-runtime image, mounted read-only at /opt/openhands-runtime by
     tools/openhands_agent/overlay.yaml. install() only checks it is there and
     uploads the runner. A missing runtime is a refusal, never a pip install.
@@ -127,7 +127,7 @@ class OpenHandsAgentOptions(InstalledAgentOptions):
 
 
 class OpenHandsAgent(BaseInstalledAgent):
-    capabilities = AgentCapabilities(atif=True)
+    capabilities = AgentCapabilities(atif=True, mcp_servers=True)
     options_model = OpenHandsAgentOptions
     options: OpenHandsAgentOptions
 

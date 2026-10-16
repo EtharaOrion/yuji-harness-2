@@ -1,0 +1,13 @@
+# The ccbridge listens on the host. Added by scripts/run_task.sh only when
+# Harbor's docker egress control is OFF for the trial (every phase public).
+#
+# When it is ON, Harbor runs main with `network_mode: service:<egress sidecar>`,
+# Docker refuses extra_hosts on such a container ("conflicting options: custom
+# host-to-IP mapping and the network mode"), and host.docker.internal resolves
+# through the sidecar instead. Measured on harbor 0.24.0: with this mapping and
+# a closed agent phase the trial failed at container create; without it and
+# with --allow-agent-host host.docker.internal, main reached a host server.
+services:
+  main:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

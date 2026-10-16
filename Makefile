@@ -5,7 +5,7 @@ VERSION = 1.2.7
 GHCR_REPO = ghcr.io/scaleapi/mcp-atlas
 
 .PHONY: build run-docker shell push install-harness run-harness install-python run-eval test \
-	build-openhands-runtime ccbridge-check test-ccbridge
+	build-openhands-runtime build-headroom-compress ccbridge-check test-ccbridge install-harbor
 
 # ---------------------------------------------------------------------------
 # Agent Environment (docker image with the 36 MCP servers)
@@ -65,6 +65,12 @@ test: # verify mcp_server_template.json and install_mcp_packages.sh stay in sync
 
 build-openhands-runtime: # the OpenHands SDK tree the agent mounts; run_task.sh preflight builds it too
 	docker build -t openhands-runtime:latest tools/openhands_agent
+
+build-headroom-compress: # the agent-path Headroom proxy (AGENT_HEADROOM_ENABLED=true); preflight builds it too
+	docker build --build-context scoring=services/scoring -t headroom-compress:latest tools/headroom
+
+install-harbor: # the pinned harbor, hash-checked (scripts/lib/harbor.sh)
+	bash scripts/lib/harbor.sh install
 
 ccbridge-check: # does this machine's Claude login load and refresh? spends no tokens
 	cd tools/bridges/ccbridge && uv run python -m claude_oauth --check

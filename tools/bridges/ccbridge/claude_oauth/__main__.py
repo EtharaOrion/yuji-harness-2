@@ -51,6 +51,11 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         port=args.port,
         log_level=args.log_level,
+        # uvicorn's 5s default closes a pooled connection while the agent runs a
+        # tool. Behind harbor's egress sidecar the client never sees that close,
+        # reuses the socket, and gets "Server disconnected without sending a
+        # response". Outlast the longest gap between model calls.
+        timeout_keep_alive=600,
     )
     return 0
 

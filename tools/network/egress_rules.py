@@ -30,9 +30,9 @@ before the command does.
 
 FAIL-OPEN IS DELIBERATE (hook mode only)
 
-The routing table is the enforcement boundary: tools/network/egress-proxy/
-overlay.yaml leaves the agent's network with no gateway, so a command this hook
-misses still cannot reach anything. The hook exists to turn a 30-second
+Harbor's egress sidecar is the enforcement boundary: it applies the task's
+declared agent-phase network_mode during agent.run(), so a command this hook
+misses still cannot reach anything the task did not allow. The hook exists to turn a 30-second
 connection timeout into an immediate, legible refusal, which is worth several
 turns per run but is not worth a benchmark that dies whenever this file has a
 bug. Anything unexpected in hook mode therefore exits 0 and lets the command
@@ -54,23 +54,15 @@ from pathlib import Path
 # Reachable over the compose bridge, not over the internet. A curl at any of
 # these is the bundle working as designed.
 #
-# Peer definition: tools/network/egress-proxy/overlay.yaml's NO_PROXY is the same
-# set applied to the run rather than to the transcript, and squid.conf's comment
-# makes keeping the two in agreement a standing pact.
-# scripts/tests/test_egress_allowlist.py enforces it.
-#
-# host.docker.internal is deliberately absent -- `internal: true` leaves the
-# bridge with no gateway, so the host-gateway address has no route no matter
-# what the proxy settings say, and a call to it is a real failed egress attempt.
+# host.docker.internal is deliberately absent: it is the host, not the bundle,
+# and the only legitimate caller of it is the agent's own model route (a bridge
+# the harness allows by name), never a tool call the model makes.
 # 0.0.0.0 IS here: as a DESTINATION it is a local bind address, and
 # `curl 0.0.0.0:8000` against a server the agent just started is ordinary local
 # work. is_internal() does not otherwise cover it (it matches 127.* and
 # localhost, not 0.0.0.0).
-# judge is the bundle's rubric judge container (tools/judge): a sibling on the
-# same bridge that test.sh calls. Its own way out goes through judge-proxy, on a
-# network main never joins, so a curl at it leaves nothing.
 INTERNAL_HOSTS = {
-    "light-servers", "localhost", "127.0.0.1", "0.0.0.0", "::1", "main", "judge",
+    "light-servers", "localhost", "127.0.0.1", "0.0.0.0", "::1", "main",
 }
 
 # --------------------------------------------------------------------------
@@ -669,10 +661,9 @@ def classify_tool(tool_name: str, tool_input: dict) -> list[Finding]:
 #
 # When this hook refuses a command, the command never runs and the step's
 # response is this text instead of any program's output. That is the difference
-# between "the proxy denied it" and "it never reached the proxy", and without a
-# marker the audit cannot tell them apart -- it reported a hook refusal as
-# "the egress proxy refused every attempt", which is a sentence about a
-# component that never saw the request.
+# between "the network refused it" and "it never reached the network", and
+# without a marker the audit cannot tell them apart -- it would credit a hook
+# refusal to a component that never saw the request.
 DENIAL_MARKER = "BLOCKED: this command reaches the public internet"
 
 DENIAL = """\

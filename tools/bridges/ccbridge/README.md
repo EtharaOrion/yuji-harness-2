@@ -78,7 +78,7 @@ uv run python -m claude_oauth --host 127.0.0.1 --port 8765
 
 Nothing outlives the run, so there is no stale bridge on old code, no port
 clash, and no secret that another checkout has to match. Concurrent runs each
-get their own bridge, and each run's squid config opens only its own port.
+get their own bridge on their own port.
 Logs go to `logs/run-<job>-<pid>.log`.
 
 **One shared bridge** (`CCBRIDGE_SHARED=1`): the older arrangement.
@@ -119,12 +119,11 @@ where a loopback listener cannot be reached, so on Linux the bridge binds
 `0.0.0.0`. The secret is then the only thing guarding it, so keep the port
 firewalled from the network.
 
-**Under network isolation** the agent has no route of its own.
-`tools/network/egress-proxy/squid-ccbridge.conf` adds exactly one destination to
-squid's allowlist: `host.docker.internal` on the bridge's port. The squid
-access log records every model call, and the internet audit is told
-(`--proxy-allow host.docker.internal`) that these calls are the model, not a
-breach.
+**Under a closed agent phase** (the task's `[agent] network_mode` is
+`allowlist` or `no-network`), `run_task.sh` passes Harbor
+`--allow-agent-host host.docker.internal`, which Harbor merges into the agent
+allowlist so the agent can reach the bridge. Harbor's egress sidecar enforces
+the rest of the task's policy.
 
 ## Caveats
 

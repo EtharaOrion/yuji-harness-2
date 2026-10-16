@@ -13,7 +13,7 @@ reshaped the Harbor job:
 Data sources (all already on disk when this runs):
     <run-dir>/result.json                 tokens, cost, model, trial name, timing
     <run-dir>/agent/trajectory.json       cache-token split
-    <run-dir>/verifier/judge_tokens.json  judge_lines (written by rubric_judge_cli)
+    <run-dir>/verifier/judge_tokens.json  judge_lines (written by the bundle's judge)
     <job-dir>/summary.json                run config (model/agent), if present
     tools.finance.claude_account                  subscription_id, fetched once and cached
 
@@ -224,7 +224,7 @@ def iso8601(raw, fallback_mtime: float | None = None) -> str:
 
 
 def judge_lines(run_dir: Path) -> list[dict]:
-    """judge_tokens.json as written by rubric_judge_cli.py --token-output."""
+    """judge_tokens.json as written by the bundle's own judge (tests/)."""
     raw = read_json(run_dir / "verifier" / "judge_tokens.json")
     if raw is None:
         return []

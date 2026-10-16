@@ -1,0 +1,37 @@
+# Agent-path Headroom: the proxy the agent's model calls go through.
+#
+# Added by scripts/run_task.sh only when AGENT_HEADROOM_ENABLED=true. run_task
+# exports ANTHROPIC_BASE_URL=http://headroom:8787 and harbor forwards it into
+# main. Neither service declares networking of its own, so harbor's egress
+# sidecar governs both under the task's agent-phase policy; run_task.sh adds
+# `headroom` (and, on GLM, host.docker.internal) with --allow-agent-host.
+services:
+  main:
+    depends_on:
+      headroom:
+        condition: service_healthy
+
+  headroom:
+    image: headroom-compress:latest
+    # Bounded and restarted, because this container is the agent's ONLY route to
+    # the model. A run died exactly here: the docker VM hit a global OOM, the
+    # kernel picked this process, and Claude Code ended the session with "API
+    # Error: Can't reach the API server (EAI_AGAIN)" -- docker stops resolving
+    # the name of a container that is gone. The limit keeps it from being the
+    # cause; the restart gives a retry something to reach. 1 GB is ample: the
+    # library build measures ~250 MB resident.
+    mem_limit: 1g
+    restart: unless-stopped
+    environment:
+      # api.anthropic.com, or zbridge on the host for a GLM run. Set per run by
+      # scripts/run_task.sh.
+      ANTHROPIC_TARGET_API_URL: "${HEADROOM_UPSTREAM:?set per run by scripts/run_task.sh}"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      # Measured 17s to healthy: the proxy retries its own startup fetches
+      # before serving. A shorter period marks main's dependency failed.
+      start_period: 30s

@@ -43,10 +43,10 @@ Two things deliberately do not:
   Claude OAuth token (or the z.ai key) in the container the agent has root in,
   which is the one thing this design keeps out.
 
-Under network isolation the `main → host` hop goes through squid, which allows
-exactly `host.docker.internal:<bridge port>` in addition to the usual list
-(`tools/network/egress-proxy/squid-ccbridge.conf`). LiteLLM honours
-`HTTP_PROXY`, so the agent needs no configuration of its own for it.
+Under a closed agent phase the `main → host` hop is allowed by name:
+`run_task.sh` passes Harbor `--allow-agent-host host.docker.internal`, which
+Harbor merges into the task's agent allowlist. The agent needs no configuration
+of its own for it.
 
 ## What the runner writes, and why in that shape
 
@@ -122,8 +122,8 @@ the reshaper classifies it as infrastructure, not as the model's failure.
 | Cost in trajectories | LiteLLM's API-equivalent price | `0.0`: LiteLLM has no price for `glm-5.3` |
 
 zbridge speaks the same Anthropic protocol as the ccbridge, so the agent is
-identical on both; only the URL it is handed differs. Under isolation, squid
-opens zbridge's port instead of the ccbridge's.
+identical on both; only the URL it is handed differs, and both live at
+`host.docker.internal`.
 
 ## Options
 
@@ -204,7 +204,7 @@ deliverable quotes it:
   the runtime's wheels are resolved against. Every bundle here builds on
   `python:3.12-slim`; an alpine (musl) image cannot load the runtime.
 - The SDK makes non-streaming calls, so one long thinking turn is one silent
-  wait. The agent, the bridge and squid all allow 30 minutes per call.
+  wait. The agent and the bridge both allow 30 minutes per call.
 - The SDK has no equivalent of Claude Code's `--disallowedTools` or PreToolUse
   hook, so the egress guard hook is not installed. The browser tool is not
   loaded, so there are no web tools to withhold, and the routing table remains

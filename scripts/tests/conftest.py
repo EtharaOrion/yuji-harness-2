@@ -48,18 +48,18 @@ def mirror_harbor_package(tmp_path: Path) -> bool:
         pkg = cc.parent.parent.parent
         for src, dest_rel in (
             (pkg / "agents" / "installed" / "claude_code.py", rel),
-            (pkg / "trial" / "trial.py",
-             rel.parent.parent.parent / "trial" / "trial.py"),
-            # patch_harbor.py's score-table suppression rewrites this one; without
-            # it the patcher reports a MISS, exits non-zero, and every stubbed
-            # harbor stage dies before dispatch.
-            (pkg / "cli" / "jobs.py",
-             rel.parent.parent.parent / "cli" / "jobs.py"),
         ):
             if src.exists():
                 dest = tmp_path / dest_rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(src.read_text())
+        # patch_harbor.py refuses any harbor that is not the pinned version, and
+        # reads the version from the package's own dist-info.
+        site = pkg.parent
+        for meta in site.glob("harbor-*.dist-info/METADATA"):
+            dest = tmp_path / meta.relative_to(venv_root)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(meta.read_text())
         return True
     return False
 
