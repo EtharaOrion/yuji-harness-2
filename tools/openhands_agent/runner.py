@@ -703,12 +703,7 @@ def pin_bedrock_alias_resolution() -> bool:
 
     _resolver_logged: dict[str, bool] = {}
 
-    def _resolve(m):
-        if not isinstance(m, str) or not m.startswith("bedrock/"):
-            return m
-        bare = m[len("bedrock/"):]
-        if bare.startswith("arn:aws:"):
-            return m
+    def _lookup(bare: str) -> tuple[str | None, list[str]]:
         aliases: list[str] = []
         for pair in os.environ.get("BEDROCK_MODEL_IDS", "").split(","):
             key, _, val = pair.partition("=")
@@ -717,25 +712,56 @@ def pin_bedrock_alias_resolution() -> bool:
                 continue
             aliases.append(key)
             if key == bare and val:
-                if not _resolver_logged.get("hit"):
-                    print(f"[openhands] bedrock resolver: '{bare}' -> ARN "
-                          f"(container aliases: {aliases})", file=sys.stderr)
-                    _resolver_logged["hit"] = True
-                return "bedrock/" + val
-        if not _resolver_logged.get("miss"):
-            print(f"[openhands] bedrock resolver MISS: alias '{bare}' not in "
-                  f"container BEDROCK_MODEL_IDS (aliases seen: {aliases}, "
-                  f"env-var length: {len(os.environ.get('BEDROCK_MODEL_IDS', ''))})",
-                  file=sys.stderr)
-            _resolver_logged["miss"] = True
-        return m
+                return val, aliases
+        return None, aliases
+
+    def _resolve_kwargs(kwargs: dict) -> None:
+        """Rewrite kwargs["model"] from bedrock alias to full ARN, in place.
+
+        OpenHands SDK's ProviderInfo parses "bedrock/<alias>" into
+        model="<alias>" + custom_llm_provider="bedrock" before calling
+        litellm_completion, so a check that only looks at a "bedrock/" prefix
+        on the model never fires. Detect bedrock by either form.
+        """
+        model = kwargs.get("model")
+        if not isinstance(model, str):
+            return
+        has_prefix = model.startswith("bedrock/")
+        is_bedrock = has_prefix or kwargs.get("custom_llm_provider") == "bedrock"
+        if not is_bedrock:
+            return
+        bare = model[len("bedrock/"):] if has_prefix else model
+        if bare.startswith("arn:aws:"):
+            return
+        arn, aliases = _lookup(bare)
+        if arn is None:
+            if not _resolver_logged.get("miss"):
+                print(f"[openhands] bedrock resolver MISS: alias '{bare}' not in "
+                      f"container BEDROCK_MODEL_IDS (aliases seen: {aliases}, "
+                      f"env-var length: {len(os.environ.get('BEDROCK_MODEL_IDS', ''))})",
+                      file=sys.stderr)
+                _resolver_logged["miss"] = True
+            return
+        kwargs["model"] = ("bedrock/" + arn) if has_prefix else arn
+        if not _resolver_logged.get("hit"):
+            print(f"[openhands] bedrock resolver: '{bare}' -> ARN "
+                  f"(prefix_form={has_prefix}, aliases={aliases})", file=sys.stderr)
+            _resolver_logged["hit"] = True
+
+    def _resolve_positional(m):
+        """Positional first-arg path (direct litellm.completion(model, ...))."""
+        if not isinstance(m, str) or not m.startswith("bedrock/"):
+            return m
+        kwargs = {"model": m}
+        _resolve_kwargs(kwargs)
+        return kwargs["model"]
 
     def _wrap(orig):
         def completion(*args, **kwargs):
             if "model" in kwargs:
-                kwargs["model"] = _resolve(kwargs["model"])
+                _resolve_kwargs(kwargs)
             elif args:
-                args = (_resolve(args[0]),) + args[1:]
+                args = (_resolve_positional(args[0]),) + args[1:]
             return orig(*args, **kwargs)
         completion._bedrock_alias_original = orig  # type: ignore[attr-defined]
         return completion
@@ -743,9 +769,9 @@ def pin_bedrock_alias_resolution() -> bool:
     def _wrap_async(orig):
         async def acompletion(*args, **kwargs):
             if "model" in kwargs:
-                kwargs["model"] = _resolve(kwargs["model"])
+                _resolve_kwargs(kwargs)
             elif args:
-                args = (_resolve(args[0]),) + args[1:]
+                args = (_resolve_positional(args[0]),) + args[1:]
             return await orig(*args, **kwargs)
         acompletion._bedrock_alias_original = orig  # type: ignore[attr-defined]
         return acompletion
