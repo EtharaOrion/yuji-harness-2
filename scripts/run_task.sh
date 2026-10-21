@@ -13,24 +13,56 @@
 #
 #   scripts/run_task.sh --stage reshape tasks/foo               # one stage only
 #
-# The default agent is OpenHands (tools/openhands_agent), on the host's Claude
-# subscription through a ccbridge (tools/bridges/ccbridge) that this run starts
-# and stops. The bridge holds the OAuth token; the agent's container gets only
-# the bridge's per-run secret. With CC_MODE=zbridge the same agent runs on GLM
-# through zbridge instead. With CC_MODE=bedrock the agent calls AWS Bedrock
-# directly from the container with AWS_BEARER_TOKEN_BEDROCK and AWS_REGION
-# forwarded in; no host bridge is started. See tools/openhands_agent/README.md.
+# The default agent is OpenHands (tools/openhands_agent). CC_MODE picks the
+# model route and, where the route exposes a second key, also the judge wire
+# that the bundle's rubric runs against:
+#
+#   unset (default) ccbridge -> host's Claude subscription (OAuth). Agent only;
+#                   judge takes CALLER_ANTHROPIC_API_KEY (or ANTHROPIC_API_KEY
+#                   from .env) direct to api.anthropic.com.
+#   CC_MODE=zbridge zbridge on :8766 -> GLM for the agent. Judge wire unchanged
+#                   (same ANTHROPIC_API_KEY -> api.anthropic.com path).
+#   CC_MODE=bedrock no host bridge; the agent calls AWS Bedrock directly from
+#                   the container with AWS_BEARER_TOKEN_BEDROCK and AWS_REGION
+#                   forwarded in. The judge also runs on Bedrock in-process via
+#                   litellm.acompletion against JUDGE_MODEL (BEDROCK_MODEL_IDS
+#                   alias) using the same AWS creds.
+#   CC_MODE=kiro    kiro_bridge on 127.0.0.1 (ephemeral port) exposes two keys:
+#                   agent_key pinned to KIRO_MODEL, judge_key pinned to
+#                   KIRO_JUDGE_MODEL. Both sides hit kiro-cli; agent and judge
+#                   models can be set independently per run.
+#
+# See tools/openhands_agent/README.md and tools/bridges/<mode>/README.md.
 #
 # Env overrides: AGENT (openhands) MODEL (claude-opus-5) N (1) JOB (<task slug>)
 #                OUTPUT_DIR (<repo>/output) COPY_TO (unset) BUILD_MULT (3) AT (auto)
 #                STAGE (all) RUN_OFFSET (auto) SETUP_MULT (6)
 #                DISALLOWED_TOOLS (WebSearch,WebFetch)
-#                CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766;
-#                         "bedrock" -> AWS Bedrock direct, no host bridge)
+#                CC_MODE (unset -> ccbridge on Claude subscription;
+#                         "zbridge" -> glm-5.3 via :8766;
+#                         "bedrock" -> AWS Bedrock direct, no host bridge;
+#                         "kiro"    -> kiro_bridge, two-key agent+judge split)
 #   bedrock:     AWS_BEARER_TOKEN_BEDROCK (required) BEDROCK_AWS_REGION (required)
-#                BEDROCK_MODEL_IDS (alias1=id1,alias2=id2 map, resolves MODEL)
+#                BEDROCK_MODEL_IDS (alias1=id1,alias2=id2 map, resolves MODEL
+#                and JUDGE_MODEL to full Bedrock inference-profile ARNs)
+#                JUDGE_MODEL (defaults to MODEL; alias from BEDROCK_MODEL_IDS)
+#                AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (optional, enables
+#                the pre-flight bedrock:ListFoundationModels credential check;
+#                set BEDROCK_CHECK_OFF=1 to skip)
 #                CC_BRIDGE_ENABLED (0)
 #                AGENT_HEADROOM_ENABLED (false)
+#   kiro:        KIRO_MODEL (default: $MODEL; pinned on the agent key)
+#                KIRO_JUDGE_MODEL (default: $MODEL; pinned on the judge key,
+#                injected into the verifier as JUDGE_MODEL via --ve)
+#                KIRO_BRIDGE_START_TIMEOUT_SEC (60) JUDGE_WIRE (anthropic)
+#                kiro-cli must be logged in on the host; the bridge mints a
+#                per-run agent_key and judge_key and tears both down at exit.
+#   judge:       ANTHROPIC_API_KEY (ccbridge/zbridge: the key the rubric judge
+#                calls api.anthropic.com with; auto-set for bedrock/kiro by
+#                this script)
+#                JUDGE_MODEL (bedrock/kiro: which model the judge runs on;
+#                defaults to the agent MODEL when unset)
+#                JUDGE_WIRE (anthropic|openai; kiro default anthropic)
 #   openhands:   CCBRIDGE_SHARED (0: a ccbridge per run, on a free port, stopped
 #                at exit; 1: one long-lived bridge on CCBRIDGE_PORT (8765) with
 #                CCBRIDGE_SECRET or tools/bridges/ccbridge/.bridge_secret)
