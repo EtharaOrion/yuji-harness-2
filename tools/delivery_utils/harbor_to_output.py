@@ -439,6 +439,50 @@ def _dump(p: Path, obj) -> None:
     p.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _dump_toml_scalar(p: Path, obj) -> None:
+    """Reward published as TOML; this is now the ONLY on-disk format.
+
+    reward.json is no longer emitted into output/. Readers (run_batch,
+    reshape merge, aggregates tests) all go through _load_toml below.
+    Nested fields (caveats list, components dict) are dropped on purpose:
+    TOML must stay trivially parseable, and the full breakdown lives in
+    detail.json next to it. Harbor's OWN internal reward.json path
+    (inside the trial dir, not output/) is unaffected.
+    """
+    lines = []
+    for k, v in obj.items():
+        if isinstance(v, bool):
+            lines.append(f"{k} = {str(v).lower()}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k} = {v}")
+        elif isinstance(v, str):
+            esc = v.replace("\\", "\\\\").replace("\"", "\\\"")
+            lines.append(f"{k} = \"{esc}\"")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _load_toml(p: Path, default):
+    """Read a scalar-dict TOML file written by _dump_toml_scalar.
+
+    tomllib is Python 3.11+ stdlib. Missing/unparseable files return
+    `default` rather than raising, so callers that iterate run dirs can
+    skip legacy or partial trials without a special case.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        return default
+    try:
+        if not p.exists():
+            return default
+        return tomllib.loads(p.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return default
+    except Exception:  # noqa: BLE001 - tomllib raises TOMLDecodeError
+        return default
+
+
 # Harbor artifacts we deliberately do not carry into output/. trial.log is a
 # byte-identical triplicate of the job-level job.log, and lock.json only records
 # the harbor invocation that produced the job — both are read during reshaping
@@ -1287,7 +1331,7 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
           run_dir / "logs" / "light-servers-tool-calls.log")
     # The bundle's own verifier outputs, published as written so a reader can
     # check the reward against the channels the bundle's tests computed.
-    for f in ("ctrf.json", "reward.json", "reward_channel_a.json",
+    for f in ("ctrf.json", "reward_channel_a.json",
               "reward_channel_c.json",
               "detail.json",
               "rubric_breakdown.json", "judge_tokens.json",
@@ -1396,7 +1440,12 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
         (ldir / "verifier-reward.txt").write_text(reward_txt_val + "\n", encoding="utf-8")
     if not (vdir / "detail.json").exists():
         _dump(vdir / "detail.json", detail_doc)
-    _dump(vdir / "reward.json", reward_pct_doc)
+    _dump_toml_scalar(vdir / "reward.toml", reward_pct_doc)
+    # reward.json is intentionally not published to output/. Harbor writes it
+    # inside its own trial dir (needed by Harbor), and various in-place copies
+    # upstream may land it here; drop it so the published verifier/ carries
+    # only reward.toml. The .raw/verifier/ copy still holds the JSON for audit.
+    (vdir / "reward.json").unlink(missing_ok=True)
     _rbd = _load(vdir / "rubric_breakdown.json", {}) or {}
     if _rbd:
         for _k in ("score", "rc", "rb"):
@@ -1436,7 +1485,7 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
         "messages": stream["messages"],
     })
     _copy(stream_path, raw_run / "agent.log")
-    for f in ("ctrf.json", "detail.json", "reward.json"):
+    for f in ("ctrf.json", "detail.json"):
         _copy(ver / f, raw_run / f)
     _copy(ver, raw_run / "verifier")
     rver = raw_run / "verifier"
@@ -1450,7 +1499,7 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
         _dump(raw_run / "detail.json", detail_doc)
     if not (rver / "detail.json").exists():
         _dump(rver / "detail.json", detail_doc)
-    _dump(rver / "reward.json", reward_pct_doc)
+    _dump_toml_scalar(rver / "reward.toml", reward_pct_doc)
     _dump(raw_run / "rubric.json", {"format": "criteria", "rubric_score": norm_reward(rubric_val), "per_criterion": rubric_entries})
 
     # Cut the published cost/rate fields to two places -- deliberately AFTER the
@@ -1469,7 +1518,7 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     # the bundle's tests wrote. finance_reporter reads its cost from the
     # PUBLISHED trajectory.json, so what it posts is cut too.
     norm_metrics_file(run_dir / "agent" / "trajectory.json")
-    for _f in ("judge_tokens.json", "reward.json"):
+    for _f in ("judge_tokens.json",):
         norm_metrics_file(run_dir / "verifier" / _f)
     with (raw_run / "trace.jsonl").open("w", encoding="utf-8") as fh:
         for r in stream["trace"]:
@@ -1952,7 +2001,7 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         if _traj_dir.is_dir():
             for _rd in sorted(_traj_dir.glob("run_*"),
                               key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else 0):
-                _rw = _load(_rd / "verifier" / "reward.json", {}) or {}
+                _rw = _load_toml(_rd / "verifier" / "reward.toml", {}) or {}
                 if _rw.get("reward") is None:
                     continue
                 _disk_rewards.append(float(_rw["reward"]))

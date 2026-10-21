@@ -9,7 +9,7 @@ Runs inference and evaluation over the task bundles with [Harbor](https://github
 
 | Concern | Owner | Mechanism |
 |---|---|---|
-| Scoring | bundle | `tests/` run by harbor in the verifier environment; the reshaper publishes `verifier/reward.json` as written and never recomputes it |
+| Scoring | bundle | `tests/` run by harbor in the verifier environment; the reshaper publishes `verifier/reward.toml` from the bundle's own reward and never recomputes it |
 | Verifier environment | bundle | `[verifier] environment_mode` (`separate`: built from `[verifier.environment].docker_image`, else `tests/Dockerfile`, else `[environment]`) |
 | Network policy | bundle | `network_mode` in `[environment]`, `[agent]`, `[verifier]`, enforced by harbor's docker egress-control sidecar, which refuses a trial it cannot enforce |
 | Model route | harness | a bridge on the host, passed to harbor as `--allow-agent-host` |
@@ -108,6 +108,11 @@ Env overrides: AGENT (openhands) MODEL (claude-opus-5) N (1) JOB (<task slug>)
                BEDROCK_MODEL_IDS (alias1=id1,alias2=id2 map, resolves MODEL
                and JUDGE_MODEL to full Bedrock inference-profile ARNs)
                JUDGE_MODEL (defaults to MODEL; alias from BEDROCK_MODEL_IDS)
+               JUDGE_MODE (bedrock | kiro | anthropic | openai; selects the
+               judge wire independently of the agent. default: bedrock)
+                 JUDGE_MODE=kiro      needs kiro-cli login + KIRO_JUDGE_MODEL
+                 JUDGE_MODE=anthropic needs ANTHROPIC_API_KEY (direct call)
+                 JUDGE_MODE=openai    needs OPENAI_API_KEY (direct call)
                AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (optional, enables
                the pre-flight bedrock:ListFoundationModels credential check;
                set BEDROCK_CHECK_OFF=1 to skip)
@@ -224,6 +229,39 @@ Three guards fire before the agent phase:
 1. `AWS_BEARER_TOKEN_BEDROCK` + `BEDROCK_AWS_REGION` must be set, else the run is refused.
 2. `MODEL` and `JUDGE_MODEL` must resolve through `BEDROCK_MODEL_IDS`, else the run is refused with the list of known aliases.
 3. If `AWS_ACCESS_KEY_ID` is set, a `bedrock:ListFoundationModels` ping validates the creds at startup instead of 20 minutes into the trial.
+
+#### Picking a different judge wire with `JUDGE_MODE`
+
+`CC_MODE=bedrock` locks the agent to Bedrock, but the judge wire is independent. Set `JUDGE_MODE` to compare judge models across runs without changing the agent:
+
+| `JUDGE_MODE` | Judge wire | Env vars needed | Pre-flight check |
+|---|---|---|---|
+| `bedrock` (default) | AWS Bedrock Converse via `boto3` | existing `AWS_BEARER_TOKEN_BEDROCK` + `BEDROCK_MODEL_IDS` | strong: SigV4 live ping + ARN resolution |
+| `kiro` | kiro-cli through the vendored kiro_bridge | `kiro-cli login` on host + `KIRO_JUDGE_MODEL` | medium: Python import + bridge start |
+| `anthropic` | direct `api.anthropic.com` | `ANTHROPIC_API_KEY` + optional `JUDGE_MODEL` | weak: env var existence |
+| `openai` | direct `api.openai.com` | `OPENAI_API_KEY` + optional `JUDGE_MODEL` | weak: env var existence |
+
+```bash
+# agent on Bedrock, judge on kiro (gpt-5.6-sol)
+CC_MODE=bedrock JUDGE_MODE=kiro \
+  MODEL=claude-opus-5 \
+  KIRO_JUDGE_MODEL=gpt-5.6-sol \
+  scripts/run_task.sh tasks/<slug>
+
+# agent on Bedrock, judge on Anthropic subscription
+CC_MODE=bedrock JUDGE_MODE=anthropic \
+  MODEL=claude-opus-5 JUDGE_MODEL=claude-sonnet-5 \
+  ANTHROPIC_API_KEY=sk-ant-api03-... \
+  scripts/run_task.sh tasks/<slug>
+
+# agent on Bedrock, judge on OpenAI
+CC_MODE=bedrock JUDGE_MODE=openai \
+  MODEL=claude-opus-5 JUDGE_MODEL=gpt-5-turbo \
+  OPENAI_API_KEY=sk-... \
+  scripts/run_task.sh tasks/<slug>
+```
+
+`JUDGE_MODE` is only honored when `CC_MODE=bedrock`. Unknown values are rejected with `JUDGE_MODE ERROR: unknown value 'X' (expected: bedrock | anthropic | openai | kiro)` and `exit 4` before the agent starts.
 
 ### `CC_MODE=kiro`
 
