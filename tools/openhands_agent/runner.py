@@ -701,16 +701,33 @@ def pin_bedrock_alias_resolution() -> bool:
         print(f"[openhands] bedrock alias resolution not installed: {exc}", file=sys.stderr)
         return False
 
+    _resolver_logged: dict[str, bool] = {}
+
     def _resolve(m):
         if not isinstance(m, str) or not m.startswith("bedrock/"):
             return m
         bare = m[len("bedrock/"):]
         if bare.startswith("arn:aws:"):
             return m
+        aliases: list[str] = []
         for pair in os.environ.get("BEDROCK_MODEL_IDS", "").split(","):
             key, _, val = pair.partition("=")
-            if key.strip() == bare and val.strip():
-                return "bedrock/" + val.strip()
+            key, val = key.strip(), val.strip()
+            if not key:
+                continue
+            aliases.append(key)
+            if key == bare and val:
+                if not _resolver_logged.get("hit"):
+                    print(f"[openhands] bedrock resolver: '{bare}' -> ARN "
+                          f"(container aliases: {aliases})", file=sys.stderr)
+                    _resolver_logged["hit"] = True
+                return "bedrock/" + val
+        if not _resolver_logged.get("miss"):
+            print(f"[openhands] bedrock resolver MISS: alias '{bare}' not in "
+                  f"container BEDROCK_MODEL_IDS (aliases seen: {aliases}, "
+                  f"env-var length: {len(os.environ.get('BEDROCK_MODEL_IDS', ''))})",
+                  file=sys.stderr)
+            _resolver_logged["miss"] = True
         return m
 
     def _wrap(orig):
@@ -732,6 +749,11 @@ def pin_bedrock_alias_resolution() -> bool:
             return await orig(*args, **kwargs)
         acompletion._bedrock_alias_original = orig  # type: ignore[attr-defined]
         return acompletion
+
+    _raw = os.environ.get("BEDROCK_MODEL_IDS", "")
+    _aliases = [p.split("=", 1)[0].strip() for p in _raw.split(",") if "=" in p and p.split("=", 1)[0].strip()]
+    print(f"[openhands] bedrock alias patch installed; "
+          f"BEDROCK_MODEL_IDS={len(_raw)} chars, aliases={_aliases}", file=sys.stderr)
 
     # Belt: the litellm module itself (direct callers, e.g. the judge).
     orig_c = getattr(litellm.completion, "_bedrock_alias_original", litellm.completion)
