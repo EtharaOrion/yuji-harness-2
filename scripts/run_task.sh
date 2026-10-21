@@ -5,6 +5,9 @@
 #   scripts/run_task.sh tasks/xenon-atomic-cube                 # openhands + opus-5 (defaults)
 #   AGENT=claude-code scripts/run_task.sh tasks/foo             # harbor's claude-code agent
 #   CC_MODE=zbridge N=3 scripts/run_task.sh tasks/foo           # openhands on GLM-5.3 (zbridge)
+#   CC_MODE=bedrock MODEL=claude-opus-5 scripts/run_task.sh tasks/foo  # openhands on AWS Bedrock
+#   CC_MODE=kiro KIRO_MODEL=claude-opus-5 KIRO_JUDGE_MODEL=gpt-5.6-sol \
+#       scripts/run_task.sh tasks/foo                           # openhands on Kiro (dynamic model + judge)
 #   AGENT=oracle scripts/run_task.sh tasks/foo                  # oracle gate
 #   COPY_TO=/some/dir scripts/run_task.sh tasks/foo           # optional extra mirror
 #
@@ -14,13 +17,18 @@
 # subscription through a ccbridge (tools/bridges/ccbridge) that this run starts
 # and stops. The bridge holds the OAuth token; the agent's container gets only
 # the bridge's per-run secret. With CC_MODE=zbridge the same agent runs on GLM
-# through zbridge instead. See tools/openhands_agent/README.md.
+# through zbridge instead. With CC_MODE=bedrock the agent calls AWS Bedrock
+# directly from the container with AWS_BEARER_TOKEN_BEDROCK and AWS_REGION
+# forwarded in; no host bridge is started. See tools/openhands_agent/README.md.
 #
 # Env overrides: AGENT (openhands) MODEL (claude-opus-5) N (1) JOB (<task slug>)
 #                OUTPUT_DIR (<repo>/output) COPY_TO (unset) BUILD_MULT (3) AT (auto)
 #                STAGE (all) RUN_OFFSET (auto) SETUP_MULT (6)
 #                DISALLOWED_TOOLS (WebSearch,WebFetch)
-#                CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766)
+#                CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766;
+#                         "bedrock" -> AWS Bedrock direct, no host bridge)
+#   bedrock:     AWS_BEARER_TOKEN_BEDROCK (required) BEDROCK_AWS_REGION (required)
+#                BEDROCK_MODEL_IDS (alias1=id1,alias2=id2 map, resolves MODEL)
 #                CC_BRIDGE_ENABLED (0)
 #                AGENT_HEADROOM_ENABLED (false)
 #   openhands:   CCBRIDGE_SHARED (0: a ccbridge per run, on a free port, stopped
@@ -190,9 +198,45 @@ SLUG="$(basename "$TASK")"
 AGENT="${AGENT:-openhands}"
 if [ "${CC_MODE:-}" = "zbridge" ]; then
   MODEL="${MODEL:-glm-5.3}"
+elif [ "${CC_MODE:-}" = "bedrock" ]; then
+  MODEL="${MODEL:-claude-opus-5}"
+elif [ "${CC_MODE:-}" = "kiro" ]; then
+  MODEL="${MODEL:-${KIRO_MODEL:-claude-opus-5}}"
 else
   MODEL="${MODEL:-claude-opus-5}"
 fi
+
+# BEDROCK_MODEL_IDS maps a short alias (what MODEL carries, and what every
+# report, trajectory dir and finance record is keyed on) to a Bedrock model id
+# or inference-profile ARN. Format: "alias1=id1,alias2=id2". A MODEL that is
+# already a bedrock/* string, a bare arn:, or a dotted model id (anthropic.*)
+# is passed through untouched. The resolved value becomes a bedrock/<id>
+# string, which LiteLLM routes directly to Bedrock.
+resolve_bedrock_model() {
+  local m="$MODEL"
+  case "$m" in
+    bedrock/*) printf '%s\n' "$m"; return 0 ;;
+    arn:aws:bedrock:*|arn:aws:iam:*) printf 'bedrock/%s\n' "$m"; return 0 ;;
+  esac
+  if [ -n "${BEDROCK_MODEL_IDS:-}" ]; then
+    local pair key val
+    IFS=',' read -ra _pairs <<< "$BEDROCK_MODEL_IDS"
+    for pair in "${_pairs[@]}"; do
+      key="${pair%%=*}"
+      val="${pair#*=}"
+      key="${key// /}"
+      if [ "$key" = "$m" ] && [ -n "$val" ]; then
+        printf 'bedrock/%s\n' "$val"
+        return 0
+      fi
+    done
+  fi
+  case "$m" in
+    anthropic.*|amazon.*|meta.*|cohere.*|mistral.*|ai21.*|deepseek.*)
+      printf 'bedrock/%s\n' "$m"; return 0 ;;
+  esac
+  return 1
+}
 
 # The OpenHands agent is not one of harbor's built-ins: harbor imports it from
 # this checkout, which is why stage_harbor puts $REPO on harbor's PYTHONPATH.
@@ -520,6 +564,153 @@ check_credentials() {
     # because the containerised agent sends no x-zbridge-secret header and a
     # live gate would 401 every call. Demanding a value here only to discard it
     # at launch failed runs for a credential that changes nothing.
+  elif [ "${CC_MODE:-}" = "bedrock" ]; then
+    # 1. AWS auth env present (bearer token or SigV4 keys).
+    if [ -z "${AWS_BEARER_TOKEN_BEDROCK:-}" ] \
+         && [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+      echo "[run_task] bedrock ERROR: neither AWS_BEARER_TOKEN_BEDROCK nor AWS_ACCESS_KEY_ID is set." >&2
+      echo "[run_task]   Add one to harness/.env." >&2
+      fail=1
+    fi
+    # 2. Region.
+    local _bedrock_region="${BEDROCK_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}"
+    if [ -z "$_bedrock_region" ]; then
+      echo "[run_task] bedrock ERROR: no AWS region is set." >&2
+      echo "[run_task]   Set BEDROCK_AWS_REGION or AWS_REGION in harness/.env" >&2
+      echo "[run_task]   (e.g. BEDROCK_AWS_REGION=ap-south-1)." >&2
+      fail=1
+    else
+      echo "[run_task] bedrock: region = $_bedrock_region"
+    fi
+    # 3. Agent MODEL alias -> ARN resolves.
+    if ! _resolved="$(resolve_bedrock_model)"; then
+      echo "[run_task] bedrock ERROR: cannot resolve MODEL='$MODEL' to a Bedrock id." >&2
+      echo "[run_task]   Pass MODEL as a bedrock/* id, an ARN, a dotted provider id" >&2
+      echo "[run_task]   (anthropic.*), or an alias from BEDROCK_MODEL_IDS." >&2
+      fail=1
+    else
+      echo "[run_task] bedrock: agent MODEL '$MODEL' -> $_resolved"
+      # Region embedded in the ARN vs the env region — warn on mismatch.
+      case "$_resolved" in
+        bedrock/arn:aws:bedrock:*)
+          local _arn_region
+          _arn_region="$(printf '%s' "$_resolved" | sed -E 's|^bedrock/arn:aws:bedrock:([^:]+):.*$|\1|')"
+          if [ -n "$_arn_region" ] && [ -n "$_bedrock_region" ] \
+               && [ "$_arn_region" != "$_bedrock_region" ]; then
+            echo "[run_task] bedrock WARNING: ARN region ($_arn_region) != env region ($_bedrock_region);" >&2
+            echo "[run_task]   LiteLLM uses env region; cross-region may fail or add latency." >&2
+          fi ;;
+      esac
+    fi
+    # 4. Judge model: if EVAL_LLM_MODEL starts with bedrock/, verify its alias
+    # resolves too. Keeps a bedrock agent + bedrock judge consistent.
+    if [ -n "${EVAL_LLM_MODEL:-}" ]; then
+      case "${EVAL_LLM_MODEL}" in
+        bedrock/arn:aws:bedrock:*)
+          echo "[run_task] bedrock: judge EVAL_LLM_MODEL uses a direct ARN" ;;
+        bedrock/*)
+          local _judge_alias="${EVAL_LLM_MODEL#bedrock/}" _judge_found=0 _judge_arn=""
+          if [ -n "${BEDROCK_MODEL_IDS:-}" ]; then
+            local IFS=',' pair key val
+            for pair in $BEDROCK_MODEL_IDS; do
+              key="${pair%%=*}"; val="${pair#*=}"
+              if [ "$key" = "$_judge_alias" ] && [ -n "$val" ]; then
+                _judge_found=1; _judge_arn="$val"; break
+              fi
+            done
+          fi
+          if [ "$_judge_found" = "1" ]; then
+            echo "[run_task] bedrock: judge EVAL_LLM_MODEL '$_judge_alias' -> $_judge_arn"
+          else
+            echo "[run_task] bedrock ERROR: EVAL_LLM_MODEL='$EVAL_LLM_MODEL' alias not in BEDROCK_MODEL_IDS." >&2
+            echo "[run_task]   Add the mapping, or use a direct bedrock/arn:aws:bedrock:... value." >&2
+            fail=1
+          fi ;;
+      esac
+    fi
+    # 5. Live auth check: aws sts get-caller-identity. Verifies SigV4 creds end
+    # to end -- bearer-token-only mode has no sts equivalent, so skip it and
+    # note that bedrock will exercise the token on the first call. Set
+    # BEDROCK_CHECK_OFF=1 to skip entirely.
+    if [ -z "${BEDROCK_CHECK_OFF:-}" ] && [ -n "${AWS_ACCESS_KEY_ID:-}" ] \
+         && command -v aws >/dev/null 2>&1; then
+      local _sts_out
+      if _sts_out="$(aws sts get-caller-identity --region "$_bedrock_region" --output json 2>&1)"; then
+        local _account
+        _account="$(printf '%s' "$_sts_out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("Account",""))
+except Exception: pass' 2>/dev/null)"
+        if [ -n "$_account" ]; then
+          echo "[run_task] bedrock: AWS SigV4 creds verified (account $_account)"
+        else
+          echo "[run_task] bedrock: AWS SigV4 creds verified"
+        fi
+      else
+        echo "[run_task] bedrock ERROR: aws sts get-caller-identity failed:" >&2
+        printf '%s\n' "$_sts_out" | head -3 | sed 's/^/[run_task]   /' >&2
+        echo "[run_task]   Fix the AWS keys in .env, or set BEDROCK_CHECK_OFF=1 to skip this gate." >&2
+        fail=1
+      fi
+    elif [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
+      echo "[run_task] bedrock: bearer-token mode -- live check deferred to first agent call"
+    fi
+  elif [ "${CC_MODE:-}" = "kiro" ]; then
+    # Kiro routes through the local kiro-cli login. The credential check is a
+    # single `kiro-cli whoami`: no network to the model, no spend. It fails
+    # for the two reasons that actually matter -- cli not installed and no
+    # login -- and names them separately so the operator fixes the right one.
+    if ! command -v kiro-cli >/dev/null 2>&1; then
+      echo "[run_task] kiro ERROR: kiro-cli not found on PATH." >&2
+      echo "[run_task]   Install from the Kiro distribution and re-run \`kiro-cli login\`." >&2
+      fail=1
+    else
+      local _who
+      if _who="$(kiro-cli whoami 2>&1)"; then
+        echo "[run_task] kiro: logged in as $(printf '%s' "$_who" | head -1)"
+      else
+        echo "[run_task] kiro ERROR: kiro-cli is installed but no valid login:" >&2
+        printf '%s\n' "$_who" | head -3 | sed 's/^/[run_task]   /' >&2
+        echo "[run_task]   Run: kiro-cli login" >&2
+        fail=1
+      fi
+    fi
+    # The agent model (KIRO_MODEL / MODEL) and the judge model (KIRO_JUDGE_MODEL)
+    # must both be in the login's model list -- otherwise the bridge will 404
+    # mid-run. Fetching the list is cheap (kiro-cli --list-models) and names
+    # the typo at second zero.
+    if [ "$fail" = "0" ]; then
+      local _models_json
+      if _models_json="$(kiro-cli chat --list-models --format json 2>/dev/null)"; then
+        local _bare_model="${MODEL#kiro/}"
+        _bare_model="${_bare_model#*/}"
+        local _judge_model="${KIRO_JUDGE_MODEL:-$_bare_model}"
+        local _agent_ok _judge_ok
+        _agent_ok="$(printf '%s' "$_models_json" | python3 -c '
+import json, sys
+try: m = json.load(sys.stdin)
+except Exception: sys.exit(0)
+entries = m.get("models", []) if isinstance(m, dict) else (m if isinstance(m, list) else [])
+ids = {x.get("model_id") or x.get("id") or x.get("model_name") for x in entries if isinstance(x, dict)}
+print("ok" if sys.argv[1] in ids else "miss")' "$_bare_model" 2>/dev/null)"
+        _judge_ok="$(printf '%s' "$_models_json" | python3 -c '
+import json, sys
+try: m = json.load(sys.stdin)
+except Exception: sys.exit(0)
+entries = m.get("models", []) if isinstance(m, dict) else (m if isinstance(m, list) else [])
+ids = {x.get("model_id") or x.get("id") or x.get("model_name") for x in entries if isinstance(x, dict)}
+print("ok" if sys.argv[1] in ids else "miss")' "$_judge_model" 2>/dev/null)"
+        case "$_agent_ok" in
+          ok) echo "[run_task] kiro: agent MODEL '$_bare_model' is available" ;;
+          *)  echo "[run_task] kiro ERROR: agent MODEL '$_bare_model' not in kiro-cli model list" >&2; fail=1 ;;
+        esac
+        case "$_judge_ok" in
+          ok) echo "[run_task] kiro: judge KIRO_JUDGE_MODEL '$_judge_model' is available" ;;
+          *)  echo "[run_task] kiro ERROR: judge KIRO_JUDGE_MODEL '$_judge_model' not in kiro-cli model list" >&2; fail=1 ;;
+        esac
+      else
+        echo "[run_task] kiro WARNING: could not list models to validate selections; continuing" >&2
+      fi
+    fi
   else
     if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
       echo "[run_task] ERROR: no Claude Code credentials found" >&2
@@ -856,7 +1047,14 @@ stage_preflight() {
   # OpenHands runs on Claude: the same, for the subscription behind the
   # ccbridge. A per-run bridge does not exist yet, so preflight proves the login
   # with --check (no model call); the harbor stage starts the bridge.
-  if [ "$AGENT" = "openhands" ] && [ "${CC_MODE:-}" != "zbridge" ]; then
+  # Bedrock runs skip the bridge entirely: LiteLLM calls bedrock-runtime from
+  # inside the container with AWS_BEARER_TOKEN_BEDROCK forwarded via harbor env.
+  # Kiro runs skip ccbridge too: ensure_kiro_bridge starts its own proxy and
+  # sets OPENHANDS_LLM_* / ANTHROPIC_* from the keys it mints.
+  if [ "$AGENT" = "openhands" ] \
+       && [ "${CC_MODE:-}" != "zbridge" ] \
+       && [ "${CC_MODE:-}" != "bedrock" ] \
+       && [ "${CC_MODE:-}" != "kiro" ]; then
     if [ "${CCBRIDGE_SHARED:-0}" = "1" ]; then ensure_shared_ccbridge; else ccbridge_prepare; fi
   fi
 
@@ -1021,6 +1219,11 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
   local _closed=""
   [ "$(agent_phase_network_mode)" != "public" ] && _closed=1
   [ "$AGENT" != "oracle" ] && args+=(--model "$MODEL")
+  # Kiro mode: inject the bridge's judge creds directly on the verifier via
+  # --ve KEY=VALUE. Does not depend on the bundle's [verifier.env] block
+  # forwarding ${ANTHROPIC_API_KEY:-} -- a bundle that forgot the forwarding
+  # still gets a judged run.
+  [ "${#KIRO_VERIFIER_ARGS[@]}" -gt 0 ] && args+=("${KIRO_VERIFIER_ARGS[@]}")
   if [ "$AGENT" = "claude-code" ]; then
     [ -n "$THINKING" ] && args+=(--ak "thinking=$THINKING")
     [ -n "$THINKING_DISPLAY" ] && args+=(--ak "thinking_display=$THINKING_DISPLAY")
@@ -1082,6 +1285,16 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
   # Must be immediately before harbor: everything that appears after this point
   # and carries harbor's "__" marker belongs to this invocation.
   snapshot_compose_projects
+  if [ "${CC_MODE:-}" = "kiro" ]; then
+    echo "[run_task] kiro env snapshot (keys set that the verifier.env will pull):"
+    for _k in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL OPENAI_API_KEY OPENAI_BASE_URL JUDGE_WIRE JUDGE_MODEL; do
+      if [ -n "${!_k:-}" ]; then
+        echo "[run_task]   $_k=<SET>"
+      else
+        echo "[run_task]   $_k=<EMPTY>"
+      fi
+    done
+  fi
   local _hrc=0
   # harbor resolves --agent tools.openhands_agent.agent:OpenHandsAgent with
   # importlib, so the checkout has to be importable from harbor's interpreter.
@@ -1433,6 +1646,119 @@ PYEOF
   return 0
 }
 
+# ------------------------------------------------------------------ kiro bridge
+# tools/bridges/kiro_bridge_runner.py: a per-run local Anthropic-compatible
+# proxy backed by the host's kiro-cli login. Zero credentials enter the
+# container -- only two short-lived keys the bridge mints at start time:
+#   agent key -- serves whatever model each request names (the run's MODEL)
+#   judge key -- pinned to KIRO_JUDGE_MODEL, so a task's rubric judge gets a
+#                fixed model regardless of what judge.toml asks for
+# Both exported through the usual env surface: OPENHANDS_LLM_* for the agent,
+# ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY for the judge wire (task bundles must
+# forward ANTHROPIC_BASE_URL in [verifier.env] for the judge to find it).
+KIRO_BRIDGE_PID=""
+KIRO_BRIDGE_CONFIG=""
+# Verifier env args to append to the harbor CLI (--ve KEY=VALUE, repeatable).
+# Populated by ensure_kiro_bridge. Harbor sets these DIRECTLY on the verifier
+# container, bypassing task.toml's ${VAR:-} template resolution -- so a bundle
+# that forgot to forward ANTHROPIC_BASE_URL (or similar) still works.
+KIRO_VERIFIER_ARGS=()
+
+ensure_kiro_bridge() {
+  local venv_py="$REPO/.venv/bin/python"
+  if [ ! -x "$venv_py" ]; then
+    echo "[run_task] kiro ERROR: $venv_py not found; create a venv and install kiro_bridge:" >&2
+    echo "[run_task]   python3 -m venv $REPO/.venv" >&2
+    echo "[run_task]   $REPO/.venv/bin/pip install <path-to-kiro-bridge-bundle>/kiro_bridge" >&2
+    exit 4
+  fi
+  if ! "$venv_py" -c 'import kiro_bridge' >/dev/null 2>&1; then
+    echo "[run_task] kiro ERROR: kiro_bridge not installed in $REPO/.venv" >&2
+    echo "[run_task]   Fix: $venv_py -m pip install <path-to-kiro-bridge-bundle>/kiro_bridge" >&2
+    exit 4
+  fi
+  local cfg_dir="$OUTPUT_DIR/.kiro-bridge"
+  mkdir -p "$cfg_dir"
+  KIRO_BRIDGE_CONFIG="$cfg_dir/run-${JOB//[^A-Za-z0-9._-]/_}-$$.json"
+  rm -f "$KIRO_BRIDGE_CONFIG"
+  local log="$cfg_dir/run-${JOB//[^A-Za-z0-9._-]/_}-$$.log"
+  echo "[run_task] starting kiro bridge (log: $log)"
+  (
+    KIRO_MODEL="${KIRO_MODEL:-$MODEL}" \
+    KIRO_JUDGE_MODEL="${KIRO_JUDGE_MODEL:-}" \
+    nohup "$venv_py" "$REPO/tools/bridges/kiro_bridge_runner.py" \
+      --host 127.0.0.1 --port 0 --config-out "$KIRO_BRIDGE_CONFIG" \
+      >"$log" 2>&1 &
+    echo $!
+  ) > "$cfg_dir/.pid.tmp"
+  KIRO_BRIDGE_PID="$(cat "$cfg_dir/.pid.tmp" | tr -d '[:space:]')"
+  rm -f "$cfg_dir/.pid.tmp"
+  local i=0 wait_s="${KIRO_BRIDGE_START_TIMEOUT_SEC:-60}"
+  while [ $i -lt "$wait_s" ]; do
+    [ -f "$KIRO_BRIDGE_CONFIG" ] && break
+    if ! kill -0 "$KIRO_BRIDGE_PID" 2>/dev/null; then
+      echo "[run_task] kiro ERROR: bridge runner exited during startup. Last 10 lines of $log:" >&2
+      tail -10 "$log" 2>/dev/null | sed 's/^/[run_task]   /' >&2
+      exit 3
+    fi
+    sleep 1; i=$((i+1))
+  done
+  if [ ! -f "$KIRO_BRIDGE_CONFIG" ]; then
+    echo "[run_task] kiro ERROR: bridge did not come up in ${wait_s}s; see $log" >&2
+    kill "$KIRO_BRIDGE_PID" 2>/dev/null || true
+    exit 3
+  fi
+  local port agent_key judge_key agent_model judge_model
+  port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("port",""))' "$KIRO_BRIDGE_CONFIG")"
+  agent_key="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_key",""))' "$KIRO_BRIDGE_CONFIG")"
+  judge_key="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("judge_key",""))' "$KIRO_BRIDGE_CONFIG")"
+  agent_model="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_model",""))' "$KIRO_BRIDGE_CONFIG")"
+  judge_model="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("judge_model",""))' "$KIRO_BRIDGE_CONFIG")"
+  if [ -z "$port" ] || [ -z "$agent_key" ] || [ -z "$judge_key" ]; then
+    echo "[run_task] kiro ERROR: bridge config missing fields in $KIRO_BRIDGE_CONFIG" >&2
+    exit 3
+  fi
+  export OPENHANDS_LLM_BASE_URL="http://host.docker.internal:$port"
+  export OPENHANDS_LLM_API_KEY="$agent_key"
+  export ANTHROPIC_BASE_URL="http://host.docker.internal:$port"
+  export ANTHROPIC_API_KEY="$judge_key"
+  export JUDGE_WIRE="${JUDGE_WIRE:-anthropic}"
+  KIRO_VERIFIER_ARGS=(
+    --ve "ANTHROPIC_API_KEY=$judge_key"
+    --ve "ANTHROPIC_BASE_URL=http://host.docker.internal:$port"
+    --ve "JUDGE_WIRE=${JUDGE_WIRE:-anthropic}"
+  )
+  # rubric_judge_cli.py reads JUDGE_MODEL from env; without it, it defaults to
+  # the wire's canonical model (claude-sonnet-5 for anthropic) which is NOT
+  # the model the kiro bridge is serving on the judge key. Pin it so the
+  # judge call records the right model and matches what the bridge actually
+  # answers.
+  if [ -n "${KIRO_JUDGE_MODEL:-}" ]; then
+    KIRO_VERIFIER_ARGS+=(--ve "JUDGE_MODEL=$KIRO_JUDGE_MODEL")
+  fi
+  echo "[run_task] kiro bridge ready on 127.0.0.1:$port (pid $KIRO_BRIDGE_PID)"
+  echo "[run_task]   agent model = $agent_model"
+  echo "[run_task]   judge model = $judge_model"
+  echo "[run_task]   openhands  -> $OPENHANDS_LLM_BASE_URL"
+  echo "[run_task]   judge wire -> $ANTHROPIC_BASE_URL (JUDGE_WIRE=$JUDGE_WIRE)"
+}
+
+stop_kiro_bridge() {
+  [ -n "${KIRO_BRIDGE_PID:-}" ] || return 0
+  if kill -0 "$KIRO_BRIDGE_PID" 2>/dev/null; then
+    kill -TERM "$KIRO_BRIDGE_PID" 2>/dev/null || true
+    local i=0
+    while [ $i -lt 20 ] && kill -0 "$KIRO_BRIDGE_PID" 2>/dev/null; do
+      sleep 0.25; i=$((i+1))
+    done
+    kill -9 "$KIRO_BRIDGE_PID" 2>/dev/null || true
+    echo "[run_task] kiro bridge stopped (pid $KIRO_BRIDGE_PID)" >&2
+  fi
+  KIRO_BRIDGE_PID=""
+  [ -n "${KIRO_BRIDGE_CONFIG:-}" ] && rm -f "$KIRO_BRIDGE_CONFIG"
+  return 0
+}
+
 # ------------------------------------------------------------------ ccbridge
 # The OpenHands agent's route to Claude: tools/bridges/ccbridge, an
 # Anthropic-compatible proxy on the host that signs each request with the Claude
@@ -1659,6 +1985,12 @@ ensure_shared_ccbridge() {
 #                       and verified it). zbridge speaks the same Anthropic
 #                       protocol as the ccbridge, so the agent is unchanged;
 #                       only where it points is.
+#   CC_MODE=bedrock     Bedrock, called directly by LiteLLM from inside the
+#                       container; no host bridge. The two placeholders exist
+#                       only to satisfy the agent class's preflight -- the
+#                       runner drops them for bedrock/* models and reads
+#                       AWS_BEARER_TOKEN_BEDROCK / AWS_REGION, which the agent
+#                       forwards from harbor's env into the container.
 #   CCBRIDGE_SHARED=1   the long-lived shared ccbridge.
 #   otherwise           a ccbridge of this run's own.
 ensure_openhands_model_route() {
@@ -1669,6 +2001,38 @@ ensure_openhands_model_route() {
     export OPENHANDS_LLM_BASE_URL="http://host.docker.internal:${ZB_PORT:-8766}"
     export OPENHANDS_LLM_API_KEY="${ZB_BRIDGE_SECRET:-zbridge}"
     echo "[run_task] openhands agent routed through zbridge ($OPENHANDS_LLM_BASE_URL, model $MODEL)"
+  elif [ "${CC_MODE:-}" = "bedrock" ]; then
+    # Keep the user-facing alias (e.g. "claude-opus-5") as the model string so
+    # trajectories, pass_summary.json and finance records are keyed on a short
+    # readable name rather than the full inference-profile ARN. The alias is
+    # resolved to the ARN inside the container at the LiteLLM call boundary
+    # (runner.py:pin_bedrock_alias_resolution). The bedrock/ prefix is still
+    # needed so the agent class's is_bedrock check (model.startswith) fires
+    # and so LiteLLM routes to the Bedrock provider.
+    case "$MODEL" in
+      bedrock/*|arn:aws:bedrock:*) ;;
+      *) MODEL="bedrock/$MODEL" ;;
+    esac
+    export OPENHANDS_LLM_BASE_URL="bedrock-direct"
+    export OPENHANDS_LLM_API_KEY="bedrock-direct"
+    export AWS_BEARER_TOKEN_BEDROCK="${AWS_BEARER_TOKEN_BEDROCK:-}"
+    export AWS_REGION="${BEDROCK_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}"
+    [ -n "${AWS_ACCESS_KEY_ID:-}" ] && export AWS_ACCESS_KEY_ID
+    [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && export AWS_SECRET_ACCESS_KEY
+    [ -n "${AWS_SESSION_TOKEN:-}" ] && export AWS_SESSION_TOKEN
+    echo "[run_task] openhands agent routed to Bedrock directly ($MODEL in $AWS_REGION)"
+  elif [ "${CC_MODE:-}" = "kiro" ]; then
+    # Kiro bridge: a per-run Anthropic-compatible proxy backed by kiro-cli.
+    # Keep MODEL bare (e.g. "claude-opus-5"); litellm_model() in agent.py
+    # prepends "anthropic/" for the LiteLLM provider route, and LiteLLM sends
+    # the Anthropic Messages request to the bridge at OPENHANDS_LLM_BASE_URL.
+    # The bridge reads the bare model name from the request body and forwards
+    # it to kiro-cli. A "kiro/" prefix would make LiteLLM 400 with
+    # "LLM Provider NOT provided" since it does not recognize kiro as a provider.
+    case "$MODEL" in
+      kiro/*) MODEL="${MODEL#kiro/}" ;;
+    esac
+    ensure_kiro_bridge
   elif [ "${CCBRIDGE_SHARED:-0}" = "1" ]; then
     ensure_shared_ccbridge
   else
@@ -1767,11 +2131,16 @@ route_agent_through_headroom() {
 }
 
 # The hosts this run's own model route needs during agent.run(), one per line:
-# the bridge on the host (ccbridge for openhands, zbridge for GLM) and the
-# headroom container when it fronts the model. stage_harbor passes each to
-# Harbor as --allow-agent-host and stage_preflight checks the merged policy.
+# the bridge on the host (ccbridge for openhands, zbridge for GLM), the Bedrock
+# endpoint for CC_MODE=bedrock (the agent calls bedrock-runtime directly from
+# the container, no host bridge), and the headroom container when it fronts the
+# model. stage_harbor passes each to Harbor as --allow-agent-host and
+# stage_preflight checks the merged policy.
 agent_route_hosts() {
-  if [ "$AGENT" = "openhands" ] || [ "${CC_MODE:-}" = "zbridge" ]; then
+  if [ "${CC_MODE:-}" = "bedrock" ]; then
+    local _region="${BEDROCK_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}}"
+    echo "bedrock-runtime.${_region}.amazonaws.com"
+  elif [ "${CC_MODE:-}" = "kiro" ] || [ "$AGENT" = "openhands" ] || [ "${CC_MODE:-}" = "zbridge" ]; then
     echo "host.docker.internal"
   fi
   [ "${AGENT_HEADROOM_ENABLED:-false}" = "true" ] && echo "headroom"
@@ -2177,9 +2546,10 @@ esac
 
 trap on_interrupt INT
 trap on_terminate TERM
-# A per-run ccbridge dies with the run however the run ends: on_interrupt and
-# on_terminate call exit, which runs this too.
-trap stop_run_ccbridge EXIT
+# A per-run ccbridge or kiro bridge dies with the run however the run ends:
+# on_interrupt and on_terminate call exit, which runs this too.
+_stop_run_bridges() { stop_run_ccbridge; stop_kiro_bridge; }
+trap _stop_run_bridges EXIT
 
 refuse_uncmountable_paths
 resolve_auth

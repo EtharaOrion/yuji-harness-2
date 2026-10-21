@@ -126,6 +126,13 @@ def _copy_masked(src: Path, dst: Path) -> None:
 
 
 def _short_model(name: str) -> str:
+    # Strip the LiteLLM provider prefix (bedrock/, anthropic/, gemini/, ...)
+    # so a ccbridge, zbridge or bedrock run of the same model lands in the
+    # same trajectory/<alias>/ directory for easy comparison. Without this,
+    # Path join on "bedrock/claude-opus-5" nests the model under a provider
+    # subdir, so the same alias produces different delivery trees per bridge.
+    if "/" in name:
+        name = name.split("/", 1)[1].replace("/", "-")
     short = name.removeprefix("claude-")
     return re.sub(r"-(\d+)$", r".\1", short)
 
