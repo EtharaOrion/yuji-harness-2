@@ -169,6 +169,85 @@ Stages: `all`, `preflight`, `harbor`, `reshape`, `finance`, `mask`. `scripts/run
 
 Before the agent phase, `tools/network/preflight_network.py` resolves the task's network plan and verifier environment through harbor's own code and refuses what harbor would refuse after the image build.
 
+## Mode details
+
+`CC_MODE` picks both the agent model route and the judge wire. The default is ccbridge; every mode runs the same OpenHands agent and the same bundle verifier, only the transport changes.
+
+### Default (ccbridge)
+
+- **Agent**: OpenHands → ccbridge on 127.0.0.1 (per-run, ephemeral port) → host's Claude subscription (OAuth, from `CLAUDE_CODE_OAUTH_TOKEN`).
+- **Judge**: direct `api.anthropic.com` with `ANTHROPIC_API_KEY` from `.env` or the caller's environment. The bridge is agent-only.
+- **Judge model**: whatever the bundle's rubric defaults to (usually `claude-sonnet-5`); override by exporting `JUDGE_MODEL`.
+
+```bash
+# .env
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat...
+ANTHROPIC_API_KEY=sk-ant-api03-...   # judge
+
+scripts/run_task.sh tasks/<slug>
+```
+
+### `CC_MODE=zbridge`
+
+- **Agent**: OpenHands → zbridge on `:8766` → GLM-5.3.
+- **Judge**: unchanged from the default (direct `api.anthropic.com` with `ANTHROPIC_API_KEY`).
+
+```bash
+CC_MODE=zbridge scripts/run_task.sh tasks/<slug>
+```
+
+### `CC_MODE=bedrock`
+
+Both agent and judge call AWS Bedrock directly. No host bridge, no kiro, no Anthropic.
+
+- **Agent**: OpenHands SDK → `litellm.completion` with `bedrock/<model>` prefix. The alias in `MODEL` is resolved to the full inference-profile ARN at call-time via a monkey-patch, so trajectory logs show `claude-opus-5`, not the ARN.
+- **Judge**: in-process `litellm.acompletion` from `services/scoring/score_claims.py` and `services/diagnostics/single_model_diagnostic.py`, same alias→ARN resolver, same AWS creds.
+
+```bash
+# .env
+CC_MODE=bedrock
+MODEL=claude-opus-5                            # agent alias
+JUDGE_MODEL=gpt-5.6-sol                        # judge alias (defaults to MODEL)
+AWS_BEARER_TOKEN_BEDROCK=bedrock-api-key-...
+BEDROCK_AWS_REGION=ap-south-1
+BEDROCK_MODEL_IDS=claude-opus-5=arn:aws:bedrock:ap-south-1:XXXX:application-inference-profile/XXXX,gpt-5.6-sol=arn:aws:bedrock:ap-south-1:XXXX:application-inference-profile/YYYY
+
+# optional, enables the pre-flight bedrock:ListFoundationModels check
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+# BEDROCK_CHECK_OFF=1   # set to skip the pre-flight check
+
+scripts/run_task.sh tasks/<slug>
+```
+
+Three guards fire before the agent phase:
+1. `AWS_BEARER_TOKEN_BEDROCK` + `BEDROCK_AWS_REGION` must be set, else the run is refused.
+2. `MODEL` and `JUDGE_MODEL` must resolve through `BEDROCK_MODEL_IDS`, else the run is refused with the list of known aliases.
+3. If `AWS_ACCESS_KEY_ID` is set, a `bedrock:ListFoundationModels` ping validates the creds at startup instead of 20 minutes into the trial.
+
+### `CC_MODE=kiro`
+
+Both agent and judge talk to kiro-cli through a local two-key bridge. Agent and judge models are set independently per run.
+
+```
+scripts/run_task.sh starts kiro_bridge on 127.0.0.1:<ephemeral>
+                           ├─ agent_key  pinned to  KIRO_MODEL        → kiro-cli
+                           └─ judge_key  pinned to  KIRO_JUDGE_MODEL  → kiro-cli
+```
+
+- **Agent** (OpenHands container): `ANTHROPIC_BASE_URL=http://host:<port>` + `agent_key` → every tool call hits kiro-cli as `KIRO_MODEL`.
+- **Judge** (verifier container): injected via Harbor `--ve` flags — `ANTHROPIC_API_KEY=<judge_key>`, `ANTHROPIC_BASE_URL=http://host:<port>`, `JUDGE_WIRE=anthropic`, `JUDGE_MODEL=<KIRO_JUDGE_MODEL>` (prevents the bundle's `rubric_judge_cli.py` from falling back to its hardcoded `claude-sonnet-5` default).
+- **Prereq**: `kiro login` already done on the host; the bridge drives the host's logged-in CLI and holds no credentials of its own.
+
+```bash
+CC_MODE=kiro \
+  KIRO_MODEL=claude-opus-5 \
+  KIRO_JUDGE_MODEL=gpt-5.6-sol \
+  scripts/run_task.sh tasks/<slug>
+```
+
+Omit `KIRO_JUDGE_MODEL` and the judge falls back to the agent model. The bridge mints a fresh `agent_key` and `judge_key` per run and tears both down at exit.
+
 ## Make targets
 
 | Target | What it does |
