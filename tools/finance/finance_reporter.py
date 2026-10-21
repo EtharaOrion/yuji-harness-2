@@ -158,18 +158,26 @@ def num(value, default=0):
 
 
 def _claude_model_usage(run_dir: Path) -> dict | None:
-    """Billed token totals from Claude Code's result event.
+    """Billed token totals from the agent's result event.
 
     Harbor sums per-message `usage` for tokens but reads `total_cost_usd` from
     the result event, and the two disagree: a compaction call is billed and
     lands in `modelUsage`, but never becomes a message in the chain. Reading
     `modelUsage` puts the tokens back on the same basis as the cost.
 
-    Returns None when the run is not Claude Code (no stream on disk), so the
-    caller keeps Harbor's totals as the fallback.
+    Supports both agents that write this envelope:
+      - Claude Code -> agent/claude-code.jsonl
+      - OpenHands SDK -> agent/openhands.jsonl (CC_MODE=bedrock, kiro, zbridge)
+    Both share the same `{"type": "result", "modelUsage": {...}}` shape,
+    with cacheReadInputTokens / cacheCreationInputTokens per model.
+
+    Returns None when neither stream is on disk (older runs, or an agent that
+    doesn't emit this envelope), so the caller keeps Harbor's totals.
     """
-    path = run_dir / "agent" / "claude-code.jsonl"
-    if not path.exists():
+    candidates = [run_dir / "agent" / "claude-code.jsonl",
+                  run_dir / "agent" / "openhands.jsonl"]
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
         return None
     rec = None
     try:

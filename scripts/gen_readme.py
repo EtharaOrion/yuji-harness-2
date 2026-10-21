@@ -125,7 +125,7 @@ def render() -> str:
     w("## What the bundle owns, and what the harness adds\n")
     w("| Concern | Owner | Mechanism |\n|---|---|---|")
     w("| Scoring | bundle | `tests/` run by harbor in the verifier environment; the reshaper "
-      "publishes `verifier/reward.json` as written and never recomputes it |")
+      "publishes `verifier/reward.toml` from the bundle's own reward and never recomputes it |")
     w("| Verifier environment | bundle | `[verifier] environment_mode` (`separate`: built from "
       "`[verifier.environment].docker_image`, else `tests/Dockerfile`, else `[environment]`) |")
     w("| Network policy | bundle | `network_mode` in `[environment]`, `[agent]`, `[verifier]`, "
@@ -231,6 +231,38 @@ def render() -> str:
       "refused with the list of known aliases.\n"
       "3. If `AWS_ACCESS_KEY_ID` is set, a `bedrock:ListFoundationModels` ping validates the "
       "creds at startup instead of 20 minutes into the trial.\n")
+
+    w("#### Picking a different judge wire with `JUDGE_MODE`\n")
+    w("`CC_MODE=bedrock` locks the agent to Bedrock, but the judge wire is independent. Set "
+      "`JUDGE_MODE` to compare judge models across runs without changing the agent:\n")
+    w("| `JUDGE_MODE` | Judge wire | Env vars needed | Pre-flight check |\n"
+      "|---|---|---|---|\n"
+      "| `bedrock` (default) | AWS Bedrock Converse via `boto3` | existing `AWS_BEARER_TOKEN_BEDROCK` + `BEDROCK_MODEL_IDS` | strong: SigV4 live ping + ARN resolution |\n"
+      "| `kiro` | kiro-cli through the vendored kiro_bridge | `kiro-cli login` on host + `KIRO_JUDGE_MODEL` | medium: Python import + bridge start |\n"
+      "| `anthropic` | direct `api.anthropic.com` | `ANTHROPIC_API_KEY` + optional `JUDGE_MODEL` | weak: env var existence |\n"
+      "| `openai` | direct `api.openai.com` | `OPENAI_API_KEY` + optional `JUDGE_MODEL` | weak: env var existence |\n")
+    w("```bash\n"
+      "# agent on Bedrock, judge on kiro (gpt-5.6-sol)\n"
+      "CC_MODE=bedrock JUDGE_MODE=kiro \\\n"
+      "  MODEL=claude-opus-5 \\\n"
+      "  KIRO_JUDGE_MODEL=gpt-5.6-sol \\\n"
+      "  scripts/run_task.sh tasks/<slug>\n"
+      "\n"
+      "# agent on Bedrock, judge on Anthropic subscription\n"
+      "CC_MODE=bedrock JUDGE_MODE=anthropic \\\n"
+      "  MODEL=claude-opus-5 JUDGE_MODEL=claude-sonnet-5 \\\n"
+      "  ANTHROPIC_API_KEY=sk-ant-api03-... \\\n"
+      "  scripts/run_task.sh tasks/<slug>\n"
+      "\n"
+      "# agent on Bedrock, judge on OpenAI\n"
+      "CC_MODE=bedrock JUDGE_MODE=openai \\\n"
+      "  MODEL=claude-opus-5 JUDGE_MODEL=gpt-5-turbo \\\n"
+      "  OPENAI_API_KEY=sk-... \\\n"
+      "  scripts/run_task.sh tasks/<slug>\n"
+      "```\n")
+    w("`JUDGE_MODE` is only honored when `CC_MODE=bedrock`. Unknown values are rejected with "
+      "`JUDGE_MODE ERROR: unknown value 'X' (expected: bedrock | anthropic | openai | kiro)` and "
+      "`exit 4` before the agent starts.\n")
 
     w("### `CC_MODE=kiro`\n")
     w("Both agent and judge talk to kiro-cli through a local two-key bridge. Agent and judge "

@@ -46,6 +46,11 @@
 #                BEDROCK_MODEL_IDS (alias1=id1,alias2=id2 map, resolves MODEL
 #                and JUDGE_MODEL to full Bedrock inference-profile ARNs)
 #                JUDGE_MODEL (defaults to MODEL; alias from BEDROCK_MODEL_IDS)
+#                JUDGE_MODE (bedrock | kiro | anthropic | openai; selects the
+#                judge wire independently of the agent. default: bedrock)
+#                  JUDGE_MODE=kiro      needs kiro-cli login + KIRO_JUDGE_MODEL
+#                  JUDGE_MODE=anthropic needs ANTHROPIC_API_KEY (direct call)
+#                  JUDGE_MODE=openai    needs OPENAI_API_KEY (direct call)
 #                AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (optional, enables
 #                the pre-flight bedrock:ListFoundationModels credential check;
 #                set BEDROCK_CHECK_OFF=1 to skip)
@@ -1214,6 +1219,7 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
   # container (empty values are dropped, so a failed proxy start is a no-op).
   ensure_cc_bridge
   [ "${CC_MODE:-}" = "zbridge" ] && ensure_zbridge
+  [ "${CC_MODE:-}" = "bedrock" ] && select_bedrock_judge
   # Exports OPENHANDS_LLM_BASE_URL / OPENHANDS_LLM_API_KEY, which the agent
   # class reads from harbor's environment: zbridge on a GLM run, else this
   # run's own ccbridge (stopped by the EXIT trap). Called directly, not in
@@ -1255,7 +1261,16 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
   # --ve KEY=VALUE. Does not depend on the bundle's [verifier.env] block
   # forwarding ${ANTHROPIC_API_KEY:-} -- a bundle that forgot the forwarding
   # still gets a judged run.
-  [ "${#KIRO_VERIFIER_ARGS[@]}" -gt 0 ] && args+=("${KIRO_VERIFIER_ARGS[@]}")
+  if [ "${#KIRO_VERIFIER_ARGS[@]}" -gt 0 ]; then
+    echo "[run_task] appending ${#KIRO_VERIFIER_ARGS[@]} KIRO verifier args to harbor" >&2
+    args+=("${KIRO_VERIFIER_ARGS[@]}")
+  elif [ "${CC_MODE:-}" = "kiro" ]; then
+    echo "[run_task] WARNING: CC_MODE=kiro but KIRO_VERIFIER_ARGS is empty; judge wire not injected" >&2
+  fi
+  if [ "${#BEDROCK_VERIFIER_ARGS[@]}" -gt 0 ]; then
+    echo "[run_task] appending ${#BEDROCK_VERIFIER_ARGS[@]} BEDROCK verifier args to harbor" >&2
+    args+=("${BEDROCK_VERIFIER_ARGS[@]}")
+  fi
   if [ "$AGENT" = "claude-code" ]; then
     [ -n "$THINKING" ] && args+=(--ak "thinking=$THINKING")
     [ -n "$THINKING_DISPLAY" ] && args+=(--ak "thinking_display=$THINKING_DISPLAY")
@@ -1792,6 +1807,158 @@ stop_kiro_bridge() {
   KIRO_BRIDGE_PID=""
   [ -n "${KIRO_BRIDGE_CONFIG:-}" ] && rm -f "$KIRO_BRIDGE_CONFIG"
   return 0
+}
+
+# ------------------------------------------------------- bedrock judge proxy
+# The bundled rubric_judge_cli.py (in the ECR judge image) only speaks
+# JUDGE_WIRE = openai | anthropic | gemini -- no native Bedrock. In CC_MODE
+# =bedrock, this proxy serves /v1/messages as an Anthropic Messages API, and
+# forwards each call to the Bedrock Converse API via boto3. The judge sees an
+# ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY and never touches AWS; the proxy
+# process holds AWS_BEARER_TOKEN_BEDROCK and resolves the JUDGE_MODEL alias
+# through BEDROCK_MODEL_IDS exactly like the agent's resolver does.
+BEDROCK_JUDGE_PID=""
+BEDROCK_JUDGE_CONFIG=""
+BEDROCK_VERIFIER_ARGS=()
+
+ensure_bedrock_judge_proxy() {
+  local host_py; host_py="$(command -v python3 || true)"
+  if [ -z "$host_py" ]; then
+    echo "[run_task] bedrock judge ERROR: python3 not found on PATH" >&2
+    exit 4
+  fi
+  local bridge_path="$REPO/tools/bridges"
+  if ! PYTHONPATH="$bridge_path" "$host_py" -c 'import bedrock_bridge, boto3' >/dev/null 2>&1; then
+    echo "[run_task] bedrock judge ERROR: cannot import bedrock_bridge + boto3 from host python" >&2
+    echo "[run_task]   Required host modules: bedrock_bridge (vendored), boto3 (pip install boto3)" >&2
+    exit 4
+  fi
+  local judge_alias="${JUDGE_MODEL:-$MODEL}"
+  if [ -z "$judge_alias" ]; then
+    echo "[run_task] bedrock judge ERROR: JUDGE_MODEL (or MODEL) must be set" >&2
+    exit 4
+  fi
+  local cfg_dir="$OUTPUT_DIR/.bedrock-judge"
+  mkdir -p "$cfg_dir"
+  BEDROCK_JUDGE_CONFIG="$cfg_dir/run-${JOB//[^A-Za-z0-9._-]/_}-$$.json"
+  rm -f "$BEDROCK_JUDGE_CONFIG"
+  local log="$cfg_dir/run-${JOB//[^A-Za-z0-9._-]/_}-$$.log"
+  echo "[run_task] starting bedrock judge proxy (log: $log)"
+  (
+    JUDGE_MODEL="$judge_alias" \
+    MODEL="${MODEL:-}" \
+    BEDROCK_MODEL_IDS="${BEDROCK_MODEL_IDS:-}" \
+    AWS_BEARER_TOKEN_BEDROCK="${AWS_BEARER_TOKEN_BEDROCK:-}" \
+    AWS_REGION="${BEDROCK_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}" \
+    BEDROCK_AWS_REGION="${BEDROCK_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}" \
+    PYTHONPATH="$bridge_path${PYTHONPATH:+:$PYTHONPATH}" \
+    nohup "$host_py" "$REPO/tools/bridges/bedrock_bridge_runner.py" \
+      --host 127.0.0.1 --port 0 --config-out "$BEDROCK_JUDGE_CONFIG" \
+      >"$log" 2>&1 &
+    echo $!
+  ) > "$cfg_dir/.pid.tmp"
+  BEDROCK_JUDGE_PID="$(cat "$cfg_dir/.pid.tmp" | tr -d '[:space:]')"
+  rm -f "$cfg_dir/.pid.tmp"
+  local i=0 wait_s="${BEDROCK_JUDGE_START_TIMEOUT_SEC:-30}"
+  while [ $i -lt "$wait_s" ]; do
+    [ -f "$BEDROCK_JUDGE_CONFIG" ] && break
+    if ! kill -0 "$BEDROCK_JUDGE_PID" 2>/dev/null; then
+      echo "[run_task] bedrock judge ERROR: proxy exited during startup. Last 10 lines of $log:" >&2
+      tail -10 "$log" 2>/dev/null | sed 's/^/[run_task]   /' >&2
+      exit 3
+    fi
+    sleep 1; i=$((i+1))
+  done
+  if [ ! -f "$BEDROCK_JUDGE_CONFIG" ]; then
+    echo "[run_task] bedrock judge ERROR: proxy did not come up in ${wait_s}s; see $log" >&2
+    kill "$BEDROCK_JUDGE_PID" 2>/dev/null || true
+    exit 3
+  fi
+  local port api_key judge_model
+  port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("port",""))' "$BEDROCK_JUDGE_CONFIG")"
+  api_key="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("api_key",""))' "$BEDROCK_JUDGE_CONFIG")"
+  judge_model="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("judge_model",""))' "$BEDROCK_JUDGE_CONFIG")"
+  if [ -z "$port" ] || [ -z "$api_key" ]; then
+    echo "[run_task] bedrock judge ERROR: proxy config missing fields in $BEDROCK_JUDGE_CONFIG" >&2
+    exit 3
+  fi
+  BEDROCK_VERIFIER_ARGS=(
+    --ve "ANTHROPIC_API_KEY=$api_key"
+    --ve "ANTHROPIC_BASE_URL=http://host.docker.internal:$port"
+    --ve "JUDGE_WIRE=anthropic"
+    --ve "JUDGE_MODEL=$judge_model"
+  )
+  echo "[run_task] bedrock judge proxy ready on 127.0.0.1:$port (pid $BEDROCK_JUDGE_PID)"
+  echo "[run_task]   judge model = $judge_model"
+  echo "[run_task]   verifier wire -> http://host.docker.internal:$port (JUDGE_WIRE=anthropic)"
+}
+
+stop_bedrock_judge_proxy() {
+  [ -n "${BEDROCK_JUDGE_PID:-}" ] || return 0
+  if kill -0 "$BEDROCK_JUDGE_PID" 2>/dev/null; then
+    kill -TERM "$BEDROCK_JUDGE_PID" 2>/dev/null || true
+    local i=0
+    while [ $i -lt 20 ] && kill -0 "$BEDROCK_JUDGE_PID" 2>/dev/null; do
+      sleep 0.25; i=$((i+1))
+    done
+    kill -9 "$BEDROCK_JUDGE_PID" 2>/dev/null || true
+    echo "[run_task] bedrock judge proxy stopped (pid $BEDROCK_JUDGE_PID)" >&2
+  fi
+  BEDROCK_JUDGE_PID=""
+  [ -n "${BEDROCK_JUDGE_CONFIG:-}" ] && rm -f "$BEDROCK_JUDGE_CONFIG"
+  return 0
+}
+
+# -------------------------------------------------- bedrock judge dispatcher
+# JUDGE_MODE picks the judge wire when CC_MODE=bedrock. The agent always runs
+# on Bedrock (per CC_MODE); the judge wire is independent so an operator can
+# compare judge models without rerunning the agent. Falls back to the Bedrock
+# judge proxy when JUDGE_MODE is unset.
+select_bedrock_judge() {
+  local mode="${JUDGE_MODE:-bedrock}"
+  case "$mode" in
+    bedrock)
+      ensure_bedrock_judge_proxy
+      ;;
+    anthropic)
+      if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        echo "[run_task] JUDGE_MODE=anthropic ERROR: ANTHROPIC_API_KEY not set" >&2
+        exit 4
+      fi
+      BEDROCK_VERIFIER_ARGS=(
+        --ve "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+        --ve "JUDGE_WIRE=anthropic"
+      )
+      [ -n "${JUDGE_MODEL:-}" ] && BEDROCK_VERIFIER_ARGS+=(--ve "JUDGE_MODEL=$JUDGE_MODEL")
+      echo "[run_task] judge wire -> api.anthropic.com (JUDGE_MODE=anthropic, JUDGE_MODEL=${JUDGE_MODEL:-<wire default>})"
+      ;;
+    openai)
+      if [ -z "${OPENAI_API_KEY:-}" ]; then
+        echo "[run_task] JUDGE_MODE=openai ERROR: OPENAI_API_KEY not set" >&2
+        exit 4
+      fi
+      BEDROCK_VERIFIER_ARGS=(
+        --ve "OPENAI_API_KEY=$OPENAI_API_KEY"
+        --ve "JUDGE_WIRE=openai"
+      )
+      [ -n "${JUDGE_MODEL:-}" ] && BEDROCK_VERIFIER_ARGS+=(--ve "JUDGE_MODEL=$JUDGE_MODEL")
+      echo "[run_task] judge wire -> api.openai.com (JUDGE_MODE=openai, JUDGE_MODEL=${JUDGE_MODEL:-<wire default>})"
+      ;;
+    kiro)
+      ensure_kiro_bridge
+      # ensure_kiro_bridge populates KIRO_VERIFIER_ARGS and exports
+      # OPENHANDS_LLM_*. The OPENHANDS_LLM_* exports would compete with the
+      # Bedrock agent env; clear them so the agent stays on Bedrock.
+      unset OPENHANDS_LLM_BASE_URL OPENHANDS_LLM_API_KEY
+      BEDROCK_VERIFIER_ARGS=("${KIRO_VERIFIER_ARGS[@]}")
+      KIRO_VERIFIER_ARGS=()
+      echo "[run_task] judge wire -> kiro_bridge (JUDGE_MODE=kiro, KIRO_JUDGE_MODEL=${KIRO_JUDGE_MODEL:-<KIRO_MODEL fallback>})"
+      ;;
+    *)
+      echo "[run_task] JUDGE_MODE ERROR: unknown value '$mode' (expected: bedrock | anthropic | openai | kiro)" >&2
+      exit 4
+      ;;
+  esac
 }
 
 # ------------------------------------------------------------------ ccbridge
@@ -2583,7 +2750,7 @@ trap on_interrupt INT
 trap on_terminate TERM
 # A per-run ccbridge or kiro bridge dies with the run however the run ends:
 # on_interrupt and on_terminate call exit, which runs this too.
-_stop_run_bridges() { stop_run_ccbridge; stop_kiro_bridge; }
+_stop_run_bridges() { stop_run_ccbridge; stop_kiro_bridge; stop_bedrock_judge_proxy; }
 trap _stop_run_bridges EXIT
 
 refuse_uncmountable_paths

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -229,8 +230,8 @@ def test_published_reward_json_is_cut_to_the_trees_precision(tmp_path):
     )
     written = h2o.convert_job(job, out, ks=[], run_offset=0)
     assert written
-    rw = json.loads(
-        (written[0] / "trajectory" / "run_1" / "verifier" / "reward.json").read_text()
+    rw = tomllib.loads(
+        (written[0] / "trajectory" / "run_1" / "verifier" / "reward.toml").read_text(encoding="utf-8")
     )
     for k in ("reward", "completion_rate", "misbehave_rate"):
         assert rw[k] == h2o.norm_reward(rw[k]), \
@@ -592,8 +593,8 @@ def test_the_bundles_own_reward_publishes_whatever_its_producer(tmp_path):
             root, [{"completion_rate": 0.9, "misbehave_rate": 0.0, "reward": 0.0}], reward)
         written = h2o.convert_job(job, out, ks=[], run_offset=0)
         assert written
-        published[producer] = json.loads(
-            (written[0] / "trajectory" / "run_1" / "verifier" / "reward.json").read_text())
+        published[producer] = tomllib.loads(
+            (written[0] / "trajectory" / "run_1" / "verifier" / "reward.toml").read_text(encoding="utf-8"))
     assert {p: d["reward"] for p, d in published.items()} == {
         "judge_container": 75.0, "something_new": 75.0, None: 75.0}
     assert published["judge_container"]["producer"] == "judge_container"
@@ -607,8 +608,8 @@ def test_a_verifier_with_no_numeric_reward_is_unscored_not_regraded(tmp_path):
         {"completion_rate": 0.9, "misbehave_rate": 0.0})
     written = h2o.convert_job(job, out, ks=[], run_offset=0)
     assert written
-    reward = json.loads(
-        (written[0] / "trajectory" / "run_1" / "verifier" / "reward.json").read_text())
+    reward = tomllib.loads(
+        (written[0] / "trajectory" / "run_1" / "verifier" / "reward.toml").read_text(encoding="utf-8"))
     assert reward["producer"] == "unscored"
     assert reward["unscored_reason"]
 
@@ -632,5 +633,5 @@ def test_the_judge_markers_do_not_ship_in_the_published_run(tmp_path):
     published = written[0] / "trajectory" / "run_1" / "verifier"
     for name in h2o.JUDGE_MARKERS:
         assert not (published / name).exists(), f"{name} shipped in the published run"
-    reward = json.loads((published / "reward.json").read_text())
+    reward = tomllib.loads((published / "reward.toml").read_text(encoding="utf-8"))
     assert reward["producer"] == "judge_container", "the label itself must survive"

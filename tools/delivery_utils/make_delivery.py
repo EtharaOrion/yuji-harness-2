@@ -10,7 +10,13 @@ from typing import NamedTuple
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
-from harbor_to_output import norm_reward, pct_to_reward, bundle_dir_names
+from harbor_to_output import (
+    bundle_dir_names,
+    norm_reward,
+    pct_to_reward,
+    _dump_toml_scalar,
+    _load_toml,
+)
 
 # tools/delivery/make_delivery.py -> the checkout root. Every path this
 # file masks is measured against it.
@@ -308,10 +314,10 @@ def make_delivery(
                 shutil.copy2(src, ver_dst / "test-stdout.txt")
                 break
 
-        reward_src = _load(ver_src / "reward.json", {}) or {}
-        _dump(ver_dst / "reward.json", {
+        reward_src = _load_toml(ver_src / "reward.toml", {}) or {}
+        _dump_toml_scalar(ver_dst / "reward.toml", {
             "reward": norm_reward(reward_src.get("reward", 0)),
-            **{k: reward_src[k] for k in ("comparable", "caveats") if k in reward_src},
+            **{k: reward_src[k] for k in ("comparable",) if k in reward_src},
         })
 
         rubric = report.get("rubric", [])
