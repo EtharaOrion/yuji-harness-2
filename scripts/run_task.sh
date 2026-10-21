@@ -1697,16 +1697,18 @@ KIRO_BRIDGE_CONFIG=""
 KIRO_VERIFIER_ARGS=()
 
 ensure_kiro_bridge() {
-  local venv_py="$REPO/.venv/bin/python"
-  if [ ! -x "$venv_py" ]; then
-    echo "[run_task] kiro ERROR: $venv_py not found; create a venv and install kiro_bridge:" >&2
-    echo "[run_task]   python3 -m venv $REPO/.venv" >&2
-    echo "[run_task]   $REPO/.venv/bin/pip install <path-to-kiro-bridge-bundle>/kiro_bridge" >&2
+  # kiro_bridge is vendored at tools/bridges/kiro_bridge/ and has zero runtime
+  # dependencies (pure stdlib), so no venv or pip-install is needed -- just
+  # put its parent on PYTHONPATH and run with host python3.
+  local host_py; host_py="$(command -v python3 || true)"
+  if [ -z "$host_py" ]; then
+    echo "[run_task] kiro ERROR: python3 not found on PATH" >&2
     exit 4
   fi
-  if ! "$venv_py" -c 'import kiro_bridge' >/dev/null 2>&1; then
-    echo "[run_task] kiro ERROR: kiro_bridge not installed in $REPO/.venv" >&2
-    echo "[run_task]   Fix: $venv_py -m pip install <path-to-kiro-bridge-bundle>/kiro_bridge" >&2
+  local bridge_path="$REPO/tools/bridges"
+  if ! PYTHONPATH="$bridge_path" "$host_py" -c 'import kiro_bridge' >/dev/null 2>&1; then
+    echo "[run_task] kiro ERROR: cannot import kiro_bridge from $bridge_path/kiro_bridge" >&2
+    echo "[run_task]   Check that tools/bridges/kiro_bridge/__init__.py exists." >&2
     exit 4
   fi
   local cfg_dir="$OUTPUT_DIR/.kiro-bridge"
@@ -1718,7 +1720,8 @@ ensure_kiro_bridge() {
   (
     KIRO_MODEL="${KIRO_MODEL:-$MODEL}" \
     KIRO_JUDGE_MODEL="${KIRO_JUDGE_MODEL:-}" \
-    nohup "$venv_py" "$REPO/tools/bridges/kiro_bridge_runner.py" \
+    PYTHONPATH="$bridge_path${PYTHONPATH:+:$PYTHONPATH}" \
+    nohup "$host_py" "$REPO/tools/bridges/kiro_bridge_runner.py" \
       --host 127.0.0.1 --port 0 --config-out "$KIRO_BRIDGE_CONFIG" \
       >"$log" 2>&1 &
     echo $!

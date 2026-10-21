@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kiro-bridge"
+version = "0.1.0"
+description = "Run Kiro CLI agents and Kiro-judged evaluations from any harness, via the kiro-cli login"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# No runtime dependencies: the bridge drives the `kiro-cli` binary and serves
+# MCP/Anthropic over the standard library only.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[project.scripts]
+kiro-bridge = "kiro_bridge.cli:main"
+
+# Flat layout: this folder IS the package, so a project can import it straight
+# from a checkout (with the folder's parent on sys.path) or pip-install it.
+[tool.setuptools]
+packages = ["kiro_bridge"]
+package-dir = { "kiro_bridge" = "." }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
