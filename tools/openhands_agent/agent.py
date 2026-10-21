@@ -230,11 +230,13 @@ class OpenHandsAgent(BaseInstalledAgent):
             raise ValueError(f"{BASE_URL_ENV} and {API_KEY_ENV} must be set")
         if not self.model_name:
             raise ValueError("no model: pass --model to harbor")
+        model = litellm_model(self.model_name)
+        # Bedrock placeholders in BASE_URL_ENV / API_KEY_ENV are dropped here,
+        # not forwarded: LiteLLM would otherwise treat them as a bearer token.
+        is_bedrock = model.startswith("bedrock/")
         opts = self.options
         env: dict[str, str] = {
-            "LLM_MODEL": litellm_model(self.model_name),
-            "LLM_BASE_URL": base_url,
-            "LLM_API_KEY": api_key,
+            "LLM_MODEL": model,
             "LLM_TIMEOUT": str(opts.llm_timeout),
             "LLM_NUM_RETRIES": str(opts.num_retries),
             "MAX_ITERATIONS": str(opts.max_iterations),
@@ -242,6 +244,29 @@ class OpenHandsAgent(BaseInstalledAgent):
             "AGENT_LOGS_DIR": self.environment_logs_dir.as_posix(),
             "OPENHANDS_SUPPRESS_BANNER": "1",
         }
+        if is_bedrock:
+            for k in ("AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION",
+                      "AWS_DEFAULT_REGION", "AWS_ACCESS_KEY_ID",
+                      "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+                      "BEDROCK_MODEL_IDS", "BEDROCK_AWS_REGION"):
+                v = self._get_env(k) or os.environ.get(k)
+                if v:
+                    env[k] = v
+            if not (env.get("AWS_BEARER_TOKEN_BEDROCK")
+                    or env.get("AWS_ACCESS_KEY_ID")):
+                raise ValueError(
+                    "model is bedrock/* but no AWS_BEARER_TOKEN_BEDROCK "
+                    "(or AWS_ACCESS_KEY_ID) is set on this host for the "
+                    "agent container to forward."
+                )
+            if not (env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")):
+                raise ValueError(
+                    "model is bedrock/* but neither AWS_REGION nor "
+                    "AWS_DEFAULT_REGION is set on this host."
+                )
+        else:
+            env["LLM_BASE_URL"] = base_url
+            env["LLM_API_KEY"] = api_key
         if opts.reasoning_effort:
             env["LLM_REASONING_EFFORT"] = opts.reasoning_effort
         if opts.max_output_tokens:

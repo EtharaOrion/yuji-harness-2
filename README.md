@@ -67,6 +67,9 @@ Run one mcp-atlas Harbor task end-to-end and emit the per-task output/ tree
   scripts/run_task.sh tasks/xenon-atomic-cube                 # openhands + opus-5 (defaults)
   AGENT=claude-code scripts/run_task.sh tasks/foo             # harbor's claude-code agent
   CC_MODE=zbridge N=3 scripts/run_task.sh tasks/foo           # openhands on GLM-5.3 (zbridge)
+  CC_MODE=bedrock MODEL=claude-opus-5 scripts/run_task.sh tasks/foo  # openhands on AWS Bedrock
+  CC_MODE=kiro KIRO_MODEL=claude-opus-5 KIRO_JUDGE_MODEL=gpt-5.6-sol \
+      scripts/run_task.sh tasks/foo                           # openhands on Kiro (dynamic model + judge)
   AGENT=oracle scripts/run_task.sh tasks/foo                  # oracle gate
   COPY_TO=/some/dir scripts/run_task.sh tasks/foo           # optional extra mirror
 
@@ -76,13 +79,18 @@ The default agent is OpenHands (tools/openhands_agent), on the host's Claude
 subscription through a ccbridge (tools/bridges/ccbridge) that this run starts
 and stops. The bridge holds the OAuth token; the agent's container gets only
 the bridge's per-run secret. With CC_MODE=zbridge the same agent runs on GLM
-through zbridge instead. See tools/openhands_agent/README.md.
+through zbridge instead. With CC_MODE=bedrock the agent calls AWS Bedrock
+directly from the container with AWS_BEARER_TOKEN_BEDROCK and AWS_REGION
+forwarded in; no host bridge is started. See tools/openhands_agent/README.md.
 
 Env overrides: AGENT (openhands) MODEL (claude-opus-5) N (1) JOB (<task slug>)
                OUTPUT_DIR (<repo>/output) COPY_TO (unset) BUILD_MULT (3) AT (auto)
                STAGE (all) RUN_OFFSET (auto) SETUP_MULT (6)
                DISALLOWED_TOOLS (WebSearch,WebFetch)
-               CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766)
+               CC_MODE (unset -> claude-opus-5; "zbridge" -> glm-5.3 via :8766;
+                        "bedrock" -> AWS Bedrock direct, no host bridge)
+  bedrock:     AWS_BEARER_TOKEN_BEDROCK (required) BEDROCK_AWS_REGION (required)
+               BEDROCK_MODEL_IDS (alias1=id1,alias2=id2 map, resolves MODEL)
                CC_BRIDGE_ENABLED (0)
                AGENT_HEADROOM_ENABLED (false)
   openhands:   CCBRIDGE_SHARED (0: a ccbridge per run, on a free port, stopped

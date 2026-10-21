@@ -329,6 +329,25 @@ def format_enriched_trajectory_for_judge(turns: list, max_chars: int = 60000) ->
     return rendered
 
 
+def _resolve_bedrock_alias(model: str) -> str:
+    """Translate bedrock/<alias> to bedrock/<ARN> via BEDROCK_MODEL_IDS.
+
+    Agent-side scripts/run_task.sh resolves the same alias map; mirroring it
+    here lets the judge accept short names (e.g. bedrock/gpt-5.6-sol) instead
+    of pasting the full application-inference-profile ARN into env.
+    """
+    if not model.startswith("bedrock/"):
+        return model
+    bare = model[len("bedrock/"):]
+    if bare.startswith("arn:aws:"):
+        return model
+    for pair in os.getenv("BEDROCK_MODEL_IDS", "").split(","):
+        key, _, val = pair.partition("=")
+        if key.strip() == bare and val.strip():
+            return "bedrock/" + val.strip()
+    return model
+
+
 class AsyncLiteLLMClient:
     """Manages async LiteLLM proxy requests with rate limiting."""
 
@@ -340,6 +359,30 @@ class AsyncLiteLLMClient:
         self.error_count = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+
+        # Bedrock models skip the LiteLLM proxy and call LiteLLM in-process:
+        # AWS_BEARER_TOKEN_BEDROCK + AWS_REGION are read from env, so
+        # base_url / api_key are unused and not required.
+        self.is_bedrock = config.model_name.startswith("bedrock/")
+        if self.is_bedrock:
+            config.model_name = _resolve_bedrock_alias(config.model_name)
+            self.base_url = ""
+            self.api_keys = []
+            self.aws_region = (
+                os.getenv("BEDROCK_AWS_REGION")
+                or os.getenv("AWS_REGION")
+                or os.getenv("AWS_DEFAULT_REGION")
+            )
+            if not (os.getenv("AWS_BEARER_TOKEN_BEDROCK") or os.getenv("AWS_ACCESS_KEY_ID")):
+                raise ValueError(
+                    "Model is bedrock/* but no AWS_BEARER_TOKEN_BEDROCK (or AWS_ACCESS_KEY_ID) is set."
+                )
+            if not self.aws_region:
+                raise ValueError(
+                    "Model is bedrock/* but no AWS region is set. Set BEDROCK_AWS_REGION or AWS_REGION."
+                )
+            self.logger.info(f"Bedrock routing enabled for {config.model_name} in {self.aws_region}")
+            return
 
         self.base_url = (
             config.base_url
@@ -369,6 +412,38 @@ class AsyncLiteLLMClient:
             try:
                 self.request_count += 1
 
+                response_format = None
+                if response_schema:
+                    response_format = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "failure_diagnosis",
+                            "schema": response_schema,
+                        },
+                    }
+
+                if self.is_bedrock:
+                    import litellm
+                    kwargs: Dict[str, Any] = {
+                        "model": self.config.model_name,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "aws_region_name": self.aws_region,
+                        "timeout": timeout,
+                    }
+                    if response_format is not None:
+                        kwargs["response_format"] = response_format
+                    resp = await litellm.acompletion(**kwargs)
+                    await asyncio.sleep(self.config.request_delay)
+                    usage = getattr(resp, "usage", None)
+                    if usage is not None:
+                        self.total_prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+                        self.total_completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+                    content = resp.choices[0].message.content
+                    if response_schema:
+                        return json.loads(content)
+                    return content
+
                 url = f"{self.base_url}/v1/chat/completions"
                 api_key = random.choice(self.api_keys)
                 headers = {
@@ -380,15 +455,8 @@ class AsyncLiteLLMClient:
                     "messages": messages,
                     "temperature": temperature,
                 }
-
-                if response_schema:
-                    payload["response_format"] = {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "failure_diagnosis",
-                            "schema": response_schema,
-                        },
-                    }
+                if response_format is not None:
+                    payload["response_format"] = response_format
 
                 async with aiohttp.ClientSession() as session:
                     async with session.post(

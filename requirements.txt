@@ -14,3 +14,7 @@ tqdm~=4.64.0
 matplotlib~=3.6.0
 nest-asyncio~=1.5.0
 httpx~=0.28.0
+# Judge pipeline optionally routes bedrock/* models through LiteLLM directly
+# (score_claims.py, single_model_diagnostic.py). Pinned to the version the
+# agent's openhands-runtime already uses so the two Python environments agree.
+litellm~=1.102.0

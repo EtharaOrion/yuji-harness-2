@@ -643,6 +643,120 @@ def pin_adaptive_thinking(display: str = "summarized") -> bool:
     return True
 
 
+def pin_bedrock_adaptive_thinking() -> bool:
+    """Teach LiteLLM that a Bedrock ARN points at an adaptive-thinking model.
+
+    Bedrock inference profiles for Claude 4.x reject {type:"enabled"} with
+      "thinking.type.enabled" is not supported for this model. Use
+      "thinking.type.adaptive" and "output_config.effort" ...
+    LiteLLM picks enabled vs adaptive in AmazonConverseConfig.map_openai_params
+    via AnthropicConfig._is_adaptive_thinking_model(model, "bedrock"), which
+    reads the model-cost map keyed by model id. ARN-based inference profiles
+    (bedrock/arn:aws:bedrock:...) have no entry, so the check returns False
+    and the legacy enabled block reaches Bedrock verbatim. Short-circuit the
+    check for ARN model strings on the bedrock provider: inference profiles
+    are the Bedrock-recommended way to use Claude 4.x, and 4.x is adaptive.
+    """
+    try:
+        from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+    except Exception as exc:  # noqa: BLE001
+        print(f"[openhands] bedrock thinking patch not installed: {exc}", file=sys.stderr)
+        return False
+    original = getattr(AnthropicConfig._is_adaptive_thinking_model,
+                       "_bedrock_adaptive_original",
+                       AnthropicConfig._is_adaptive_thinking_model)
+
+    def _is_adaptive_thinking_model(model, custom_llm_provider):
+        if original(model, custom_llm_provider):
+            return True
+        if custom_llm_provider == "bedrock" and isinstance(model, str) \
+                and "arn:aws:bedrock:" in model:
+            return True
+        return False
+
+    _is_adaptive_thinking_model._bedrock_adaptive_original = original  # type: ignore[attr-defined]
+    AnthropicConfig._is_adaptive_thinking_model = staticmethod(_is_adaptive_thinking_model)
+    return True
+
+
+def pin_bedrock_alias_resolution() -> bool:
+    """Keep bedrock/<alias> visible in trajectories, hand bedrock/<ARN> to LiteLLM.
+
+    OpenHands SDK records whatever model id its LLM was constructed with on
+    every assistant event, so running with model=bedrock/arn:aws:... would
+    leak the full inference-profile ARN into 100+ log lines and the account id
+    into finance_receipt.json. The ARN is routing metadata, not an experiment
+    identifier.
+    OpenHands SDK does `from litellm import completion as litellm_completion`
+    in openhands/sdk/llm/llm.py (and the acompletion equivalent), binding the
+    name at import time, so patching litellm.completion on the litellm module
+    is a no-op for the SDK call site. The SDK's own bound names must be
+    patched instead. We also patch the module-level names as a belt-and-
+    suspenders fallback for direct litellm callers (e.g. the judge services).
+    Non-bedrock models pass through. BEDROCK_MODEL_IDS is the alias map.
+    """
+    try:
+        import litellm
+    except Exception as exc:  # noqa: BLE001
+        print(f"[openhands] bedrock alias resolution not installed: {exc}", file=sys.stderr)
+        return False
+
+    def _resolve(m):
+        if not isinstance(m, str) or not m.startswith("bedrock/"):
+            return m
+        bare = m[len("bedrock/"):]
+        if bare.startswith("arn:aws:"):
+            return m
+        for pair in os.environ.get("BEDROCK_MODEL_IDS", "").split(","):
+            key, _, val = pair.partition("=")
+            if key.strip() == bare and val.strip():
+                return "bedrock/" + val.strip()
+        return m
+
+    def _wrap(orig):
+        def completion(*args, **kwargs):
+            if "model" in kwargs:
+                kwargs["model"] = _resolve(kwargs["model"])
+            elif args:
+                args = (_resolve(args[0]),) + args[1:]
+            return orig(*args, **kwargs)
+        completion._bedrock_alias_original = orig  # type: ignore[attr-defined]
+        return completion
+
+    def _wrap_async(orig):
+        async def acompletion(*args, **kwargs):
+            if "model" in kwargs:
+                kwargs["model"] = _resolve(kwargs["model"])
+            elif args:
+                args = (_resolve(args[0]),) + args[1:]
+            return await orig(*args, **kwargs)
+        acompletion._bedrock_alias_original = orig  # type: ignore[attr-defined]
+        return acompletion
+
+    # Belt: the litellm module itself (direct callers, e.g. the judge).
+    orig_c = getattr(litellm.completion, "_bedrock_alias_original", litellm.completion)
+    orig_a = getattr(litellm.acompletion, "_bedrock_alias_original", litellm.acompletion)
+    litellm.completion = _wrap(orig_c)
+    litellm.acompletion = _wrap_async(orig_a)
+
+    # Suspenders: openhands SDK's bound names, which it name-imported at
+    # module load. This is the one that matters for the agent.
+    try:
+        import openhands.sdk.llm.llm as sdk_llm
+        sdk_c = getattr(sdk_llm, "litellm_completion", None)
+        sdk_a = getattr(sdk_llm, "litellm_acompletion", None)
+        if sdk_c is not None:
+            orig_c2 = getattr(sdk_c, "_bedrock_alias_original", sdk_c)
+            sdk_llm.litellm_completion = _wrap(orig_c2)  # type: ignore[attr-defined]
+        if sdk_a is not None:
+            orig_a2 = getattr(sdk_a, "_bedrock_alias_original", sdk_a)
+            sdk_llm.litellm_acompletion = _wrap_async(orig_a2)  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[openhands] bedrock alias resolution: SDK name patch skipped ({exc})",
+              file=sys.stderr)
+    return True
+
+
 REFUSALS: list[str] = []
 """Response ids Anthropic answered with stop_reason "refusal", in order."""
 
@@ -779,8 +893,12 @@ def main(argv: list[str] | None = None) -> int:
     # Popped, not read: the terminal tool's shell inherits this process's
     # environment, and the agent has no use for the bridge secret in it.
     api_key = os.environ.pop("LLM_API_KEY", "").strip()
-    if not model or not api_key:
-        print("[openhands] LLM_MODEL and LLM_API_KEY must both be set", file=sys.stderr)
+    is_bedrock = model.startswith("bedrock/")
+    if not model:
+        print("[openhands] LLM_MODEL must be set", file=sys.stderr)
+        return 2
+    if not is_bedrock and not api_key:
+        print("[openhands] LLM_API_KEY must be set (unless LLM_MODEL is bedrock/*)", file=sys.stderr)
         return 2
 
     # /workspace is where every bundle here keeps the task's files; the
@@ -809,6 +927,9 @@ def main(argv: list[str] | None = None) -> int:
         from openhands.tools.terminal import TerminalTool
 
         pin_adaptive_thinking(os.environ.get("LLM_THINKING_DISPLAY", "summarized").strip() or "summarized")
+        if is_bedrock:
+            pin_bedrock_adaptive_thinking()
+            pin_bedrock_alias_resolution()
         count_refusals(lambda rid: stream.write({
             "type": "system", "subtype": "refusal", "response_id": rid,
             "detail": "Anthropic returned stop_reason \"refusal\" with no content"}))
@@ -826,7 +947,7 @@ def main(argv: list[str] | None = None) -> int:
                           "error": detail[:500]})
 
         llm_kwargs: dict[str, Any] = {
-            "model": model, "api_key": api_key, "base_url": base_url,
+            "model": model,
             "usage_id": "agent",
             "num_retries": _env_int("LLM_NUM_RETRIES", 5),
             "retry_listener": on_retry,
@@ -835,6 +956,15 @@ def main(argv: list[str] | None = None) -> int:
             # timeout is raised to match (run_task.sh ensure_ccbridge).
             "timeout": _env_int("LLM_TIMEOUT", 1800),
         }
+        if is_bedrock:
+            # LiteLLM reads AWS_BEARER_TOKEN_BEDROCK / AWS_* from env; passing
+            # api_key here makes it attempt the placeholder as a bearer token.
+            aws_region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+            if aws_region:
+                llm_kwargs["aws_region_name"] = aws_region
+        else:
+            llm_kwargs["api_key"] = api_key
+            llm_kwargs["base_url"] = base_url
         if (effort := os.environ.get("LLM_REASONING_EFFORT", "").strip()):
             llm_kwargs["reasoning_effort"] = effort
         if (max_out := _env_int("LLM_MAX_OUTPUT_TOKENS", None)):
