@@ -172,6 +172,91 @@ def render() -> str:
       "plan and verifier environment through harbor's own code and refuses what harbor would "
       "refuse after the image build.\n")
 
+    w("## Mode details\n")
+    w("`CC_MODE` picks both the agent model route and the judge wire. The default is ccbridge; "
+      "every mode runs the same OpenHands agent and the same bundle verifier, only the "
+      "transport changes.\n")
+
+    w("### Default (ccbridge)\n")
+    w("- **Agent**: OpenHands \u2192 ccbridge on 127.0.0.1 (per-run, ephemeral port) \u2192 "
+      "host's Claude subscription (OAuth, from `CLAUDE_CODE_OAUTH_TOKEN`).\n"
+      "- **Judge**: direct `api.anthropic.com` with `ANTHROPIC_API_KEY` from `.env` or the "
+      "caller's environment. The bridge is agent-only.\n"
+      "- **Judge model**: whatever the bundle's rubric defaults to (usually "
+      "`claude-sonnet-5`); override by exporting `JUDGE_MODEL`.\n")
+    w("```bash\n"
+      "# .env\n"
+      "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat...\n"
+      "ANTHROPIC_API_KEY=sk-ant-api03-...   # judge\n"
+      "\n"
+      "scripts/run_task.sh tasks/<slug>\n"
+      "```\n")
+
+    w("### `CC_MODE=zbridge`\n")
+    w("- **Agent**: OpenHands \u2192 zbridge on `:8766` \u2192 GLM-5.3.\n"
+      "- **Judge**: unchanged from the default (direct `api.anthropic.com` with "
+      "`ANTHROPIC_API_KEY`).\n")
+    w("```bash\n"
+      "CC_MODE=zbridge scripts/run_task.sh tasks/<slug>\n"
+      "```\n")
+
+    w("### `CC_MODE=bedrock`\n")
+    w("Both agent and judge call AWS Bedrock directly. No host bridge, no kiro, no Anthropic.\n")
+    w("- **Agent**: OpenHands SDK \u2192 `litellm.completion` with `bedrock/<model>` prefix. The "
+      "alias in `MODEL` is resolved to the full inference-profile ARN at call-time via a "
+      "monkey-patch, so trajectory logs show `claude-opus-5`, not the ARN.\n"
+      "- **Judge**: in-process `litellm.acompletion` from `services/scoring/score_claims.py` and "
+      "`services/diagnostics/single_model_diagnostic.py`, same alias\u2192ARN resolver, same "
+      "AWS creds.\n")
+    w("```bash\n"
+      "# .env\n"
+      "CC_MODE=bedrock\n"
+      "MODEL=claude-opus-5                            # agent alias\n"
+      "JUDGE_MODEL=gpt-5.6-sol                        # judge alias (defaults to MODEL)\n"
+      "AWS_BEARER_TOKEN_BEDROCK=bedrock-api-key-...\n"
+      "BEDROCK_AWS_REGION=ap-south-1\n"
+      "BEDROCK_MODEL_IDS=claude-opus-5=arn:aws:bedrock:ap-south-1:XXXX:application-inference-profile/XXXX,"
+      "gpt-5.6-sol=arn:aws:bedrock:ap-south-1:XXXX:application-inference-profile/YYYY\n"
+      "\n"
+      "# optional, enables the pre-flight bedrock:ListFoundationModels check\n"
+      "AWS_ACCESS_KEY_ID=AKIA...\n"
+      "AWS_SECRET_ACCESS_KEY=...\n"
+      "# BEDROCK_CHECK_OFF=1   # set to skip the pre-flight check\n"
+      "\n"
+      "scripts/run_task.sh tasks/<slug>\n"
+      "```\n")
+    w("Three guards fire before the agent phase:\n"
+      "1. `AWS_BEARER_TOKEN_BEDROCK` + `BEDROCK_AWS_REGION` must be set, else the run is refused.\n"
+      "2. `MODEL` and `JUDGE_MODEL` must resolve through `BEDROCK_MODEL_IDS`, else the run is "
+      "refused with the list of known aliases.\n"
+      "3. If `AWS_ACCESS_KEY_ID` is set, a `bedrock:ListFoundationModels` ping validates the "
+      "creds at startup instead of 20 minutes into the trial.\n")
+
+    w("### `CC_MODE=kiro`\n")
+    w("Both agent and judge talk to kiro-cli through a local two-key bridge. Agent and judge "
+      "models are set independently per run.\n")
+    w("```\n"
+      "scripts/run_task.sh starts kiro_bridge on 127.0.0.1:<ephemeral>\n"
+      "                           \u251c\u2500 agent_key  pinned to  KIRO_MODEL        \u2192 kiro-cli\n"
+      "                           \u2514\u2500 judge_key  pinned to  KIRO_JUDGE_MODEL  \u2192 kiro-cli\n"
+      "```\n")
+    w("- **Agent** (OpenHands container): `ANTHROPIC_BASE_URL=http://host:<port>` + `agent_key` "
+      "\u2192 every tool call hits kiro-cli as `KIRO_MODEL`.\n"
+      "- **Judge** (verifier container): injected via Harbor `--ve` flags \u2014 "
+      "`ANTHROPIC_API_KEY=<judge_key>`, `ANTHROPIC_BASE_URL=http://host:<port>`, "
+      "`JUDGE_WIRE=anthropic`, `JUDGE_MODEL=<KIRO_JUDGE_MODEL>` (prevents the bundle's "
+      "`rubric_judge_cli.py` from falling back to its hardcoded `claude-sonnet-5` default).\n"
+      "- **Prereq**: `kiro login` already done on the host; the bridge drives the host's "
+      "logged-in CLI and holds no credentials of its own.\n")
+    w("```bash\n"
+      "CC_MODE=kiro \\\n"
+      "  KIRO_MODEL=claude-opus-5 \\\n"
+      "  KIRO_JUDGE_MODEL=gpt-5.6-sol \\\n"
+      "  scripts/run_task.sh tasks/<slug>\n"
+      "```\n")
+    w("Omit `KIRO_JUDGE_MODEL` and the judge falls back to the agent model. The bridge mints a "
+      "fresh `agent_key` and `judge_key` per run and tears both down at exit.\n")
+
     w("## Make targets\n")
     w("| Target | What it does |\n|---|---|")
     for t, d in make_targets():
