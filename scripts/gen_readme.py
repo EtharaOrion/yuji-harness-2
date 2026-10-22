@@ -125,7 +125,7 @@ def render() -> str:
     w("## What the bundle owns, and what the harness adds\n")
     w("| Concern | Owner | Mechanism |\n|---|---|---|")
     w("| Scoring | bundle | `tests/` run by harbor in the verifier environment; the reshaper "
-      "publishes `verifier/reward.toml` from the bundle's own reward and never recomputes it |")
+      "publishes `verifier/reward.json` as written and never recomputes it |")
     w("| Verifier environment | bundle | `[verifier] environment_mode` (`separate`: built from "
       "`[verifier.environment].docker_image`, else `tests/Dockerfile`, else `[environment]`) |")
     w("| Network policy | bundle | `network_mode` in `[environment]`, `[agent]`, `[verifier]`, "

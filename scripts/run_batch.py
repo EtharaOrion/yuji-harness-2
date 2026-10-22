@@ -241,20 +241,12 @@ def drive_unit(cp: ckpt.Checkpoint, unit_id: str, args: argparse.Namespace,
 
 
 def _grade(run_dir: Path) -> dict[str, Any]:
-    """Best-effort reward/pass readout, so the checkpoint doubles as a scoreboard.
-
-    reward.toml is the sole on-disk reward published since the format switch;
-    see tools/delivery_utils/harbor_to_output.py:_dump_toml_scalar.
-    """
+    """Best-effort reward/pass readout, so the checkpoint doubles as a scoreboard."""
     out: dict[str, Any] = {}
     try:
-        import tomllib
-        reward = tomllib.loads(
-            (run_dir / "verifier" / "reward.toml").read_text(encoding="utf-8"))
+        reward = json.loads((run_dir / "verifier" / "reward.json").read_text())
         out["reward"] = norm_reward(reward.get("reward", reward.get("value")))
-    except (OSError, ImportError, AttributeError):
-        pass
-    except Exception:  # noqa: BLE001 - tomllib raises TOMLDecodeError
+    except (OSError, json.JSONDecodeError, AttributeError):
         pass
     try:
         report = json.loads((run_dir / "report.json").read_text())
