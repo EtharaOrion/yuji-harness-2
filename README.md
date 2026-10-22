@@ -9,7 +9,7 @@ Runs inference and evaluation over the task bundles with [Harbor](https://github
 
 | Concern | Owner | Mechanism |
 |---|---|---|
-| Scoring | bundle | `tests/` run by harbor in the verifier environment; the reshaper publishes `verifier/reward.toml` from the bundle's own reward and never recomputes it |
+| Scoring | bundle | `tests/` run by harbor in the verifier environment; the reshaper publishes `verifier/reward.json` as written and never recomputes it |
 | Verifier environment | bundle | `[verifier] environment_mode` (`separate`: built from `[verifier.environment].docker_image`, else `tests/Dockerfile`, else `[environment]`) |
 | Network policy | bundle | `network_mode` in `[environment]`, `[agent]`, `[verifier]`, enforced by harbor's docker egress-control sidecar, which refuses a trial it cannot enforce |
 | Model route | harness | a bridge on the host, passed to harbor as `--allow-agent-host` |
