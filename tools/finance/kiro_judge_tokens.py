@@ -26,7 +26,9 @@ from pathlib import Path
 # A valuation only: Kiro bills credits, not these rates.
 RATES = {
     "gpt-5.6-sol":       {"input": 5.0, "output": 30.0, "cache_read": 0.5, "cache_write": 6.25},
+    "claude-opus-5":     {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
     "claude-opus-4-5":   {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
+    "claude-sonnet-5":   {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.50},
     "claude-sonnet-4-5": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
     "claude-haiku-4-5":  {"input": 1.0, "output": 5.0,  "cache_read": 0.1, "cache_write": 1.25},
