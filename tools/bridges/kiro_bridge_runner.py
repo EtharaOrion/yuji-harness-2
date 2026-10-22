@@ -18,7 +18,9 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -28,6 +30,29 @@ def _find_free_port(host: str) -> int:
         return s.getsockname()[1]
 
 
+def _call_logger(path: str):
+    """on_call hook: append each call as one JSON line. Calls arrive on pool threads."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    lock = threading.Lock()
+
+    def record(rec) -> None:
+        now = datetime.now(timezone.utc)
+        line = json.dumps({
+            "ts": now.isoformat(timespec="milliseconds"),
+            "label": rec.label,
+            "requested": rec.requested,
+            "served": rec.served,
+            "ok": rec.ok,
+            "error": rec.error,
+            "usage": rec.usage,
+        })
+        with lock, out.open("a") as fh:
+            fh.write(line + "\n")
+
+    return record
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run the Kiro Anthropic bridge for one task.")
     ap.add_argument("--host", default="127.0.0.1",
@@ -35,6 +60,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=0, help="bind port (0 = pick a free one)")
     ap.add_argument("--config-out", required=True,
                     help="write the chosen port + keys here as JSON; shell reads it then signals ready")
+    ap.add_argument("--calls-out", default="",
+                    help="append one JSON line per served call (label, model, usage, UTC time); "
+                         "lets the harness account judge tokens for bundles whose judge records none")
     args = ap.parse_args()
 
     try:
@@ -52,7 +80,8 @@ def main() -> int:
     agent_model = os.environ.get("KIRO_MODEL", "").strip() or None
     port = args.port or _find_free_port(args.host)
 
-    server = AnthropicServer(shared_bridge(), host=args.host, port=port)
+    server = AnthropicServer(shared_bridge(), host=args.host, port=port,
+                             on_call=_call_logger(args.calls_out) if args.calls_out else None)
     agent_key = server.add_key("agent")
     judge_key = server.add_key("judge", judge_model)
     server.start()

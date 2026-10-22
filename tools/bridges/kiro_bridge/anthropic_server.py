@@ -49,6 +49,13 @@ class CallRecord:
     error: str = ""
 
 
+class _Server(ThreadingHTTPServer):
+    # The stdlib default listen backlog is 5. Judges such as rewardkit fire one
+    # request per criterion at once (40+), which overflows it and surfaces in
+    # clients as "Server disconnected" / "Cannot connect to host".
+    request_queue_size = 256
+
+
 class AnthropicServer:
     """Serves `/v1/messages` from Kiro. Start, hand out keys, stop."""
 
@@ -94,7 +101,7 @@ class AnthropicServer:
     def start(self) -> AnthropicServer:
         if self._server is not None:
             return self
-        server = ThreadingHTTPServer((self.host, self._requested_port), _make_handler(self))
+        server = _Server((self.host, self._requested_port), _make_handler(self))
         server.daemon_threads = True
         self._server = server
         self._thread = threading.Thread(target=server.serve_forever, name="kiro-anthropic",

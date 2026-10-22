@@ -1705,6 +1705,10 @@ PYEOF
 # forward ANTHROPIC_BASE_URL in [verifier.env] for the judge to find it).
 KIRO_BRIDGE_PID=""
 KIRO_BRIDGE_CONFIG=""
+# Every call the bridge serves, one JSON line each. Named by job, not pid, so a
+# later `--stage reshape` finds it; kiro_judge_tokens.py turns the judge calls
+# into verifier/judge_tokens.json for bundles whose judge records no usage.
+KIRO_CALLS_LOG="$OUTPUT_DIR/.kiro-bridge/calls-${JOB//[^A-Za-z0-9._-]/_}.jsonl"
 # Verifier env args to append to the harbor CLI (--ve KEY=VALUE, repeatable).
 # Populated by ensure_kiro_bridge. Harbor sets these DIRECTLY on the verifier
 # container, bypassing task.toml's ${VAR:-} template resolution -- so a bundle
@@ -1738,6 +1742,7 @@ ensure_kiro_bridge() {
     PYTHONPATH="$bridge_path${PYTHONPATH:+:$PYTHONPATH}" \
     nohup "$host_py" "$REPO/tools/bridges/kiro_bridge_runner.py" \
       --host 127.0.0.1 --port 0 --config-out "$KIRO_BRIDGE_CONFIG" \
+      --calls-out "$KIRO_CALLS_LOG" \
       >"$log" 2>&1 &
     echo $!
   ) > "$cfg_dir/.pid.tmp"
@@ -1777,6 +1782,9 @@ ensure_kiro_bridge() {
     --ve "ANTHROPIC_API_KEY=$judge_key"
     --ve "ANTHROPIC_BASE_URL=http://host.docker.internal:$port"
     --ve "JUDGE_WIRE=${JUDGE_WIRE:-anthropic}"
+    # litellm (genkit/rewardkit judges) rejects reasoning_effort for bridge
+    # model names it doesn't map (e.g. anthropic/gpt-5.6-sol); drop it.
+    --ve "LITELLM_DROP_PARAMS=True"
   )
   # rubric_judge_cli.py reads JUDGE_MODEL from env; without it, it defaults to
   # the wire's canonical model (claude-sonnet-5 for anthropic) which is NOT
@@ -2658,6 +2666,10 @@ stage_reshape() {
   fi
   [ -n "${COPY_TO:-}" ] && conv+=(--copy-to "$COPY_TO")
   "${conv[@]}"
+  if [ -f "$KIRO_CALLS_LOG" ]; then
+    python3 tools/finance/kiro_judge_tokens.py --calls "$KIRO_CALLS_LOG" "$TRAJ_DIR"/run_* \
+      || echo "[run_task] WARNING: judge token backfill failed (non-fatal)" >&2
+  fi
   # Relative to the job dir this state file sits in — keeps host-local paths
   # out of everything the pipeline writes (informational only, never read back).
   state_put run_dir "trajectory/run_$((offset+1))"
