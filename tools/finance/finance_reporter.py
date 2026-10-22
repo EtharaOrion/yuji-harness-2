@@ -320,6 +320,15 @@ def usage_for_run(run_dir: Path) -> dict:
              or ((summary.get("config") or {}).get("model"))
              or env("MODEL"))
 
+    # OpenHands SDK reports total_cost_usd=0 for bedrock/* because LiteLLM has
+    # no built-in Bedrock pricing table. Compute cost from the agent's model
+    # rates when the SDK's value is zero but tokens exist.
+    if cost == 0 and (fresh + completion + cache_read + cache_write) > 0:
+        from kiro_judge_tokens import RATES, _cost as _rate_cost
+        bare = str(model or "").removeprefix("bedrock/").removeprefix("anthropic/")
+        if bare in RATES:
+            cost = _rate_cost(bare, int(fresh), int(completion), int(cache_read), int(cache_write))
+
     stamp = result.get("finished_at") or result.get("updated_at") or result.get("started_at")
     return {
         "trajectory_id": result.get("trial_name") or run_dir.name,
