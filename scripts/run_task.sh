@@ -1791,7 +1791,14 @@ ensure_kiro_bridge() {
   # the model the kiro bridge is serving on the judge key. Pin it so the
   # judge call records the right model and matches what the bridge actually
   # answers.
-  if [ -n "${KIRO_JUDGE_MODEL:-}" ]; then
+  # Only pin JUDGE_MODEL when the kiro bridge is actually serving the judge
+  # (JUDGE_WIRE=anthropic path) AND the operator didn't set JUDGE_MODEL
+  # themselves. With JUDGE_TRANSPORT=codex the operator's JUDGE_MODEL is for
+  # a different wire; clobbering it would make rewardkit call codex with
+  # gpt-5.6-sol and drop the rubric channel to pytest-only.
+  if [ -n "${KIRO_JUDGE_MODEL:-}" ] \
+       && [ -z "${JUDGE_MODEL:-}" ] \
+       && [ "${JUDGE_WIRE:-anthropic}" = "anthropic" ]; then
     KIRO_VERIFIER_ARGS+=(--ve "JUDGE_MODEL=$KIRO_JUDGE_MODEL")
   fi
   echo "[run_task] kiro bridge ready on 127.0.0.1:$port (pid $KIRO_BRIDGE_PID)"
@@ -2051,7 +2058,12 @@ ccbridge_prepare() {
   mkdir -p "$CCBRIDGE_DIR/logs"
   # The first sync on a machine builds the venv -- minutes when cold. A venv
   # copied from another machine is rebuilt here rather than half-working.
-  (cd "$CCBRIDGE_DIR" && uv sync --frozen --quiet) || {
+  # Pin UV_PYTHON=3.12 (pyproject requires >=3.12 but a 3.13/3.14 host without
+  # 3.12 installed makes uv silently fail the sync). Clear UV_PROJECT_ENVIRONMENT
+  # so an operator-set venv path from an outer uv run does not redirect the
+  # sync away from CCBRIDGE_DIR/.venv.
+  (cd "$CCBRIDGE_DIR" && unset UV_PROJECT_ENVIRONMENT && \
+      UV_PYTHON=3.12 uv sync --frozen --quiet) || {
     echo "[run_task] ERROR: could not build the ccbridge venv (uv sync in $CCBRIDGE_DIR)" >&2
     exit 3
   }

@@ -50,7 +50,8 @@ md = _load_delivery()
 
 def _build_job(
     tmp_path: Path, per_trial: list[dict], trial_reward: dict | None = None,
-    agent_cost: float | None = None,
+    agent_cost: float | None = None, agent_name: str = "claude-code",
+    model_name: str = "claude-opus-5", job_subdir: str = "job",
 ) -> tuple[Path, Path]:
     """A minimal Harbor job dir carrying `per_trial` metrics in result.json.
 
@@ -59,10 +60,10 @@ def _build_job(
     `agent_cost`, when given, becomes each trial's agent/trajectory.json
     final_metrics.total_cost_usd, uncut, as the agent SDK writes it.
     """
-    job = tmp_path / "job"
+    job = tmp_path / job_subdir
     job.mkdir()
     (job / "config.json").write_text(
-        json.dumps({"agents": [{"name": "claude-code", "model_name": "claude-opus-5"}]})
+        json.dumps({"agents": [{"name": agent_name, "model_name": model_name}]})
     )
     (job / "result.json").write_text(
         json.dumps({"id": "job-1", "stats": {"evals": {"e1": {"metrics": per_trial}}}})
@@ -86,7 +87,7 @@ def _build_job(
             verifier.mkdir()
             (verifier / "reward.json").write_text(json.dumps(trial_reward))
     out = tmp_path / "out"
-    out.mkdir()
+    out.mkdir(exist_ok=True)
     return job, out
 
 
@@ -153,6 +154,35 @@ def test_unmeasured_channel_reports_null_not_zero(tmp_path):
         tmp_path, [{"completion_rate": 0.9, "misbehave_rate": 0.0, "reward": 0.0}]
     )
     assert summary["metrics"]["avg_traj_tests"] is None
+
+
+def test_rewardkit_bundle_populates_percentages_from_reward_json(tmp_path):
+    """The Rewardkit (5b10675f) bundle writes only verifier/reward.json with
+    {pytest, rubric, reward} and omits detail.json / channel_a / rubric_breakdown.
+    Without the fallback at harbor_to_output.py:1027, traj_val/rubric_val stay
+    None and every run drops out of the pass_summary.json completed filter.
+    """
+    import shutil
+    out_task = tmp_path / "task"
+    trial = out_task / "trajectory" / "run_1"
+    (trial / "agent").mkdir(parents=True)
+    (trial / "verifier").mkdir()
+    (trial / "config.json").write_text(
+        json.dumps({"task": {"path": "tasks/demo", "name": "demo"}}))
+    (trial / "result.json").write_text(json.dumps({"id": "t", "reward": 0.0}))
+    (trial / "verifier" / "reward.json").write_text(json.dumps({
+        "pytest": 0.75, "rubric": 0.80, "reward": 0.775
+    }))
+    raw = out_task / ".raw" / "trials_demo"
+    raw.mkdir(parents=True)
+    rec = h2o.reshape_trial(trial, 1, out_task=out_task, raw_trials=raw,
+                            model="m", task_name="demo", task_dir=None,
+                            job_id="j1", agent_name="smoke")
+    pr = rec["per_run"]
+    assert pr["test_weights_percentage"] == 75.0
+    assert pr["rubric_weights_percentage"] == 80.0
+    assert pr["agent"] == "smoke"
+    shutil.rmtree(out_task)
 
 
 def _convert_with_trial_reward(tmp_path: Path, trial_reward: dict) -> dict:
@@ -598,6 +628,44 @@ def test_the_bundles_own_reward_publishes_whatever_its_producer(tmp_path):
         "judge_container": 75.0, "something_new": 75.0, None: 75.0}
     assert published["judge_container"]["producer"] == "judge_container"
     assert published[None]["producer"] == "bundle_verifier"
+
+
+def test_pass_summary_groups_runs_by_agent_and_model(tmp_path):
+    """A slug ran against two agents must publish separate per_group averages.
+
+    Mixing oracle + nop + opus-5 into one blended mean was the bug: the flat
+    `average_combined_score` averaged 75 (oracle) with 0 (nop) into 37.5 and
+    nothing in the file said which was which. `per_group` keeps them apart.
+    """
+    job_a, out = _build_job(
+        tmp_path,
+        [{"completion_rate": 0.9, "misbehave_rate": 0.0, "reward": 0.0}] * 2,
+        {"reward": 0.75, "completion_rate": 0.9, "misbehave_rate": 0.0,
+         "producer": "judge_container"},
+        agent_name="oracle", model_name="claude-opus-5", job_subdir="job_a",
+    )
+    assert h2o.convert_job(job_a, out, ks=[], run_offset=0)
+    job_b, _ = _build_job(
+        tmp_path,
+        [{"completion_rate": 0.0, "misbehave_rate": 0.0, "reward": 0.0}] * 2,
+        {"reward": 0.0, "completion_rate": 0.0, "misbehave_rate": 0.0,
+         "producer": "judge_container"},
+        agent_name="nop", model_name="claude-opus-5", job_subdir="job_b",
+    )
+    written = h2o.convert_job(job_b, out, ks=[], run_offset=2)
+    task = written[0]
+    pass_summary = json.loads((task / "pass_summary.json").read_text())
+
+    per_group = pass_summary.get("per_group")
+    assert per_group, "pass_summary.json has no per_group block"
+    by_agent = {g["agent"]: g for g in per_group}
+    assert set(by_agent) == {"oracle", "nop"}
+    assert by_agent["oracle"]["average_combined_score"] == pytest.approx(75.0)
+    assert by_agent["nop"]["average_combined_score"] == pytest.approx(0.0)
+    assert by_agent["oracle"]["runs_completed"] == 2
+    assert by_agent["nop"]["runs_completed"] == 2
+    agents_in_runs = {p.get("agent") for p in pass_summary["per_run"]}
+    assert agents_in_runs == {"oracle", "nop"}
 
 
 def test_a_verifier_with_no_numeric_reward_is_unscored_not_regraded(tmp_path):

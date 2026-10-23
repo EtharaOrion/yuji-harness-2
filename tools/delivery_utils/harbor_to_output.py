@@ -1018,6 +1018,21 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     rubric_val = (ledger.get("rubric") or {}).get("value")
     if rubric_val is None and breakdown.get("score") is not None:
         rubric_val = breakdown["score"]
+    # Rewardkit layout fallback. The 5b10675f bundle format writes only
+    # verifier/reward.json with {"pytest": x, "rubric": y, "reward": z} and
+    # does not emit detail.json's ledger, channel_a.json or rubric_breakdown's
+    # `score` key. Without this, traj_val/rubric_val stay None and
+    # test_weights_percentage / rubric_weights_percentage come out null, which
+    # drops every run from the pass_summary.json `completed` filter.
+    if traj_val is None or rubric_val is None:
+        _rew_raw = _load(ver / "reward.json", {}) or {}
+        if traj_val is None and isinstance(_rew_raw.get("pytest"), (int, float)):
+            traj_val = float(_rew_raw["pytest"])
+        if rubric_val is None and _rew_raw.get("rubric") is not None:
+            try:
+                rubric_val = float(_rew_raw["rubric"])
+            except (TypeError, ValueError):
+                pass
     traj_w = (ledger.get("traj_tests") or {}).get("weight", 0)
     rubric_w = (ledger.get("rubric") or {}).get("weight", 0)
     vr_rewards = (tres.get("verifier_result") or {}).get("rewards", {})
@@ -1573,7 +1588,8 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     pair = {"task": task_name, "seed": None, "attempt": run_no,
             "instruction": stream["instruction"] or ((task_dir / "instruction.md").read_text() if task_dir and (task_dir / "instruction.md").exists() else None),
             "final_answer": stream["final_answer"], "reward": final_reward, "passed": passed}
-    per_run = {"run_index": run_no, "model": model, "include_multimodal": False,
+    per_run = {"run_index": run_no, "agent": agent_name, "model": model,
+               "include_multimodal": False,
                "test_weights_percentage": test_pct, "rubric_weights_percentage": rubric_pct,
                "scored": _scored,
                "combined_score": final_reward}
@@ -1923,10 +1939,40 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
         # `scored` catches the other shape of the same thing: a trial that died
         # in the harness but whose verifier still wrote a well-formed 0 for
         # Channel A, so test_weights_percentage is 0.0 rather than None.
-        completed = [p for p in per_run
-                     if p.get("test_weights_percentage") is not None and p.get("scored", True)]
-        errored = [p for p in per_run
-                   if p.get("test_weights_percentage") is None or not p.get("scored", True)]
+        # The Rewardkit bundle layout writes only reward.json with pytest/rubric/
+        # reward keys (no detail.json ledger, no channel_a.json), so the per-run
+        # test_weights_percentage may be None even when the run was scored and
+        # has a well-formed combined_score. Gate on combined_score + scored
+        # instead, with test_weights_percentage as a fallback signal for
+        # bundles that still produce only percentages.
+        def _is_completed(p):
+            if not p.get("scored", True):
+                return False
+            if isinstance(p.get("combined_score"), (int, float)):
+                return True
+            return p.get("test_weights_percentage") is not None
+        completed = [p for p in per_run if _is_completed(p)]
+        errored = [p for p in per_run if not _is_completed(p)]
+        # per_group keeps separate averages when a slug mixes agents/models
+        # (oracle + nop + opus into one pool averages away the signal).
+        def _group_key(p):
+            return (p.get("agent") or "agent", p.get("model") or "unknown")
+        _groups: dict[tuple[str, str], list[dict]] = {}
+        for p in per_run:
+            _groups.setdefault(_group_key(p), []).append(p)
+        per_group = []
+        for (g_agent, g_model), g_runs in sorted(_groups.items()):
+            g_completed = [p for p in g_runs if _is_completed(p)]
+            g_errored = [p for p in g_runs if not _is_completed(p)]
+            per_group.append({
+                "agent": g_agent, "model": g_model, "runs": len(g_runs),
+                "runs_completed": len(g_completed),
+                "runs_errored": len(g_errored),
+                "errored_run_indices": [p.get("run_index") for p in g_errored],
+                "average_combined_score": _mean([p["combined_score"] for p in g_completed]),
+                "average_test_weights_percentage": _mean([p["test_weights_percentage"] for p in g_completed]),
+                "average_rubric_weights_percentage": (_mean(_grp) if (_grp := [p["rubric_weights_percentage"] for p in g_completed if p["rubric_weights_percentage"] is not None]) else None),
+            })
         pass_summary = {
             "model": agg_model, "models": _models, "runs": n,
             "runs_completed": len(completed),
@@ -1935,6 +1981,7 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
             "average_combined_score": _mean([p["combined_score"] for p in completed]),
             "average_test_weights_percentage": _mean([p["test_weights_percentage"] for p in completed]),
             "average_rubric_weights_percentage": (_mean(_rp) if (_rp := [p["rubric_weights_percentage"] for p in completed if p["rubric_weights_percentage"] is not None]) else None),
+            "per_group": per_group,
             "per_run": per_run,
         }
         _dump(out_task / "pass_summary.json", pass_summary)
