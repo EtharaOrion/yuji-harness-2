@@ -293,10 +293,13 @@ def _render_turn(message: Mapping[str, Any]) -> str:
 
 
 def _text_of(value: Any) -> str:
+    # Strip NUL bytes before forwarding: raw .docx/.pdf contents sent as tool
+    # results carry \x00, and kiro-cli's JSON transport rejects them with a
+    # parse error that drops the whole conversation. ccbridge sanitises too.
     if value is None:
         return ""
     if isinstance(value, str):
-        return value
+        return value.replace("\x00", "")
     if isinstance(value, list):
         out = []
         for block in value:
@@ -307,8 +310,8 @@ def _text_of(value: Any) -> str:
                     out.append(f"[{block.get('type')} omitted]")
             elif isinstance(block, str):
                 out.append(block)
-        return "\n".join(out)
-    return str(value)
+        return "\n".join(out).replace("\x00", "")
+    return str(value).replace("\x00", "")
 
 
 # --------------------------------------------------------------------------- #
