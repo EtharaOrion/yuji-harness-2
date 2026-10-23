@@ -562,10 +562,27 @@ def test_trajectory_validates_as_atif(recorded, tmp_path):
         f"t = Trajectory.model_validate(json.load(open({str(path)!r})))\n"
         "print(len(t.steps), t.final_metrics.total_prompt_tokens)\n")
     assert proc.returncode == 0, proc.stderr[-3000:]
-    assert proc.stdout.split() == ["5", "1000"]
+    assert proc.stdout.split() == ["6", "1000"]
     agent_steps = [s for s in traj["steps"] if s["source"] == "agent"]
     assert agent_steps[0]["metrics"]["cached_tokens"] == 500
     assert agent_steps[0]["observation"]["results"][0]["content"] == '{"status": "ok", "items": 24}'
+    closing = traj["steps"][-1]
+    assert closing["message"] == "Done: 19 settled, 5 declined."
+    assert closing["llm_call_count"] == 0 and "metrics" not in closing and "tool_calls" not in closing
+    assert traj["final_metrics"]["total_steps"] == 6
+
+
+def test_finish_message_step_not_duplicated():
+    finish = {"function_name": "finish", "arguments": {"message": "All done."}}
+    already = [{"step_id": 1, "source": "agent", "message": "All done.", "tool_calls": [finish]}]
+    assert runner._finish_message_step(already) is None
+    no_finish = [{"step_id": 1, "source": "agent", "message": "hi",
+                  "tool_calls": [{"function_name": "terminal", "arguments": {}}]}]
+    assert runner._finish_message_step(no_finish) is None
+    empty = [{"step_id": 1, "source": "agent", "message": "x",
+              "tool_calls": [{"function_name": "finish", "arguments": {"message": "  "}}]}]
+    assert runner._finish_message_step(empty) is None
+    assert runner._finish_message_step([]) is None
 
 
 # =============================================================================

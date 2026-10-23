@@ -454,6 +454,33 @@ class Recorder:
         obs["results"].append(entry)
 
 
+def _finish_message_step(steps: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Surface the finish tool's message as the closing agent text step.
+
+    OpenHands delivers the final answer as finish(message=...), so it lives only
+    in tool_calls[].arguments. Verifiers that read the last agent step's text
+    (rewardkit test.sh `_atif`) would otherwise see the pre-finish thought.
+    The step is marked llm_call_count=0: a dispatch, not a new model call.
+    """
+    if not steps or steps[-1].get("source") != "agent":
+        return None
+    last = steps[-1]
+    text = ""
+    for call in last.get("tool_calls") or []:
+        if call.get("function_name") == "finish":
+            message = (call.get("arguments") or {}).get("message")
+            if isinstance(message, str) and message.strip():
+                text = message
+    if not text or (last.get("message") or "").strip() == text.strip():
+        return None
+    step: dict[str, Any] = {"step_id": len(steps) + 1, "source": "agent", "message": text,
+                            "llm_call_count": 0, "extra": {"origin": "finish_tool_message"}}
+    for key in ("timestamp", "model_name"):
+        if last.get(key) is not None:
+            step[key] = last[key]
+    return step
+
+
 def build_trajectory(recorder: Recorder, *, session_id: str, sdk_version: str,
                      tool_definitions: list[dict[str, Any]] | None,
                      per_response: dict[str, dict[str, Any]],
@@ -475,6 +502,9 @@ def build_trajectory(recorder: Recorder, *, session_id: str, sdk_version: str,
                           "reasoning_tokens": usage["reasoning_tokens"]},
             }
         steps.append(step)
+    closing = _finish_message_step(steps)
+    if closing:
+        steps.append(closing)
     if not steps:
         steps.append({"step_id": 1, "source": "system", "message": ""})
     return {
