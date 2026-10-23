@@ -6,11 +6,10 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import NamedTuple
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
-from harbor_to_output import norm_reward, pct_to_reward, bundle_dir_names
+from harbor_to_output import bundle_dir_names
 
 # tools/delivery/make_delivery.py -> the checkout root. Every path this
 # file masks is measured against it.
@@ -48,7 +47,7 @@ _TEXT_SUFFIXES = {".json", ".jsonl", ".txt", ".md", ".xml", ".yaml", ".yml",
 # tree the leak gate withholds, so nothing is copied that is not listed here.
 # The bundle grades itself: its tests/ run in its own verifier environment, and
 # the harness ships no grader of its own beside them.
-PUBLIC_BUNDLE_PARTS = ("task.toml", "instruction.md", "environment", "tests")
+PUBLIC_BUNDLE_PARTS = ("task.toml", "instruction.md", "environment", "tests", "solution")
 
 _BUNDLE_IGNORE = shutil.ignore_patterns(
     "__pycache__", ".pytest_cache", "*.pyc", "*.pyo", ".DS_Store", ".env", "*.log",
@@ -126,45 +125,316 @@ def _copy_masked(src: Path, dst: Path) -> None:
 
 
 def _short_model(name: str) -> str:
-    # Strip the LiteLLM provider prefix (bedrock/, anthropic/, gemini/, ...)
-    # so a ccbridge, zbridge or bedrock run of the same model lands in the
-    # same trajectory/<alias>/ directory for easy comparison. Without this,
-    # Path join on "bedrock/claude-opus-5" nests the model under a provider
-    # subdir, so the same alias produces different delivery trees per bridge.
+    """`anthropic/claude-opus-5` -> `opus-5` (the trajectories/<model>/ dir).
+
+    The LiteLLM provider prefix is stripped so a ccbridge, zbridge or bedrock
+    run of the same model lands in the same directory. Hyphens are kept:
+    TASK-STRUCTURE.md names the folder `opus-5`, never `opus.5`.
+    """
     if "/" in name:
         name = name.split("/", 1)[1].replace("/", "-")
-    short = name.removeprefix("claude-")
-    return re.sub(r"-(\d+)$", r".\1", short)
+    return name.removeprefix("claude-")
 
 
-def _run_label(dir_name: str) -> str:
-    return dir_name.replace("_", " ", 1)
+# Agents whose runs are reference baselines, not model trajectories. The spec
+# ships model runs only (TASK-STRUCTURE.md section 6).
+_NON_MODEL_AGENTS = {"oracle", "nop"}
+
+# The five verifier files a delivered run carries (section 6). reward.json is
+# rewritten to {"reward": x}; the other four are copied verbatim.
+_VERIFIER_COPY = ("ctrf.json", "end_env.json", "junit.xml", "reward-details.json")
+
+_DP = 4
 
 
-def _rubric_cleared(item: dict) -> bool:
-    positive = item.get("is_positive", True)
-    passed = bool(item.get("passed"))
-    return passed if positive else not passed
+def _r(x):
+    return round(float(x), _DP) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
 
 
-def _build_judge_usage(tokens: dict) -> dict:
+def _pristine_verifier(run_dir: Path) -> Path:
+    """Where the bundle's own test.sh outputs live for this run.
+
+    harbor_to_output snapshots them into client_verifier/ before it rewrites
+    verifier/ in place; older trees without the snapshot fall back to verifier/.
+    """
+    snap = run_dir / "client_verifier"
+    return snap if snap.is_dir() else run_dir / "verifier"
+
+
+def _judge_criteria_meta(task_src: Path | None) -> list[dict]:
+    """[[criterion]] blocks of tests/reward/rubric/judge.toml, in file order."""
+    if task_src is None:
+        return []
+    path = task_src / "tests" / "reward" / "rubric" / "judge.toml"
+    if not path.is_file():
+        # Pre-rewardkit bundles keep the author's rubric at tests/judge.toml,
+        # with source weights in `weight` and no is_positive annotation.
+        path = task_src / "tests" / "judge.toml"
+    if not path.is_file():
+        return []
+    try:
+        import tomllib
+        return list(tomllib.loads(path.read_text(encoding="utf-8")).get("criterion") or [])
+    except Exception as e:  # malformed judge.toml: report, ship without metadata
+        print(f"Warning: cannot parse {path}: {e}", file=sys.stderr)
+        return []
+
+
+def _threshold(task_src: Path | None) -> float:
+    tw = _load(task_src / "tests" / "test_weights.json", {}) if task_src else {}
+    t = (tw or {}).get("threshold")
+    return float(t) if isinstance(t, (int, float)) else 0.7
+
+
+def _reward_weights(task_src: Path | None) -> dict:
+    """weights of the `reward` aggregation in tests/reward/reward.toml."""
+    if task_src is not None:
+        path = task_src / "tests" / "reward" / "reward.toml"
+        if path.is_file():
+            try:
+                import tomllib
+                for block in tomllib.loads(path.read_text(encoding="utf-8")).get("reward") or []:
+                    if block.get("name") == "reward" and isinstance(block.get("weights"), dict):
+                        return dict(block["weights"])
+            except Exception as e:
+                print(f"Warning: cannot parse {path}: {e}", file=sys.stderr)
+    return {"pytest": 0.5, "rubric": 0.5}
+
+
+def _pytest_block(ver: Path, score) -> dict:
+    grade = _load(ver / "grade_report.json", {}) or {}
+    summary = ((_load(ver / "ctrf.json", {}) or {}).get("results") or {}).get("summary") or {}
+    passed = summary.get("passed")
+    failed = summary.get("failed")
+    if failed is None:
+        exit_code = None
+    else:
+        exit_code = 0 if failed == 0 and not summary.get("other") else 1
     return {
-        "input_tokens": tokens.get("judge_input_tokens", 0),
-        "cache_read_input_tokens": tokens.get("judge_input_cache_tokens", 0),
-        # `judge_cache_write_tokens` is the current name; `judge_output_cache_tokens`
-        # is the old one and is still read so artifacts written before the rename
-        # keep costing correctly. Both hold cache CREATION, which is input-side.
-        "cache_creation_input_tokens": tokens.get(
-            "judge_cache_write_tokens",
-            tokens.get("judge_output_cache_tokens", 0)),
-        "output_tokens": tokens.get("judge_output_tokens", 0),
-        "cost_usd": tokens.get("judge_cost_usd", 0),
+        "score": _r(score),
+        "passed": passed,
+        "failed": failed,
+        "exit_code": exit_code,
+        "guard_polarity": grade.get("guard_polarity"),
+        "gate": grade.get("gate"),
+        "missed": list(grade.get("missed") or []),
+        "guards_tripped": list(grade.get("guards_tripped") or []),
+        "errors": list(grade.get("errors") or []),
+        "tests": [
+            {
+                "name": t.get("test", t.get("name")),
+                "weight": t.get("weight"),
+                "passed": t.get("passed"),
+                "tripped": t.get("tripped"),
+                "reason": t.get("reason") or None,
+                "error": t.get("error") or None,
+            }
+            for t in (grade.get("tests") or [])
+        ],
     }
+
+
+def _rubric_block(ver: Path, meta: list[dict]) -> list[dict]:
+    details = (_load(ver / "reward-details.json", {}) or {}).get("rubric") or {}
+    judged = {str(c.get("id", c.get("name"))): c for c in (details.get("criteria") or [])}
+    by_name = {c.get("name"): c for c in (details.get("criteria") or [])}
+    rows = []
+    order = meta or [{"id": k, "name": v.get("name")} for k, v in judged.items()]
+    for m in order:
+        cid = str(m.get("id", m.get("name")))
+        got = judged.get(cid) or by_name.get(m.get("name")) or {}
+        ann = m.get("annotations") or {}
+        weight = ann.get("source_weight", m.get("weight", got.get("weight")))
+        positive = ann.get("is_positive")
+        if positive is None:
+            positive = ann.get("polarity", "positive" if (weight or 0) >= 0 else "negative") == "positive"
+        satisfied = None
+        if got:
+            raw = str(got.get("raw", "")).strip().lower()
+            satisfied = raw == "yes" if raw in ("yes", "no") else (got.get("value") or 0) >= 1.0
+        w = weight if isinstance(weight, (int, float)) else 0
+        rows.append({
+            "id": cid,
+            "name": m.get("name", got.get("name")),
+            "criterion": got.get("description", m.get("description")),
+            "weight": weight,
+            "is_positive": positive,
+            "evaluation_target": ann.get("evaluation_target"),
+            "satisfied": satisfied,
+            "earned": w if positive and satisfied else 0,
+            "charged": abs(w) if (not positive) and satisfied else 0,
+            "justification": got.get("reasoning"),
+            "error": None if got else "criterion not judged",
+        })
+    return rows
+
+
+def _failure_mode(errored: bool, passed: bool, combined) -> str:
+    if errored:
+        return "errored"
+    if passed:
+        return "pass"
+    if not combined:
+        return "zero"
+    return "partial"
+
+
+def _model_runs(traj_src: Path) -> list[tuple[int, Path, dict, dict]]:
+    """(run_index, run_dir, result, config) of every model run, by run index."""
+    runs = []
+    for run_dir in traj_src.glob("run_*"):
+        m = re.fullmatch(r"run_(\d+)", run_dir.name)
+        if not (m and run_dir.is_dir()):
+            continue
+        result = _load(run_dir / "result.json", {}) or {}
+        config = _load(run_dir / "config.json", {}) or result.get("config") or {}
+        agent = config.get("agent") or {}
+        if (agent.get("name") or "").lower() in _NON_MODEL_AGENTS or not agent.get("model_name"):
+            print(f"[delivery] skipping non-model run {run_dir.name} "
+                  f"(agent={agent.get('name')!r})")
+            continue
+        runs.append((int(m.group(1)), run_dir, result, config))
+    return sorted(runs, key=lambda r: r[0])
+
+
+def _write_trajectories(src: Path, dst: Path, task_src: Path | None) -> None:
+    """output/<uuid>/trajectory/run_N -> <uuid>/trajectories/<model>/run_N.
+
+    Layout and every file shape follow TASK-STRUCTURE.md sections 1 and 6.
+    Numbers come from the bundle's own verifier outputs (rewardkit reward.json,
+    reward-details.json, judge.json, grade_report.json, ctrf.json), on the 0-1
+    scale, never from the harness's percentage reshaping.
+    """
+    traj_src = src / "trajectory"
+    job_cfg = _load(src / "config.json", {}) or {}
+    job_name = job_cfg.get("job_name") or src.name
+    threshold = _threshold(task_src)
+    weights = _reward_weights(task_src)
+    meta = _judge_criteria_meta(task_src)
+
+    by_model: dict[str, list] = {}
+    for run in _model_runs(traj_src) if traj_src.is_dir() else []:
+        model_full = (run[3].get("agent") or {}).get("model_name", "")
+        by_model.setdefault(_short_model(model_full), []).append(run)
+
+    if not by_model:
+        print("Warning: no model runs to deliver", file=sys.stderr)
+        return
+
+    for short, runs in by_model.items():
+        model_dst = dst / "trajectories" / short
+        model_dst.mkdir(parents=True)
+        per_run = []
+        for new_idx, (_old, run_dir, result, config) in enumerate(runs, start=1):
+            ver = _pristine_verifier(run_dir)
+            dst_run = model_dst / f"run_{new_idx}"
+            (dst_run / "agent").mkdir(parents=True)
+            (dst_run / "artifacts").mkdir()
+            (dst_run / "verifier").mkdir()
+
+            if (run_dir / "agent" / "trajectory.json").is_file():
+                shutil.copy2(run_dir / "agent" / "trajectory.json",
+                             dst_run / "agent" / "trajectory.json")
+            if (run_dir / "artifacts" / "manifest.json").is_file():
+                _copy_masked(run_dir / "artifacts" / "manifest.json",
+                             dst_run / "artifacts" / "manifest.json")
+            for name in ("config.json", "result.json"):
+                if (run_dir / name).is_file():
+                    _copy_masked(run_dir / name, dst_run / name)
+
+            for name in _VERIFIER_COPY:
+                if (ver / name).is_file():
+                    shutil.copy2(ver / name, dst_run / "verifier" / name)
+                else:
+                    print(f"Warning: {run_dir.name}: verifier/{name} missing", file=sys.stderr)
+
+            rewards = _load(ver / "reward.json", {}) or {}
+            combined = _r(rewards.get("reward"))
+            pytest_score = _r(rewards.get("pytest"))
+            rubric_score = _r(rewards.get("rubric"))
+            _dump(dst_run / "verifier" / "reward.json",
+                  {"reward": combined if combined is not None else 0.0})
+
+            judge = _load(ver / "judge.json", None)
+            judge_model = (judge or {}).get("model") if (judge or {}).get("ran") else None
+            if judge is not None and not judge.get("ran"):
+                print(f"[make_delivery] WARNING {dst_run.name}: rubric judge did not run "
+                      f"({judge.get('reason') or 'no reason given'}); run is pytest-only",
+                      file=sys.stderr)
+            errored = result.get("exception_info") is not None
+            state_failed = (ver / "state_capture_failed.txt").is_file()
+            passed = (not errored) and combined is not None and combined >= threshold
+            trial_name = result.get("trial_name") or config.get("trial_name") or ""
+            trial = trial_name.split("__")[-1]
+            model_full = (config.get("agent") or {}).get("model_name", "")
+
+            channels = {k: v for k, v in (("pytest", pytest_score), ("rubric", rubric_score))
+                        if v is not None}
+            report = {
+                "model": short,
+                "model_full": model_full,
+                "run_index": new_idx,
+                "job": job_name,
+                "trial": trial,
+                "started_at": result.get("started_at"),
+                "finished_at": result.get("finished_at"),
+                "scale": "0-1",
+                "pytest": _pytest_block(ver, pytest_score),
+                "rubric": _rubric_block(ver, meta) if rubric_score is not None else [],
+                "rubric_score": rubric_score,
+                "judge": judge,
+                "final_reward": combined,
+                "channels": channels,
+                "weights": (_load(ver / "reward_producer.json", {}) or {}).get("weights") or weights,
+                "state_capture_failed": True if state_failed else None,
+                "errored": errored,
+            }
+            _dump(dst_run / "report.json", report)
+
+            per_run.append({
+                "run_index": new_idx,
+                "job": job_name,
+                "trial": trial,
+                "pytest_score": pytest_score,
+                "rubric_score": rubric_score,
+                "combined_score": combined,
+                "passed": passed,
+                "errored": errored,
+                "failure_mode": _failure_mode(errored, passed, combined),
+                "judge_model": judge_model,
+                "state_capture_failed": state_failed,
+            })
+
+        done = [r for r in per_run if not r["errored"]]
+
+        def _avg(key):
+            vals = [r[key] for r in done if r[key] is not None]
+            return round(sum(vals) / len(vals), _DP) if vals else None
+
+        _dump(model_dst / "pass_summary.json", {
+            "model": short,
+            "scale": "0-1",
+            "threshold": threshold,
+            "runs": len(per_run),
+            "runs_completed": len(done),
+            "runs_errored": len(per_run) - len(done),
+            "errored_run_indices": [r["run_index"] for r in per_run if r["errored"]],
+            "runs_with_state_capture_failed": [r["run_index"] for r in per_run
+                                               if r["state_capture_failed"]],
+            "judge_models": sorted({r["judge_model"] for r in per_run if r["judge_model"]}),
+            "runs_without_rubric": [r["run_index"] for r in per_run
+                                    if not r["errored"] and r["rubric_score"] is None],
+            "average_combined_score": _avg("combined_score"),
+            "average_pytest_score": _avg("pytest_score"),
+            "average_rubric_score": _avg("rubric_score"),
+            "per_run": per_run,
+        })
+        print(f"[delivery] trajectories/{short}: {len(per_run)} run(s)")
 
 
 def _copy_public_bundle(task_src: Path, dest: Path) -> list[str]:
     """Copy PUBLIC_BUNDLE_PARTS of `task_src` into `dest`; return what shipped."""
-    dest.mkdir(parents=True)
+    dest.mkdir(parents=True, exist_ok=True)
     shipped: list[str] = []
     for part in PUBLIC_BUNDLE_PARTS:
         src = task_src / part
@@ -230,118 +500,22 @@ def make_delivery(
                 task_src = hit
                 break
     if task_src.exists():
-        shipped = _copy_public_bundle(task_src, dst / "data")
+        shipped = _copy_public_bundle(task_src, dst)
         print(f"[delivery] bundle parts shipped: {', '.join(shipped) or 'none'}")
-        _warn_stray_mounts(dst / "data" / "environment" / "docker-compose.yaml")
+        _warn_stray_mounts(dst / "environment" / "docker-compose.yaml")
     else:
         print(f"Warning: task dir not found: {task_src}", file=sys.stderr)
-        (dst / "data").mkdir()
+        task_src = None
 
-    traj_src = src / "trajectory"
-    traj_dst = dst / "trajectory"
-    traj_dst.mkdir()
-
-    pass_sum = _load(src / "pass_summary.json", {})
-    per_run_clean = [
-        {k: v for k, v in run.items() if k != "include_multimodal"}
-        for run in (pass_sum.get("per_run") or [])
-    ]
-    delivery_pass = {k: v for k, v in pass_sum.items() if k != "per_run"}
-    delivery_pass["per_run"] = per_run_clean
-    _dump(traj_dst / "pass_summary.json", delivery_pass)
-
-    model_name: str = pass_sum.get("model", "")
-
-    for run_dir in sorted(traj_src.glob("run_*")):
-        report = _load(run_dir / "report.json", {})
-        run_model = report.get("model") or model_name
-        model_dst = traj_dst / _short_model(run_model)
-        dst_run = model_dst / _run_label(run_dir.name)
-        dst_run.mkdir(parents=True)
-
-        (dst_run / "agent").mkdir()
-        src_traj = run_dir / "agent" / "trajectory.json"
-        if src_traj.exists():
-            shutil.copy2(src_traj, dst_run / "agent" / "trajectory.json")
-
-        arts_src = run_dir / "artifacts"
-        if arts_src.exists():
-            shutil.copytree(arts_src, dst_run / "artifacts")
-        else:
-            (dst_run / "artifacts").mkdir()
-
-        if (run_dir / "config.json").exists():
-            _copy_masked(run_dir / "config.json", dst_run / "config.json")
-        judge_tokens = _load(run_dir / "verifier" / "judge_tokens.json", {})
-        # A bundle's judge may write judge_tokens.json as a LIST of per-call
-        # entries; older judges wrote one dict. Merge a
-        # list into the dict shape _build_judge_usage expects: token counts
-        # and cost sum across calls, model comes from the first entry.
-        if isinstance(judge_tokens, list):
-            calls = [t for t in judge_tokens if isinstance(t, dict)]
-            merged = {"model_name": calls[0].get("model_name", "") if calls else ""}
-            for key in ("judge_input_tokens", "judge_output_tokens",
-                        "judge_input_cache_tokens", "judge_output_cache_tokens",
-                        "judge_cache_write_tokens", "judge_cost_usd"):
-                vals = [t[key] for t in calls if isinstance(t.get(key), (int, float))]
-                if vals:
-                    merged[key] = sum(vals)
-            judge_tokens = merged
-        report.pop("include_multimodal", None)
-        report["judge_model"] = judge_tokens.get("model_name", "")
-        report["judge_usage"] = _build_judge_usage(judge_tokens)
-        _dump(dst_run / "report.json", report)
-
-        if (run_dir / "result.json").exists():
-            _copy_masked(run_dir / "result.json", dst_run / "result.json")
-
-        ver_src = run_dir / "verifier"
-        ver_dst = dst_run / "verifier"
-        ver_dst.mkdir()
-
-        if (ver_src / "ctrf.json").exists():
-            shutil.copy2(ver_src / "ctrf.json", ver_dst / "ctrf.json")
-
-        for src in (run_dir / "logs" / "verifier-stdout.txt",
-                    ver_src / "test-stdout.txt"):
-            if src.exists():
-                shutil.copy2(src, ver_dst / "test-stdout.txt")
-                break
-
-        reward_src = _load(ver_src / "reward.json", {}) or {}
-        _dump(ver_dst / "reward.json", {
-            "reward": norm_reward(reward_src.get("reward", 0)),
-            **{k: reward_src[k] for k in ("comparable", "caveats") if k in reward_src},
-        })
-
-        rubric = report.get("rubric", [])
-        # harbor_to_output writes this key PRESENT and NULL when the rubric
-        # channel went ungraded (the host rubric pass refuses to grade an empty
-        # trajectory), so `.get(key, 0)` returned None and the division below
-        # raised TypeError. Coercing it to 0 would be worse than the crash: it
-        # would publish "this run scored 0%" for a run that was never scored at
-        # all, which is precisely the claim the reward ledger declines to make.
-        # Unscored stays null, and the delivery bundle says so.
-        rubric_pct = report.get("rubric_weights_percentage")
-        score_data = {
-            "model": report.get("model", run_model),
-            "run_index": report.get("run_index", 1),
-            "rubric_weights_percentage": rubric_pct,
-            "total": len(rubric),
-            "passed": sum(1 for r in rubric if _rubric_cleared(r)),
-            "failed": sum(1 for r in rubric if not _rubric_cleared(r)),
-            "reward": pct_to_reward(rubric_pct),
-            "scored": rubric_pct is not None,
-            "rubric": rubric,
-            "judge_model": judge_tokens.get("model_name", ""),
-            "judge_usage": report.get("judge_usage", {}),
-        }
-        _dump(ver_dst / "score.json", score_data)
+    _write_trajectories(src, dst, task_src)
 
     # Safety net: whatever else landed in the bundle (artifacts, logs, task
     # data), no host-local path may ship. This also catches future additions
     # to the bundle without anyone having to remember the masking rule.
-    swept = mask_tree(dst)
+    # Only trajectories/ is swept: the bundle parts must stay byte-identical
+    # to the source bundle (TASK-STRUCTURE.md section 2).
+    traj_root = dst / "trajectories"
+    swept = mask_tree(traj_root) if traj_root.is_dir() else []
     for p in swept:
         print(f"masked local paths in: {p.relative_to(dst)}")
 
@@ -378,7 +552,7 @@ def main() -> None:
     if not args.task_slug:
         parser.error("task_slug is required unless --mask-only is given")
 
-    base = Path(__file__).resolve().parent.parent
+    base = REPO_ROOT
     make_delivery(
         task_slug=args.task_slug,
         output_dir=base / args.output_dir,

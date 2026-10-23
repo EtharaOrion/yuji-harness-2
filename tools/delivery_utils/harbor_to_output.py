@@ -460,6 +460,15 @@ PRUNE_FROM_VERIFIER = ("junit.xml",
                        "grade_report.md") + JUDGE_MARKERS
 
 
+# Snapshot of the bundle's verifier outputs taken before the reshape rewrites
+# verifier/; the source of every number make_delivery publishes.
+CLIENT_VERIFIER_DIR = "client_verifier"
+CLIENT_VERIFIER_FILES = ("ctrf.json", "end_env.json", "junit.xml", "reward.json",
+                         "reward-details.json", "judge.json", "grade_report.json",
+                         "reward_producer.json", "state_capture_failed.txt",
+                         "rubric_judge_failed.txt")
+
+
 def _prune(*paths: Path) -> None:
     for pth in paths:
         try:
@@ -965,6 +974,17 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     tlock = _load(trial_dir / "lock.json", {}) or {}
     ver = trial_dir / "verifier"
     ag = trial_dir / "agent"
+    # The bundle's own test.sh outputs, before anything below rewrites
+    # verifier/ in place (reward.json becomes the percentage doc, junit.xml and
+    # the judge markers are pruned). make_delivery builds the client-facing
+    # trajectories/ tree from this snapshot. Taken once: a re-run of the
+    # reshape over an in-place tree must not snapshot the rewritten files.
+    client_ver = trial_dir / CLIENT_VERIFIER_DIR
+    if ver.is_dir() and not client_ver.exists():
+        client_ver.mkdir()
+        for f in CLIENT_VERIFIER_FILES:
+            if (ver / f).is_file():
+                shutil.copy2(ver / f, client_ver / f)
     detail = _load(ver / "detail.json", {}) or {}
     ctrf = _load(ver / "ctrf.json")
     breakdown = _load(ver / "rubric_breakdown.json", {}) or {}
@@ -1256,6 +1276,8 @@ def reshape_trial(trial_dir: Path, run_no: int, *, out_task: Path, raw_trials: P
     # ---- trajectory/Run_N (Harbor-shaped) ---------------------------------
     run_dir = out_task / "trajectory" / f"run_{run_no}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    if client_ver.is_dir():
+        _copy(client_ver, run_dir / CLIENT_VERIFIER_DIR)
     if _copy(ag / "claude-code.jsonl", run_dir / "agent" / "claude-code.jsonl"):
         (run_dir / "agent" / "claude-code.txt").unlink(missing_ok=True)
     elif _copy(ag / "claude-code.txt", run_dir / "agent" / "claude-code.jsonl"):

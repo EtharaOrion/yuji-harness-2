@@ -1271,6 +1271,7 @@ print(((json.load(open(sys.argv[1])).get("agents") or [{}])[0] or {}).get("name"
     echo "[run_task] appending ${#BEDROCK_VERIFIER_ARGS[@]} BEDROCK verifier args to harbor" >&2
     args+=("${BEDROCK_VERIFIER_ARGS[@]}")
   fi
+  ensure_rewardkit_judge_env || exit 4
   if [ "$AGENT" = "claude-code" ]; then
     [ -n "$THINKING" ] && args+=(--ak "thinking=$THINKING")
     [ -n "$THINKING_DISPLAY" ] && args+=(--ak "thinking_display=$THINKING_DISPLAY")
@@ -1922,6 +1923,72 @@ stop_bedrock_judge_proxy() {
   BEDROCK_JUDGE_PID=""
   [ -n "${BEDROCK_JUDGE_CONFIG:-}" ] && rm -f "$BEDROCK_JUDGE_CONFIG"
   return 0
+}
+
+# ------------------------------------------------------ rewardkit rubric judge
+# Bundles in the TASK-STRUCTURE layout (tests/reward/rubric/judge.toml) are judged
+# by rewardkit inside tests/test.sh, which reads JUDGE_TRANSPORT (codex default)
+# plus CODEX_AUTH_B64 or CLAUDE_CODE_OAUTH_TOKEN -- not the JUDGE_WIRE/ANTHROPIC_*
+# creds the legacy tests/grade.py judge uses. task.toml's [verifier.env] pulls
+# them from this shell, so export them here; harbor stores them as ${VAR}
+# templates in config.json, never the literal value. Without them test.sh
+# silently skips the rubric and the run ships pytest-only, so fail instead.
+# JUDGE_SKIP=1 opts out.
+ensure_rewardkit_judge_env() {
+  [ -f "$TASK/tests/reward/rubric/judge.toml" ] || return 0
+  if [ "${JUDGE_SKIP:-0}" = "1" ]; then
+    echo "[run_task] JUDGE_SKIP=1: rubric judge disabled, runs will be pytest-only" >&2
+    return 0
+  fi
+  # With a harness judge proxy (kiro bridge / bedrock proxy, passed as
+  # --ve ANTHROPIC_BASE_URL=...) route rewardkit through it via the claude CLI,
+  # the same proxy legacy grade.py tasks are judged through.
+  local a via_proxy=""
+  for a in "${args[@]}"; do
+    case "$a" in ANTHROPIC_BASE_URL=?*) via_proxy=1 ;; esac
+  done
+  if [ -n "$via_proxy" ] && [ -z "${JUDGE_TRANSPORT:-}" ]; then
+    export JUDGE_TRANSPORT=claude-code
+    # An OAuth token would make the claude CLI bypass the proxy's API key.
+    export JUDGE_CLAUDE_TOKEN=""
+    args+=(--ve JUDGE_TRANSPORT=claude-code)
+  fi
+  export JUDGE_TRANSPORT="${JUDGE_TRANSPORT:-codex}"
+  case "$JUDGE_TRANSPORT" in
+    codex)
+      if [ -z "${CODEX_AUTH_B64:-}" ]; then
+        local auth="${CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
+        if [ ! -s "$auth" ]; then
+          echo "[run_task] rubric judge ERROR: JUDGE_TRANSPORT=codex needs CODEX_AUTH_B64 or a codex login at $auth (run 'codex login', or set JUDGE_SKIP=1)" >&2
+          return 1
+        fi
+        CODEX_AUTH_B64="$(base64 < "$auth" | tr -d '\n')"
+      fi
+      export CODEX_AUTH_B64
+      ;;
+    claude-code)
+      [ -n "$via_proxy" ] || export JUDGE_CLAUDE_TOKEN="${JUDGE_CLAUDE_TOKEN:-${CLAUDE_CODE_OAUTH_TOKEN:-}}"
+      if [ -z "$via_proxy$JUDGE_CLAUDE_TOKEN${ANTHROPIC_API_KEY:-}" ]; then
+        echo "[run_task] rubric judge ERROR: JUDGE_TRANSPORT=claude-code needs JUDGE_CLAUDE_TOKEN / CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "[run_task] rubric judge ERROR: unknown JUDGE_TRANSPORT '$JUDGE_TRANSPORT' (codex or claude-code)" >&2
+      return 1
+      ;;
+  esac
+  # JUDGE_MODEL may also arrive as a --ve already in the caller's args.
+  local has_model=""
+  [ -n "${JUDGE_MODEL:-}" ] && has_model=1
+  for a in "${args[@]}"; do
+    case "$a" in JUDGE_MODEL=?*) has_model=1 ;; esac
+  done
+  if [ -z "$has_model" ]; then
+    echo "[run_task] rubric judge ERROR: JUDGE_MODEL is empty (set JUDGE_MODEL or KIRO_JUDGE_MODEL, or JUDGE_SKIP=1)" >&2
+    return 1
+  fi
+  echo "[run_task] rubric judge: rewardkit via JUDGE_TRANSPORT=$JUDGE_TRANSPORT" >&2
 }
 
 # -------------------------------------------------- bedrock judge dispatcher
