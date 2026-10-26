@@ -231,11 +231,37 @@ def iso8601(raw, fallback_mtime: float | None = None) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
+def _rewardkit_judge_records(run_dir: Path) -> list[dict]:
+    """judge_tokens.json-shaped records from rewardkit's verifier/judge.json usage."""
+    jd = read_json(run_dir / "verifier" / "judge.json")
+    if not isinstance(jd, dict) or not jd.get("ran"):
+        return []
+    usage = jd.get("usage") or {}
+    models = usage.get("models") or {jd.get("model") or "": usage}
+    # codex counts cached reads inside input_tokens; the finance fields keep them apart.
+    codex = jd.get("transport") == "codex"
+    out = []
+    for name, u in models.items():
+        if not isinstance(u, dict):
+            continue
+        cache_read = num(u.get("cache_read_input_tokens", 0))
+        inp = num(u.get("input_tokens", 0))
+        out.append({
+            "model_name": name,
+            "judge_input_tokens": max(inp - cache_read, 0) if codex else inp,
+            "judge_output_tokens": num(u.get("output_tokens", 0)),
+            "judge_input_cache_tokens": cache_read,
+            "judge_cache_write_tokens": num(u.get("cache_creation_input_tokens", 0)),
+            "judge_cost_usd": round(num(u.get("cost_usd", 0)), 6),
+        })
+    return out
+
+
 def judge_lines(run_dir: Path) -> list[dict]:
-    """judge_tokens.json as written by the bundle's own judge (tests/)."""
+    """judge_tokens.json as written by the bundle's own judge (tests/), else rewardkit's judge.json."""
     raw = read_json(run_dir / "verifier" / "judge_tokens.json")
     if raw is None:
-        return []
+        raw = _rewardkit_judge_records(run_dir)
     if isinstance(raw, dict):
         raw = raw.get("judge_lines") or [raw]
     if not isinstance(raw, list):
