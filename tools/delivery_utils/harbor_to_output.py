@@ -2098,12 +2098,20 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
             # ours, and it is published there.
             _tt = {"n_input_tokens": 0, "n_cache_tokens": 0, "n_output_tokens": 0}
             _tcost, _tseen, _tcost_seen = 0.0, 0, False
+            _tdone, _tscored, _terr = 0, 0, 0
             _traj_root = out_task / "trajectory"
             for _rd in (sorted(_traj_root.glob("run_*"),
                                key=lambda q: int(q.name.split("_")[-1])
                                if q.name.split("_")[-1].isdigit() else 0)
                         if _traj_root.is_dir() else []):
-                _ar = ((_load(_rd / "result.json", {}) or {}).get("agent_result") or {})
+                _rr = _load(_rd / "result.json", {}) or {}
+                if _rr:
+                    _tdone += 1
+                    if (_rr.get("verifier_result") or {}).get("rewards") is not None:
+                        _tscored += 1
+                    if _rr.get("exception_info") is not None:
+                        _terr += 1
+                _ar = _rr.get("agent_result") or {}
                 if not _ar:
                     continue
                 _tseen += 1
@@ -2118,6 +2126,14 @@ def convert_job(job_dir: Path, output_root: Path, *, ks: list[int], run_offset: 
                 _top_res["stats"]["cost_usd"] = round(_tcost, 6) if _tcost_seen else None
                 _top_res["n_total_trials"] = max(_top_res.get("n_total_trials") or 0,
                                                  _tseen)
+            if _tdone and isinstance(_top_res.get("stats"), dict):
+                # Same recount for the trial counters harbor keeps per job.
+                _top_res["stats"]["n_completed_trials"] = _tdone
+                _top_res["stats"]["n_errored_trials"] = _terr
+                if len(_evals) == 1:
+                    for _eval_data in _evals.values():
+                        _eval_data["n_trials"] = _tscored
+                        _eval_data["n_errors"] = _terr
             _dump(out_task / "result.json", norm_result_metrics(_top_res))
 
         # .raw summary / pairs / failure_analysis
