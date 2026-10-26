@@ -21,11 +21,19 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# USD per million tokens at list price, matching the yuji judge image's
-# _JUDGE_RATES so judge lines from both bundle styles are valued the same way.
-# A valuation only: Kiro bills credits, not these rates.
+# USD per million tokens, Bedrock Global cross-Region (CRIS) prices, which for
+# Claude are Anthropic's list prices. Regional and geo profiles (us., in., ...)
+# cost 10% more; these rates assume the application inference profiles in
+# BEDROCK_MODEL_IDS wrap global.* profiles. A valuation only for Kiro, which
+# bills credits, not these rates.
+#
+# gpt-5.6-sol: Bedrock model card, Global CRIS, short context (<=272K input);
+# in ap-south-1 Sol is offered on Global CRIS only. AWS calls the $4/$20 cut
+# promotional "at least through November 21, 2026" -- recheck after that date.
+# The yuji judge image (judge-1.1.0) still carries the old $5/$30 Sol rate in
+# its own _JUDGE_RATES, so judge lines it writes itself value Sol higher.
 RATES = {
-    "gpt-5.6-sol":       {"input": 5.0, "output": 30.0, "cache_read": 0.5, "cache_write": 6.25},
+    "gpt-5.6-sol":       {"input": 4.0, "output": 20.0, "cache_read": 0.4, "cache_write": 5.00},
     "claude-opus-5":     {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
     "claude-opus-4-5":   {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
     "claude-sonnet-5":   {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.50},
