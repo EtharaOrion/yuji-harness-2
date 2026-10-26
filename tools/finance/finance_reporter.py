@@ -262,6 +262,7 @@ def judge_lines(run_dir: Path) -> list[dict]:
     raw = read_json(run_dir / "verifier" / "judge_tokens.json")
     if raw is None:
         raw = _rewardkit_judge_records(run_dir)
+    from kiro_judge_tokens import RATES, _cost as _rate_cost
     if isinstance(raw, dict):
         raw = raw.get("judge_lines") or [raw]
     if not isinstance(raw, list):
@@ -280,6 +281,12 @@ def judge_lines(run_dir: Path) -> list[dict]:
                 rec.get("judge_cache_write_tokens",
                         rec.get("judge_output_cache_tokens", 0)))
             line["judge_turns"] = num(rec.get("judge_turns", 0))
+            # Price every judge line from the one RATES table; a model it lacks keeps its recorded cost.
+            if line["model_name"] in RATES:
+                line["judge_cost_usd"] = _rate_cost(
+                    line["model_name"], int(line["judge_input_tokens"]),
+                    int(line["judge_output_tokens"]), int(line["judge_input_cache_tokens"]),
+                    int(line["judge_cache_write_tokens"]))
             out.append(line)
     return out
 

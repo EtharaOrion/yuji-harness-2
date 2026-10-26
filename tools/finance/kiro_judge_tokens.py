@@ -40,6 +40,8 @@ RATES = {
     "claude-sonnet-4-5": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
     "claude-haiku-4-5":  {"input": 1.0, "output": 5.0,  "cache_read": 0.1, "cache_write": 1.25},
+    # glm-5.3: z.ai API list price (docs.z.ai/guides/overview/pricing); cache storage is free for now.
+    "glm-5.3":           {"input": 1.4, "output": 4.4,  "cache_read": 0.26, "cache_write": 0.0},
 }
 RATE_ENV = {
     "input": "JUDGE_PRICE_INPUT_PER_MTOK",
