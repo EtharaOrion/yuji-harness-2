@@ -17,15 +17,8 @@ REPO_ROOT = _Path(__file__).resolve().parents[2]
 
 # Host-local path masking, inline. Harbor stamps absolute host paths
 # (trial_uri, trials_dir, jobs_dir, tracebacks) into bookkeeping files, which
-# is how `/Users/<name>/...` strings end up in shipped bundles. A path holding
-# a repo anchor is cut to anchor-relative form (`/Users/x/dev/harness/output/t`
-# -> `output/t`, still a usable pointer inside the bundle); any other
-# home-rooted path gets its `/Users/<name>` or `/home/<name>` head replaced
-# with `~`. Container paths (/workspace, /logs, /tmp) survive verbatim.
-_ANCHORED_RE = re.compile(
-    r"(?:file://)?(?:/(?:Users|home)|~)/[^\s\"'\\]*?/"
-    r"(?=(?:delivery_output|output|input|tasks|jobs)(?:/|[\"'\s]|$))"
-)
+# is how `/Users/<name>/...` strings end up in shipped bundles. _HOST_PATH_RE
+# below cuts them; container paths (/workspace, /logs, /tmp) survive verbatim.
 _HOME_RE = re.compile(r"(?:file://)?/(?:Users|home)/[^/\s\"'\\]+")
 
 # macOS mkdtemp: /var/folders/<2 chars>/<hash>/T. The hash is derived from the
@@ -35,6 +28,51 @@ _HOME_RE = re.compile(r"(?:file://)?/(?:Users|home)/[^/\s\"'\\]+")
 # result.json and job.log. /private is the real path, /var the symlink, and
 # both spellings turn up in the same message.
 _TMPDIR_RE = re.compile(r"(?:/private)?/var/folders/[^/\s\"']+/[^/\s\"']+/[A-Z]")
+
+# Any host path, wherever it was run from: a home or volume root (macOS, Linux,
+# Windows, WSL, `~`, file://) followed by its directories, which may hold spaces
+# but never start or end with one. Everything up to the last directory a bundle
+# points into (_KEEP_FROM) is cut; with none, only the final name survives.
+_SEG = r"[^/\\\"'`<>|\s](?:[^/\\\"'`<>|\r\n\t]*[^/\\\"'`<>|\s])?"
+_SEP = r"(?:\\\\|\\|/)"
+_HOST_PATH_RE = re.compile(
+    r"(?<![\w.:/\\~-])(?:file://)?(?:"
+    rf"/(?:Users|home|media){_SEP}{_SEG}|/Volumes{_SEP}{_SEG}|/mnt{_SEP}[A-Za-z](?=[/\\])"
+    rf"|[A-Za-z]:{_SEP}(?:Users|home|Documents and Settings){_SEP}{_SEG}|~(?=[/\\])"
+    rf")(?P<rest>(?:{_SEP}{_SEG})*)"
+)
+_PART_RE = re.compile(rf"{_SEP}({_SEG})")
+_KEEP_FROM = {"output", "delivery_output", "tasks", "jobs", "input", "tools", "scripts", "services"}
+
+
+def _host_path(m: re.Match) -> str:
+    parts = list(_PART_RE.finditer(m.group("rest")))
+    if not parts:
+        return "~"
+    keep = next((p for p in reversed(parts) if p.group(1) in _KEEP_FROM), parts[-1])
+    return m.group("rest")[keep.start(1):]
+
+
+# Harbor's path fields carry the operator's directories whatever machine ran
+# them. A value holding a task uuid becomes that uuid alone; a trial name only
+# carries a truncated uuid, so it never matches. trials_dir and trial_uri name
+# the job, and a task may be run from a folder of any name, so a job field, or
+# a path that is a host path, without a uuid of its own takes the task uuid of
+# the folder the file sits in. Container and app paths ("/workspace/x") stay.
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_FIELD_RE = re.compile(r'("(path|trials_dir|trial_uri|jobs_dir)"\s*:\s*")([^"]*)(")')
+
+
+def _task_uuid(path: Path) -> str | None:
+    return next((p for p in reversed(path.parts) if _UUID_RE.fullmatch(p)), None)
+
+
+def _field(m: re.Match, task_uuid: str | None) -> str:
+    found = _UUID_RE.findall(m.group(3))
+    if not found and task_uuid and (m.group(2) in ("trials_dir", "trial_uri")
+                                    or m.group(2) == "path" and _HOST_PATH_RE.match(m.group(3))):
+        found = [task_uuid]
+    return m.group(1) + found[-1] + m.group(4) if found else m.group(0)
 
 _TEXT_SUFFIXES = {".json", ".jsonl", ".txt", ".md", ".xml", ".yaml", ".yml",
                   ".log", ".toml", ".py", ".csv", ".html", ".cfg", ".ini"}
@@ -57,9 +95,9 @@ _BUNDLE_IGNORE = shutil.ignore_patterns(
 def _repo_needles() -> list[tuple[str, str]]:
     """(needle, replacement) pairs that cut this checkout's root off a path.
 
-    _ANCHORED_RE only fires on a path whose tail starts at one of the five
-    directories a delivered bundle points into. Everything else in the repo is
-    invisible to it -- which is why `--extra-docker-compose` shipped as
+    The general host-path rule only keeps a tail from the directories a bundle
+    points into; this checkout's own root is cut exactly, before it -- the old
+    anchored rule missed every other repo directory, which is why `--extra-docker-compose` shipped as
     `~/Downloads/.../harness/tools/openhands_agent/overlay.yaml` in every
     config.json we published. Anchoring on the repo root instead covers
     `tools/`, `services/`, `scripts/` and any directory added later.
@@ -82,12 +120,13 @@ def _repo_needles() -> list[tuple[str, str]]:
     return sorted(set(pairs), key=lambda kv: len(kv[0]), reverse=True)
 
 
-def mask_local_paths(text: str) -> str:
-    text = _ANCHORED_RE.sub("", text)
+def mask_local_paths(text: str, harbor_fields: bool = True, task_uuid: str | None = None) -> str:
+    if harbor_fields:
+        text = _FIELD_RE.sub(lambda m: _field(m, task_uuid), text)
     for needle, repl in _repo_needles():
         text = text.replace(needle, repl)
     text = _TMPDIR_RE.sub("$TMPDIR", text)
-    return _HOME_RE.sub("~", text)
+    return _HOST_PATH_RE.sub(_host_path, text)
 
 
 def mask_tree(root: Path) -> list[Path]:
@@ -99,7 +138,8 @@ def mask_tree(root: Path) -> list[Path]:
         # surrogateescape, not replace: a log with one non-UTF-8 byte in it
         # must come back byte-identical apart from the paths we masked.
         text = p.read_text(encoding="utf-8", errors="surrogateescape")
-        masked = mask_local_paths(text)
+        masked = mask_local_paths(text, harbor_fields=".raw" not in p.relative_to(root).parts,
+                                  task_uuid=_task_uuid(p))
         if masked != text:
             p.write_text(masked, encoding="utf-8", errors="surrogateescape")
             changed.append(p)
@@ -120,7 +160,8 @@ def _dump(path: Path, data) -> None:
 def _copy_masked(src: Path, dst: Path) -> None:
     """Copy a text file, masking host-local paths (Harbor's trial_uri,
     trials_dir, jobs_dir carry absolute host paths that must not ship)."""
-    dst.write_text(mask_local_paths(src.read_text(encoding="utf-8", errors="replace")),
+    dst.write_text(mask_local_paths(src.read_text(encoding="utf-8", errors="replace"),
+                                    task_uuid=_task_uuid(dst)),
                    encoding="utf-8")
 
 

@@ -270,22 +270,15 @@ def fmt_reward(value) -> str:
 sys.path.insert(0, str(REPO / "services" / "mcp_eval"))
 sys.path.insert(0, str(REPO / "scripts"))
 
-# Host-local path masking, inline. Harbor stamps absolute host paths
-# (trial_uri, trials_dir) into config/result bookkeeping and writes host-side
-# tracebacks into exception.txt. A path holding a repo anchor is cut to
-# anchor-relative form (`/Users/x/dev/harness/output/t` -> `output/t`); any
-# other home-rooted path gets its `/Users/<name>` or `/home/<name>` head
-# replaced with `~`. Container paths (/workspace, /logs, /tmp) stay verbatim.
-_ANCHORED_RE = re.compile(
-    r"(?:file://)?(?:/(?:Users|home)|~)/[^\s\"'\\]*?/"
-    r"(?=(?:delivery_output|output|input|tasks|jobs)(?:/|[\"'\s]|$))"
-)
-_HOME_RE = re.compile(r"(?:file://)?/(?:Users|home)/[^/\s\"'\\]+")
-
-
+# Host-local path masking. Harbor stamps absolute host paths (trial_uri,
+# trials_dir) into config/result bookkeeping and writes host-side tracebacks
+# into exception.txt; make_delivery.mask_local_paths cuts them.
 def mask_file(path: Path) -> None:
+    # The same mask make_delivery's final sweep applies, so the two never drift.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from make_delivery import mask_local_paths
     text = path.read_text(encoding="utf-8", errors="replace")
-    masked = _HOME_RE.sub("~", _ANCHORED_RE.sub("", text))
+    masked = mask_local_paths(text)
     if masked != text:
         path.write_text(masked, encoding="utf-8")
 

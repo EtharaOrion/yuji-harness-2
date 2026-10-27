@@ -524,9 +524,15 @@ def _mask(text: str, repo="/Users/operator/work/harness", monkeypatch=None) -> s
      "-f $TMPDIR/tmpu3n/x.json"),
     ("/var/folders/1b/d687yx7j39l_8_smp0000gn/T/tmp6/y.json",
      "$TMPDIR/tmp6/y.json"),
-    # Home-rooted but outside the repo: head replaced, tail kept.
-    ("/Users/someone/.claude/settings.json", "~/.claude/settings.json"),
-    ("/home/runner/.local/share/uv/tools/harbor", "~/.local/share/uv/tools/harbor"),
+    # Home-rooted but outside the repo: only the tail from a bundle directory,
+    # else the final name, survives -- the folders above it are the operator's.
+    ("/Users/someone/.claude/settings.json", "settings.json"),
+    ("/home/runner/.local/share/uv/tools/harbor", "tools/harbor"),
+    # Folder names may hold spaces.
+    ("/Users/someone/a b/c d/tools/x.yaml", "tools/x.yaml"),
+    # Harbor's path fields keep the task uuid alone, wherever the run lived.
+    ('"trial_uri": "/any/where/output/00000000-0000-0000-0000-000000000001/t__abc"',
+     '"trial_uri": "00000000-0000-0000-0000-000000000001"'),
 ])
 def test_mask_cuts_host_paths(raw, want, monkeypatch):
     assert _mask(raw, monkeypatch=monkeypatch) == want

@@ -164,13 +164,15 @@ checkpoints in between.
   finance    finance_reporter.py -> Odoo                  (NOT idempotent: external POST)
   mask       make_delivery.py --mask-only -> strips host   (idempotent; runs
              paths; automatic at the end of reshape + finance)
+  atif       trajectory_reshaper.py -> ATIF_VERSION shape (idempotent; runs
+             (default 1.5) in output/ and delivery_output/  after finance)
 
 State that crosses a stage boundary (which Run_N this invocation owns, where
 earlier runs were stashed) is written to output/<job>/.run_state.json so a
 later stage in a separate process can pick it up.
 ```
 
-Stages: `all`, `preflight`, `harbor`, `reshape`, `finance`, `mask`. `scripts/run_batch.py` drives them one at a time with a checkpoint between each.
+Stages: `all`, `preflight`, `harbor`, `reshape`, `finance`, `mask`, `atif`. `scripts/run_batch.py` drives them one at a time with a checkpoint between each.
 
 Before the agent phase, `tools/network/preflight_network.py` resolves the task's network plan and verifier environment through harbor's own code and refuses what harbor would refuse after the image build.
 

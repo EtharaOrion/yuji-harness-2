@@ -102,6 +102,8 @@
 #   finance    finance_reporter.py -> Odoo                  (NOT idempotent: external POST)
 #   mask       make_delivery.py --mask-only -> strips host   (idempotent; runs
 #              paths; automatic at the end of reshape + finance)
+#   atif       trajectory_reshaper.py -> ATIF_VERSION shape (idempotent; runs
+#              (default 1.5) in output/ and delivery_output/  after finance)
 #
 # State that crosses a stage boundary (which Run_N this invocation owns, where
 # earlier runs were stashed) is written to output/<job>/.run_state.json so a
@@ -224,11 +226,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-TASK="${TASK:?usage: scripts/run_task.sh [--stage all|preflight|harbor|reshape|finance|mask] <task-dir>}"
+TASK="${TASK:?usage: scripts/run_task.sh [--stage all|preflight|harbor|reshape|finance|mask|atif] <task-dir>}"
 [ -f "$TASK/task.toml" ] || { echo "not a task dir (no task.toml): $TASK" >&2; exit 2; }
 case "$STAGE" in
-  all|preflight|harbor|reshape|finance|mask) ;;
-  *) echo "unknown stage: $STAGE (want all|preflight|harbor|reshape|finance|mask)" >&2; exit 2;;
+  all|preflight|harbor|reshape|finance|mask|atif) ;;
+  *) echo "unknown stage: $STAGE (want all|preflight|harbor|reshape|finance|mask|atif)" >&2; exit 2;;
 esac
 SLUG="$(basename "$TASK")"
 
@@ -2829,6 +2831,21 @@ stage_finance() {
   stage_mask
 }
 
+# ATIF_VERSION (.env, default 1.5): reshape the OpenHands ATIF-v1.8 trajectory.json
+# in output/ and delivery_output/ to the v1.5 delivery shape, in place. Runs last,
+# after netaudit and finance have read the v1.8 file. ATIF_VERSION=1.8 ships it as is.
+stage_atif() {
+  local want="${ATIF_VERSION:-1.5}"
+  if [ "$want" = "1.8" ]; then
+    echo "[atif] ATIF_VERSION=1.8: trajectory.json shipped as the runner wrote it" >&2
+    return 0
+  fi
+  local dirs=("$OUTPUT_DIR/$OUT_SLUG" "$(dirname "$OUTPUT_DIR")/delivery_output/$OUT_SLUG")
+  [ -n "${COPY_TO:-}" ] && dirs+=("$COPY_TO/$OUT_SLUG")
+  python3 tools/delivery_utils/trajectory_reshaper.py --to "$want" "${dirs[@]}" \
+    || echo "[atif] WARNING: trajectory reshape failed (non-fatal)" >&2
+}
+
 # --- dispatch -----------------------------------------------------------------
 
 # Only the stages that actually drive harbor. reshape/finance/mask move files
@@ -2853,8 +2870,9 @@ case "$STAGE" in
   preflight) stage_preflight ;;
   harbor)    stage_harbor ;;
   reshape)   stage_reshape ;;
-  finance)   stage_finance ;;
+  finance)   stage_finance; stage_atif ;;
   mask)      stage_mask ;;
-  all)       stage_preflight; stage_harbor; stage_reshape; stage_finance
+  atif)      stage_atif ;;
+  all)       stage_preflight; stage_harbor; stage_reshape; stage_finance; stage_atif
              echo "[run_task] done → $OUTPUT_DIR/$OUT_SLUG" ;;
 esac
