@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -119,8 +120,12 @@ def _add_run(out: Path, n: int, *, agent="openhands-sdk", model="anthropic/claud
     _w(ver / "reward-details.json", {"rubric": {"criteria": [
         {"id": "1", "name": "c-good", "value": 1.0, "raw": "yes", "description": "d1", "reasoning": "r1"},
         {"id": "2", "name": "c-bad", "value": 0.0, "raw": "no", "description": "d2", "reasoning": "r2"},
-    ]}})
-    _w(ver / "judge.json", {"ran": True, "model": "gpt-x"})
+    ], "judge": {"agent": "codex", "cwd": "/logs/verifier/judge_ws",
+                 "atif_trajectory": "/logs/verifier/judge_ws/trajectory.json"},
+        "judge_logs": ["/logs/verifier/trajectory.codex.batched-1.abc.jsonl"]}})
+    _w(ver / "judge.json", {"ran": True, "model": "gpt-x", "configured": {
+        "agent": "codex", "cwd": "/logs/verifier/judge_ws",
+        "atif_trajectory": "/logs/verifier/judge_ws/trajectory.json", "mode": "batched"}})
     _w(ver / "grade_report.json", {"guard_polarity": "pass_charges", "gate": None, "missed": ["t2"],
                                    "guards_tripped": [], "errors": [],
                                    "tests": [{"test": "t1", "weight": 1, "passed": True,
@@ -211,6 +216,26 @@ def test_report_is_built_from_the_bundles_verifier(delivered):
     assert (good["weight"], good["satisfied"], good["earned"]) == (5, True, 5)
     assert (bad["weight"], bad["is_positive"], bad["satisfied"], bad["charged"]) == (-3, False, False, 0)
     assert rep["weights"] == {"pytest": 0.5, "rubric": 0.5}
+
+
+def test_judge_container_paths_do_not_ship(delivered):
+    run = delivered / "trajectories/opus-5/run_1"
+    rep = json.loads((run / "report.json").read_text())
+    assert rep["judge"]["configured"] == {"agent": "codex", "mode": "batched"}
+    details = json.loads((run / "verifier/reward-details.json").read_text())
+    assert "judge_logs" not in details["rubric"]
+    assert details["rubric"]["judge"] == {"agent": "codex"}
+    assert len(details["rubric"]["criteria"]) == 2
+
+
+def test_an_imported_agent_ships_under_its_own_name(tmp_path):
+    _make_bundle(tmp_path)
+    out = tmp_path / "output" / SLUG
+    shutil.rmtree(out / "trajectory")
+    _add_run(out, 1, agent="tools.openhands_agent.agent:OpenHandsAgent")
+    result = json.loads((_deliver(tmp_path) / "trajectories/opus-5/run_1/result.json").read_text())
+    assert result["config"]["agent"]["name"] == "openhands-sdk"
+    assert result["trial_name"] == "a-task__T1"
 
 
 def test_pass_summary_is_on_the_0_1_scale(delivered):

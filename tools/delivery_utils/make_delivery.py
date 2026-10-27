@@ -182,9 +182,53 @@ def _short_model(name: str) -> str:
 _NON_MODEL_AGENTS = {"oracle", "nop"}
 
 # The verifier files a delivered run carries (section 6). reward.json is
-# rewritten to {"reward": x}; the others are copied verbatim.
+# rewritten to {"reward": x}, reward-details.json loses the judge's container
+# paths (_scrub_judge_paths); the others are copied verbatim.
 _VERIFIER_COPY = ("ctrf.json", "end_env.json", "junit.xml", "reward-details.json",
                   "final_message.md")
+
+# Where the rubric judge ran and logged inside the verifier container. They
+# point at files the delivery does not carry, so they are dropped.
+_JUDGE_PATH_KEYS = ("cwd", "atif_trajectory")
+
+# Agents harbor imported by path record that path as config.agent.name; the
+# delivered result.json names the agent instead.
+_AGENT_NAMES = {"tools.openhands_agent.agent:OpenHandsAgent": "openhands-sdk"}
+
+
+def _scrub_judge_paths(judge) -> None:
+    """Drop the judge's container paths from a judge block, in place.
+
+    judge.json nests them under `configured`; reward-details.json's
+    rubric.judge carries them at the top level.
+    """
+    if not isinstance(judge, dict):
+        return
+    for target in (judge, judge.get("configured")):
+        if isinstance(target, dict):
+            for key in _JUDGE_PATH_KEYS:
+                target.pop(key, None)
+
+
+def _write_reward_details(src: Path, dst: Path) -> None:
+    details = _load(src, None)
+    rubric = details.get("rubric") if isinstance(details, dict) else None
+    if not isinstance(rubric, dict):
+        shutil.copy2(src, dst)
+        return
+    rubric.pop("judge_logs", None)
+    _scrub_judge_paths(rubric.get("judge"))
+    _dump(dst, details)
+
+
+def _write_result(src: Path, dst: Path) -> None:
+    result = _load(src, None)
+    agent = ((result or {}).get("config") or {}).get("agent") if isinstance(result, dict) else None
+    if not (isinstance(agent, dict) and agent.get("name") in _AGENT_NAMES):
+        _copy_masked(src, dst)
+        return
+    agent["name"] = _AGENT_NAMES[agent["name"]]
+    _dump(dst, result)
 
 _DP = 4
 
@@ -380,9 +424,10 @@ def _write_trajectories(src: Path, dst: Path, task_src: Path | None) -> None:
             if (run_dir / "artifacts" / "manifest.json").is_file():
                 _copy_masked(run_dir / "artifacts" / "manifest.json",
                              dst_run / "artifacts" / "manifest.json")
-            for name in ("config.json", "result.json"):
-                if (run_dir / name).is_file():
-                    _copy_masked(run_dir / name, dst_run / name)
+            if (run_dir / "config.json").is_file():
+                _copy_masked(run_dir / "config.json", dst_run / "config.json")
+            if (run_dir / "result.json").is_file():
+                _write_result(run_dir / "result.json", dst_run / "result.json")
 
             for name in _VERIFIER_COPY:
                 # Snapshots taken before final_message.md joined
@@ -391,7 +436,9 @@ def _write_trajectories(src: Path, dst: Path, task_src: Path | None) -> None:
                 src = ver / name
                 if not src.is_file() and name == "final_message.md":
                     src = run_dir / "verifier" / name
-                if src.is_file():
+                if src.is_file() and name == "reward-details.json":
+                    _write_reward_details(src, dst_run / "verifier" / name)
+                elif src.is_file():
                     shutil.copy2(src, dst_run / "verifier" / name)
                 else:
                     print(f"Warning: {run_dir.name}: verifier/{name} missing", file=sys.stderr)
@@ -404,6 +451,7 @@ def _write_trajectories(src: Path, dst: Path, task_src: Path | None) -> None:
                   {"reward": combined if combined is not None else 0.0})
 
             judge = _load(ver / "judge.json", None)
+            _scrub_judge_paths(judge)
             judge_model = (judge or {}).get("model") if (judge or {}).get("ran") else None
             if judge is not None and not judge.get("ran"):
                 print(f"[make_delivery] WARNING {dst_run.name}: rubric judge did not run "
