@@ -64,6 +64,14 @@ def mirror_harbor_package(tmp_path: Path) -> bool:
     return False
 
 
+@pytest.fixture(autouse=True)
+def _skip_test_sh_patch(monkeypatch):
+    """run_task.sh rewrites a task's tests/test.sh and refuses one with no canary GUID.
+    The bundles these tests build are stubs with no real verifier, and the patch has
+    its own tests (test_patch_test_sh.py), so every run_task.sh spawned here skips it."""
+    monkeypatch.setenv("PATCH_TEST_SH_OFF", "1")
+
+
 @pytest.fixture
 def harbor_package_mirror(tmp_path):
     """Make `tmp_path` look enough like a harbor venv for patch_harbor.py."""

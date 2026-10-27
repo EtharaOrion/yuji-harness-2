@@ -115,6 +115,7 @@ def _add_run(out: Path, n: int, *, agent="openhands-sdk", model="anthropic/claud
     _w(ver / "ctrf.json", {"results": {"summary": {"tests": 2, "passed": 1, "failed": 1}}})
     _w(ver / "junit.xml", "<testsuites/>")
     _w(ver / "end_env.json", {})
+    _w(ver / "final_message.md", "done\n")
     _w(ver / "reward-details.json", {"rubric": {"criteria": [
         {"id": "1", "name": "c-good", "value": 1.0, "raw": "yes", "description": "d1", "reasoning": "r1"},
         {"id": "2", "name": "c-bad", "value": 0.0, "raw": "no", "description": "d2", "reasoning": "r2"},
@@ -188,8 +189,8 @@ def test_run_layout_matches_the_spec(delivered):
     assert files == sorted([
         "config.json", "result.json", "report.json",
         "agent/trajectory.json", "artifacts/manifest.json",
-        "verifier/ctrf.json", "verifier/end_env.json", "verifier/junit.xml",
-        "verifier/reward-details.json", "verifier/reward.json",
+        "verifier/ctrf.json", "verifier/end_env.json", "verifier/final_message.md",
+        "verifier/junit.xml", "verifier/reward-details.json", "verifier/reward.json",
     ])
 
 
@@ -255,6 +256,16 @@ def test_tree_without_snapshot_falls_back_to_verifier(tmp_path):
     delivered = _deliver(tmp_path)
     reward = json.loads((delivered / "trajectories/opus-5/run_1/verifier/reward.json").read_text())
     assert reward == {"reward": 0.3}
+
+
+def test_final_message_falls_back_to_verifier_for_older_snapshots(tmp_path):
+    _make_bundle(tmp_path)
+    run = tmp_path / "output" / SLUG / "trajectory" / "run_1"
+    (run / "client_verifier" / "final_message.md").unlink()
+    _w(run / "verifier" / "final_message.md", "from verifier\n")
+    delivered = _deliver(tmp_path)
+    msg = delivered / "trajectories/opus-5/run_1/verifier/final_message.md"
+    assert msg.read_text() == "from verifier\n"
 
 
 def test_a_mount_above_the_bundle_is_named(tmp_path, capsys):

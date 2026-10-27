@@ -459,7 +459,7 @@ CLIENT_VERIFIER_DIR = "client_verifier"
 CLIENT_VERIFIER_FILES = ("ctrf.json", "end_env.json", "junit.xml", "reward.json",
                          "reward-details.json", "judge.json", "grade_report.json",
                          "reward_producer.json", "state_capture_failed.txt",
-                         "rubric_judge_failed.txt")
+                         "rubric_judge_failed.txt", "final_message.md")
 
 
 def _prune(*paths: Path) -> None:

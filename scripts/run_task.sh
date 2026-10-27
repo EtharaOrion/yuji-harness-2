@@ -1045,6 +1045,20 @@ harbor_python() {
   return 1
 }
 
+# Every task runs the harness's verifier entrypoint: tests/test.sh is rewritten in
+# place from assets/verifier/test.sh, keeping the task's canary GUID.
+# PATCH_TEST_SH_OFF=1 bypasses it.
+patch_test_sh() {
+  [ -n "${PATCH_TEST_SH_OFF:-}" ] && return 0
+  local _out _rc=0
+  _out="$(python3 "$REPO/scripts/patch_test_sh.py" "$TASK" 2>&1)" || _rc=$?
+  if [ -n "$_out" ]; then echo "[run_task] $_out" >&2; fi
+  if [ "$_rc" != 0 ]; then
+    echo "[run_task] refusing to run $SLUG: add its '# harbor-canary GUID <uuid>' line to tests/test.sh" >&2
+    exit 2
+  fi
+}
+
 stage_preflight() {
   # FIRST, before the image build and long before the agent phase: prove Harbor
   # can enforce this task's network policy. Harbor itself only checks this in
@@ -2588,17 +2602,20 @@ egress_guard_settings() {
 # so this is the first point where every run is guaranteed to have one to audit.
 #
 #   INTERNET_AUDIT_OFF=1     skip entirely
-#   INTERNET_AUDIT_WARN=1    report findings but never block
-#   INTERNET_AUDIT_STRICT=1  also block a run that only ATTEMPTED egress
+#   INTERNET_AUDIT_BLOCK=1   withhold delivery (and exit 2) on a breach
+#   INTERNET_AUDIT_STRICT=1  with BLOCK, also block a run that only ATTEMPTED egress
+#   INTERNET_AUDIT_WARN=1    accepted for old callers; report-only is now the default
 #
-# Default policy: only a run that actually REACHED the internet withholds
-# delivery. An attempt the egress guard refused is the block working, and the
-# audit says so in those words rather than crediting the network for it.
+# Default policy: report, never block. Whether a task may use the internet is
+# now the bundle's call (its agent-phase network_mode), not a hardcoded rule
+# here, so every run is delivered and the per-run internet_audit.json plus the
+# FLAGGED line below carry the finding. INTERNET_AUDIT_BLOCK=1 restores the old
+# withhold-on-breach behaviour.
 stage_netaudit() {
   [ -z "${INTERNET_AUDIT_OFF:-}" ] || return 0
 
   local flags=()
-  [ -n "${INTERNET_AUDIT_WARN:-}" ] && flags+=(--warn-only)
+  [ -n "${INTERNET_AUDIT_BLOCK:-}" ] || flags+=(--warn-only)
   # Reaching for the web is disqualifying in itself, rather than only getting
   # there. Off by default: the guard now refuses the command and tells the model
   # what to use instead, and a model that probes once, is refused, and adapts is
@@ -2679,6 +2696,15 @@ stage_netaudit() {
   [ "$_attempted" -gt 0 ] && [ "$_reached" -eq 0 ] && \
     echo "[run_task] internet audit: $_attempted run(s) reached for the web and were refused; nothing left the sandbox" >&2
 
+  # Report-only (the default): the delivery stays, the finding is flagged.
+  if [ -z "${INTERNET_AUDIT_BLOCK:-}" ]; then
+    [ "$_reached" -gt 0 ] && \
+      echo "[run_task] internet audit: FLAGGED -- $_reached of $seen run(s) reached the open internet (agent policy: ${_policy:-unknown}); delivered anyway, see <run>/internet_audit.json" >&2
+    [ "$_unwitnessed" -gt 0 ] && \
+      echo "[run_task] internet audit: FLAGGED -- $_unwitnessed of $seen run(s) reached for the web with no enforced closed policy; delivered anyway" >&2
+    return 0
+  fi
+
   [ "$dirty" -eq 0 ] && return 0
 
   # A real breach. Withdraw the delivered copy before saying it is withheld:
@@ -2702,7 +2728,7 @@ stage_netaudit() {
   fi
   echo "    This task is closed-world: the answer comes from the MCP sidecars" >&2
   echo "    and /workspace/data. Per-run detail: <run>/internet_audit.json" >&2
-  echo "    Inspect without blocking: INTERNET_AUDIT_WARN=1 scripts/run_task.sh ..." >&2
+  echo "    Deliver anyway: run without INTERNET_AUDIT_BLOCK=1" >&2
   echo >&2
   exit 2
 }
@@ -2862,6 +2888,7 @@ _stop_run_bridges() { stop_run_ccbridge; stop_kiro_bridge; stop_bedrock_judge_pr
 trap _stop_run_bridges EXIT
 
 refuse_uncmountable_paths
+case "$STAGE" in preflight|harbor|all) patch_test_sh ;; esac
 resolve_auth
 check_credentials
 check_finance_env

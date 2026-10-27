@@ -181,9 +181,10 @@ def _short_model(name: str) -> str:
 # ships model runs only (TASK-STRUCTURE.md section 6).
 _NON_MODEL_AGENTS = {"oracle", "nop"}
 
-# The five verifier files a delivered run carries (section 6). reward.json is
-# rewritten to {"reward": x}; the other four are copied verbatim.
-_VERIFIER_COPY = ("ctrf.json", "end_env.json", "junit.xml", "reward-details.json")
+# The verifier files a delivered run carries (section 6). reward.json is
+# rewritten to {"reward": x}; the others are copied verbatim.
+_VERIFIER_COPY = ("ctrf.json", "end_env.json", "junit.xml", "reward-details.json",
+                  "final_message.md")
 
 _DP = 4
 
@@ -384,8 +385,14 @@ def _write_trajectories(src: Path, dst: Path, task_src: Path | None) -> None:
                     _copy_masked(run_dir / name, dst_run / name)
 
             for name in _VERIFIER_COPY:
-                if (ver / name).is_file():
-                    shutil.copy2(ver / name, dst_run / "verifier" / name)
+                # Snapshots taken before final_message.md joined
+                # CLIENT_VERIFIER_FILES lack it; the reshape never touches it
+                # in verifier/, so that copy is still the bundle's own.
+                src = ver / name
+                if not src.is_file() and name == "final_message.md":
+                    src = run_dir / "verifier" / name
+                if src.is_file():
+                    shutil.copy2(src, dst_run / "verifier" / name)
                 else:
                     print(f"Warning: {run_dir.name}: verifier/{name} missing", file=sys.stderr)
 
