@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-bridge"
+version = "0.1.0"
+description = "Anthropic-compatible judge endpoint backed by the codex CLI login."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+readme = "README.md"
+
+[project.scripts]
+codex-bridge = "codex_bridge.cli:main"
+
+# Flat layout: this folder IS the package, so a project can import it straight
+# from a checkout (with the folder's parent on sys.path) or pip-install it.
+[tool.setuptools]
+packages = ["codex_bridge"]
+package-dir = { "codex_bridge" = "." }
